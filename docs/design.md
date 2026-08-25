@@ -152,7 +152,11 @@ CREATE TABLE snapshots (
   state      TEXT    NOT NULL           -- building|complete|restore_in_progress
                                         -- |restored|failed
              CHECK (state IN ('building','complete','restore_in_progress',
-                              'restored','failed'))
+                              'restored','failed')),
+  -- Set when a restore of this snapshot starts, cleared by a verified
+  -- success or by the capture that carries its unrecovered sessions
+  -- forward. See "Carrying unrecovered sessions forward".
+  unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1))
 );
 
 CREATE TABLE session_rows (
@@ -164,16 +168,29 @@ CREATE TABLE session_rows (
   UNIQUE (snapshot_id, tmux_session_id)
 );
 
+-- A window belongs to as many sessions as it is linked into (`link-window`),
+-- so windows are keyed by snapshot, never by session, and the membership
+-- lives in session_window_links. Keying them by session made every capture
+-- fail (duplicate pane inserts) while any link existed on the server.
 CREATE TABLE window_rows (
   row_id          INTEGER PRIMARY KEY,
-  session_row_id  INTEGER NOT NULL REFERENCES session_rows(row_id) ON DELETE CASCADE,
+  snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
   tmux_window_id  TEXT    NOT NULL,     -- native @N
-  idx             INTEGER NOT NULL,
   name            TEXT    NOT NULL,
   layout          TEXT    NOT NULL,     -- tmux window_layout string
   active_pane_id  TEXT,                 -- native %N
   zoomed          INTEGER NOT NULL DEFAULT 0 CHECK (zoomed IN (0,1)),
-  UNIQUE (session_row_id, tmux_window_id)
+  UNIQUE (snapshot_id, tmux_window_id)
+);
+
+CREATE TABLE session_window_links (
+  row_id          INTEGER PRIMARY KEY,
+  session_row_id  INTEGER NOT NULL REFERENCES session_rows(row_id) ON DELETE CASCADE,
+  window_row_id   INTEGER NOT NULL REFERENCES window_rows(row_id) ON DELETE CASCADE,
+  idx             INTEGER NOT NULL,     -- the window's index *in this session*
+  active          INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0,1)),
+  UNIQUE (session_row_id, window_row_id),
+  UNIQUE (session_row_id, idx)
 );
 
 CREATE TABLE pane_rows (
@@ -311,7 +328,29 @@ capture path never runs re-entrantly.
 1. Insert `snapshots` row with `state='building'` and the current `boot_id`.
 2. Query tmux in three calls (`list-sessions`, `list-windows -a`,
    `list-panes -a`) with explicit `-F` format strings that yield native ids,
-   cwd, active and zoom flags, pane title, and window layout.
+   cwd, active and zoom flags, pane title, and window layout. Records are
+   framed by printable ASCII tokens — tmux ≤ 3.6 rewrites non-printable bytes
+   in format output — and every field is escaped by tmux itself before it is
+   framed, so a window name, path, title or command containing a token or a
+   newline is data rather than an outage.
+
+   **osm requires tmux 3.7 or newer and refuses to start below it.** The
+   framing above survives an older tmux; the *values* do not. tmux ≤ 3.6
+   rewrites every non-ASCII byte and every newline in format output to `_`
+   inside the server, before osm receives the field, so a pane in
+   `/home/u/żółć` is persisted as `/home/u/______` and restored into that path.
+   The damage is done upstream of every escape this engine applies, and it is
+   silent. Debian bookworm (3.3a), Ubuntu (3.4) and Debian trixie (3.5a) are
+   therefore all excluded; refusing loudly at startup is the only honest
+   answer, and it is checked once per process from `tmux -V`.
+
+   The version is only half of it. tmux decides whether a command client gets
+   raw UTF-8 or the sanitised form from *that client's* `LC_ALL`/`LC_CTYPE`/
+   `LANG`, so even 3.7c writes `/tmp/____` for `/tmp/żółć` when osm runs
+   without a locale in its environment — the ordinary state of a systemd user
+   unit and of a tmux hook. Every tmux invocation therefore passes `-u`, which
+   takes the decision away from an environment variable nobody sets on
+   purpose.
 3. Query `hyprctl -j clients` and `hyprctl -j monitors`. Validate both parse as
    JSON arrays before use. Map each terminal window's pid to a tmux client and
    session by walking the process tree.
@@ -321,6 +360,79 @@ capture path never runs re-entrantly.
 
 A snapshot that fails at any step leaves its row in `building` and is ignored by
 every reader; the next successful capture prunes it.
+
+### Carrying unrecovered sessions forward
+
+Restore selects its source by recency, so an incompletely restored snapshot
+would be superseded by the very capture that recorded the incomplete result,
+and then deleted by retention — losing the sessions the restore never put
+back, with no error anywhere.
+
+The debt is tracked **per session**, on `session_rows.unresolved`, and it is
+created only by a restore. Every session of a snapshot is marked outstanding
+when a restore of it *starts* (a restore killed mid-run never reaches any
+reporting code), and each one the restore verifiably delivered — created or
+adopted, with no degradation reported against it — is discharged when it
+finishes. `snapshots.unresolved` is a cache of "any session row is still
+outstanding", kept only so retention can filter on one column; while it is set,
+retention may not delete the snapshot.
+
+A whole-snapshot flag could not express this, and three separate failures came
+of trying:
+
+- **A partially restored session resolved its own source.** Treating "a live
+  session holds this name" as recovery let a restore that failed after four of
+  nine panes bless the truncated session it had just left behind. Resolution
+  now requires full topology equivalence (`equiv::difference`, the same
+  judgement adoption makes). A live session that holds the name but not the
+  topology resolves nothing and is not carried either — a snapshot holding two
+  sessions with one name could never be restored — so the source keeps the debt
+  and stays out of retention.
+- **A mixed live/carried pair split a linked window.** Where two sessions share
+  a window and the restore delivered only one of them, the carried one used to
+  get a second, independent copy. A restore now records captured→live window
+  identity in `restore_window_map`, so the carried session is *linked* into the
+  live window instead. The identity is verified against the row before it is
+  believed, and a bare id is trusted as same-server only within one boot.
+- **Deleting or renaming a session brought it back.** Since debt is only ever
+  created by a restore that failed to deliver a specific session, a session that
+  was delivered and then closed simply stays closed, and a rename adds nothing
+  to carry. The resolution path is the tombstone.
+
+Every capture therefore writes a superset: the live topology, plus each session
+an earlier snapshot is still owed and this server has not demonstrably got
+back. Carried rows keep their contents verbatim; only the tmux ids are
+rewritten under a `carried:<snapshot>:` prefix, so they cannot collide with a
+live `$0`/`@1`/`%2` and so one carried window keeps a single identity across
+generations. The new snapshot owes whatever it carried.
+
+A verified restore publishes the topology it produced as this boot's snapshot
+and retires its source in the **same** transaction, while still holding the
+restore lock: retiring first would leave an interval with no `complete`
+snapshot on the machine at all. If that publication fails, the attempt is
+`unsecured` rather than `succeeded` — the sessions are back, but nothing
+durable records them — and `osm restore` exits non-zero so systemd restarts
+it instead of recording a clean success.
+
+### Schema versions
+
+`db::open` never destroys a database it cannot read. A version it can migrate
+is migrated in place; anything else — an older shape, an unversioned file, a
+database from a newer build — is checkpointed and moved aside as
+`state.db.v<N>.bak`, never overwriting an earlier backup, and a fresh database
+takes its name. `osm status --json` reports it under `database.preserved`.
+
+The whole of `open` runs under an exclusive lock beside the database, and the
+classification is re-formed under that lock rather than trusted from before it.
+Both halves are load-bearing: with the sequence unlocked, thirty-two concurrent
+openers on one older database produced ten preservation operations, nine of them
+moving aside *empty* databases caught mid-creation and reporting one of those as
+the user's preserved data. Narrowing the lock to just the preservation branch is
+not enough either — SQLite manages a WAL database's `-wal`/`-shm` by path, so a
+process merely opening the file while another moves it aside fails with
+`SQLITE_IOERR_DELETE`. Backups are created with `link(2)`, which fails
+atomically on an existing destination where `rename(2)` would overwrite it, and
+a sidecar that cannot travel with its database is a hard error.
 
 ### Agent detection
 

@@ -1,19 +1,164 @@
 name: ci
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  lint:
+    name: fmt + clippy
+    runs-on: [self-hosted, Linux, X64, docker]
+    container:
+      image: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain components
+        run: rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: clippy, rustfmt
-      - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y tmux
-      - run: cargo fmt --check
+          key: lint
+      - run: cargo fmt --all --check
+      # Default features on: this is the only job that type-checks the
+      # `default-server` code path the shipped binary uses.
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+
+  test:
+    # tmux rewrites anything it considers unprintable in format output, and it
+    # changed which characters those are: on 3.6 and older, every non-ASCII
+    # byte and every newline becomes "_" *inside the server*, so a directory
+    # called /home/u/żółć is captured — and restored — as /home/u/______. That
+    # is not recoverable on this side, so 3.7 is the supported floor and the
+    # suite runs against it. The older versions get their own job below, which
+    # asserts osm refuses rather than misbehaves.
+    name: tests (tmux ${{ matrix.label }})
+    runs-on: [self-hosted, Linux, X64, docker]
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The supported floor, built from source: no Debian release ships a
+          # tmux this new yet.
+          - label: "3.7c (source)"
+            image: rust:1-trixie
+            source: "3.7c"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tmux ${{ matrix.source }} from source
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq build-essential libevent-dev libncurses-dev \
+            bison pkg-config curl sqlite3
+          curl -fsSL -o /tmp/tmux.tar.gz \
+            "https://github.com/tmux/tmux/releases/download/${{ matrix.source }}/tmux-${{ matrix.source }}.tar.gz"
+          tar -xzf /tmp/tmux.tar.gz -C /tmp
+          cd "/tmp/tmux-${{ matrix.source }}"
+          ./configure --prefix=/usr/local >/dev/null
+          make -j"$(nproc)" >/dev/null
+          make install
+          tmux -V
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.image }}-${{ matrix.source }}
+
+      # BEFORE the tests, never after. A test that reaches the default tmux
+      # server destroys whatever is on it — this exact failure took out a live
+      # 7-session development environment — so the check that forbids it has
+      # to run while there is still something to protect. The old version ran
+      # *after* the test step and grepped only for `Command::new("tmux")`,
+      # which let the project's own `Tmux::default()` straight through.
+      #
+      # --no-default-features is the structural half: it compiles out
+      # `Tmux::default_server()` entirely, so no test binary in the run below
+      # can even name the default server.
+      - name: No test may target the default tmux server
+        run: cargo test --no-default-features --test no_default_server -- --test-threads=1
+
+      - name: Tests
+        run: cargo test --all --no-default-features -- --test-threads=1
+
+  refuses-old-tmux:
+    # Debian bookworm's tmux 3.3a, kept in CI precisely because it is *not*
+    # supported: the contract is that osm stops with a message naming the
+    # version, not that it quietly captures corrupted paths.
+    name: refuses to run (tmux 3.3a bookworm)
+    runs-on: [self-hosted, Linux, X64, docker]
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux (distribution package)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq tmux
+          tmux -V
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: refuses-old-tmux
+      - run: cargo build --no-default-features --bin osm
+      - name: osm must refuse every tmux subcommand and say why
+        # bash explicitly, and **without `-e`**. Two separate traps, both of
+        # which have failed a run here:
+        #
+        # * the container's default shell is dash, which has no
+        #   `set -o pipefail`, so the step aborted on the `set` line itself;
+        # * GitHub's `shell: bash` is `bash -e {0}`, and this whole step
+        #   asserts that `osm` *fails* — an assignment takes the exit status
+        #   of its command substitution, so `out="$(osm …)"` killed the script
+        #   at the first command, before a single check had been made. The
+        #   step then failed whatever osm actually did, which makes it a check
+        #   that can never pass.
+        shell: bash --noprofile --norc {0}
+        run: |
+          set -uo pipefail
+          sock="osm-ci-refuse-$$"
+          fail=0
+          for cmd in snapshot "restore --dry-run" install-hooks daemon; do
+            # shellcheck disable=SC2086
+            out="$(./target/debug/osm --socket "$sock" $cmd 2>&1)"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "FAIL: 'osm $cmd' exited 0 on tmux 3.3a"
+              fail=1
+            fi
+            case "$out" in
+              *"3.3a"*"3.7"*) : ;;
+              *) echo "FAIL: 'osm $cmd' did not name the found and required versions: $out"; fail=1 ;;
+            esac
+          done
+          # `status` is the one command that must still produce its JSON, with
+          # the refusal reported inside it rather than as an exit status.
+          status="$(./target/debug/osm --socket "$sock" status --json)"
+          echo "$status"
+          case "$status" in
+            *'"ready":false'*'"reachable":false'*"3.7"*) : ;;
+            *) echo "FAIL: status did not report the unsupported tmux: $status"; fail=1 ;;
+          esac
+          exit "$fail"
+
+  msrv:
+    # 1.85, measured, not wished for: cargo 1.84 cannot parse a locked
+    # dependency that declares edition 2024. The manifest previously claimed
+    # 1.75, which never built.
+    name: build (MSRV 1.85)
+    runs-on: [self-hosted, Linux, X64, docker]
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # Build only: the declared rust-version is a consumer promise, and
+      # nothing verified it before — CI built stable exclusively.
+      - run: cargo build --all-targets --locked

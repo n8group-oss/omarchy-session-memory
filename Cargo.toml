@@ -2,14 +2,30 @@
 name = "osm"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# The real floor, measured against the committed Cargo.lock: cargo 1.84
+# refuses `clap_lex 1.1.0` ("feature `edition2024` is required"), 1.85 builds
+# clean. The previously declared 1.75 was never once true — CI only ever
+# built stable, and nothing checked it.
+rust-version = "1.85"
 license = "MIT"
 description = "Session memory engine for Omarchy: tmux, workspace, and agent restore"
 repository = "https://github.com/n8group-oss/omarchy-session-memory"
 
+[lib]
+name = "osm"
+path = "src/lib.rs"
+
 [[bin]]
 name = "osm"
 path = "src/main.rs"
+
+[features]
+# Lets the shipped binary talk to the *default* tmux server when no
+# --socket/OSM_TMUX_SOCKET is given. Tests are built with
+# --no-default-features, which removes `Tmux::default_server()` entirely, so
+# no test can address the developer's real tmux server even by mistake.
+default = ["default-server"]
+default-server = []
 
 [dependencies]
 anyhow = "1"
