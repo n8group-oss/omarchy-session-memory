@@ -1,8 +1,18 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-/// (row_id, tmux_window_id, link idx, name, layout, active_pane_id, zoomed)
-type WindowRow = (i64, String, u32, String, String, Option<String>, i64);
+/// (row_id, tmux_window_id, link idx, name, auto_named, layout,
+/// active_pane_id, zoomed)
+type WindowRow = (
+    i64,
+    String,
+    u32,
+    String,
+    Option<i64>,
+    String,
+    Option<String>,
+    i64,
+);
 
 #[derive(Debug, Clone)]
 pub struct PanePlan {
@@ -20,6 +30,9 @@ pub struct WindowPlan {
     pub tmux_window_id: String,
     pub idx: u32,
     pub name: String,
+    /// Whether tmux owned [`Self::name`] at capture time, or `None` for a row
+    /// written before that was recorded. See [`crate::equiv`].
+    pub auto_named: Option<bool>,
     pub layout: String,
     pub active_pane_id: Option<String>,
     pub zoomed: bool,
@@ -46,7 +59,7 @@ fn windows_of(conn: &Connection, session_row_id: i64) -> Result<Vec<WindowPlan>>
     // the repeat by `tmux_window_id` and issues `link-window` instead of
     // building a second copy.
     let mut w_stmt = conn.prepare(
-        "SELECT w.row_id, w.tmux_window_id, l.idx, w.name, w.layout,
+        "SELECT w.row_id, w.tmux_window_id, l.idx, w.name, w.auto_named, w.layout,
                 w.active_pane_id, w.zoomed
          FROM session_window_links l
          JOIN window_rows w ON w.row_id = l.window_row_id
@@ -63,12 +76,15 @@ fn windows_of(conn: &Connection, session_row_id: i64) -> Result<Vec<WindowPlan>>
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         })?
         .collect::<Result<_, _>>()?;
 
     let mut windows = Vec::new();
-    for (window_row_id, tmux_window_id, idx, wname, layout, active_pane_id, zoomed) in w_rows {
+    for (window_row_id, tmux_window_id, idx, wname, auto_named, layout, active_pane_id, zoomed) in
+        w_rows
+    {
         let mut p_stmt = conn.prepare(
             "SELECT tmux_pane_id, idx, cwd, restore_policy
              FROM pane_rows WHERE window_row_id = ?1 ORDER BY idx",
@@ -88,6 +104,7 @@ fn windows_of(conn: &Connection, session_row_id: i64) -> Result<Vec<WindowPlan>>
             tmux_window_id,
             idx,
             name: wname,
+            auto_named: auto_named.map(|v| v == 1),
             layout,
             active_pane_id,
             zoomed: zoomed == 1,

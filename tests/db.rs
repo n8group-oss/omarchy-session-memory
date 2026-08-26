@@ -296,11 +296,21 @@ fn concurrent_opens_do_not_preserve_each_other() {
 
 /// The tables an osm database had before schema 6, in the shapes the
 /// migration has to work on: `session_rows` with no `unresolved` column,
-/// `restore_attempts` with the narrow `CHECK`, and `restore_objects` holding a
-/// foreign key into it. Everything else `open` creates itself with
-/// `IF NOT EXISTS`, so only what the migration touches is spelled out.
+/// `restore_attempts` with the narrow `CHECK`, `restore_objects` holding a
+/// foreign key into it, and `window_rows` with no `auto_named`. Everything else
+/// `open` creates itself with `IF NOT EXISTS`, so only what the migration
+/// touches is spelled out.
 const PRE_V6_TABLES: &str = "
     CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE window_rows (
+      row_id         INTEGER PRIMARY KEY,
+      snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+      tmux_window_id TEXT    NOT NULL,
+      name           TEXT    NOT NULL,
+      layout         TEXT    NOT NULL,
+      active_pane_id TEXT,
+      zoomed         INTEGER NOT NULL DEFAULT 0 CHECK (zoomed IN (0,1)),
+      UNIQUE (snapshot_id, tmux_window_id));
     CREATE TABLE session_rows (
       row_id           INTEGER PRIMARY KEY,
       snapshot_id      INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
@@ -666,6 +676,15 @@ fn a_v6_database_gains_the_server_columns_without_claiming_an_identity() {
                captured_window_id TEXT    NOT NULL,
                live_window_id     TEXT    NOT NULL,
                UNIQUE (attempt_id, captured_window_id));
+             CREATE TABLE window_rows (
+               row_id         INTEGER PRIMARY KEY,
+               snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+               tmux_window_id TEXT    NOT NULL,
+               name           TEXT    NOT NULL,
+               layout         TEXT    NOT NULL,
+               active_pane_id TEXT,
+               zoomed         INTEGER NOT NULL DEFAULT 0 CHECK (zoomed IN (0,1)),
+               UNIQUE (snapshot_id, tmux_window_id));
              INSERT INTO snapshots (id, taken_at, boot_id, reason, state, unresolved)
                VALUES (1, 100, 'boot-a', 'manual', 'complete', 1);
              INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name, unresolved)
@@ -709,6 +728,81 @@ fn a_v6_database_gains_the_server_columns_without_claiming_an_identity() {
         identities,
         (None, None),
         "a row written before the columns existed must claim no server"
+    );
+
+    let version: u32 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0).map(|v| v.parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(version, osm::db::SCHEMA_VERSION);
+}
+
+/// A v8 database is what this build's predecessor wrote: window rows with a
+/// name, and no record of whether the *user* chose it or tmux was still
+/// deriving it.
+///
+/// The migration adds that record as one nullable column, and every existing
+/// row keeps NULL — "this row cannot say". Equivalence reads that as "the name
+/// is not an identity" and skips it, which is the only safe reading: those rows
+/// were written by a build that could not tell a chosen name from a derived
+/// one, so the `bash` in them may be either. Defaulting them to "the user chose
+/// it" would leave every snapshot already on disk exposed to the failure the
+/// column exists to prevent — a snapshot pinned out of retention forever
+/// because tmux renamed a window after the capture.
+#[test]
+fn a_v8_database_gains_the_name_ownership_column_without_claiming_an_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+               state TEXT NOT NULL
+                     CHECK (state IN ('building','complete','restore_in_progress',
+                                      'restored','failed')),
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+               server TEXT);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE window_rows (
+               row_id         INTEGER PRIMARY KEY,
+               snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+               tmux_window_id TEXT    NOT NULL,
+               name           TEXT    NOT NULL,
+               layout         TEXT    NOT NULL,
+               active_pane_id TEXT,
+               zoomed         INTEGER NOT NULL DEFAULT 0 CHECK (zoomed IN (0,1)),
+               UNIQUE (snapshot_id, tmux_window_id));
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state, unresolved)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete', 1);
+             INSERT INTO window_rows (row_id, snapshot_id, tmux_window_id, name, layout)
+               VALUES (1, 1, '@0', 'bash', 'abcd,80x24,0,0,0');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '8');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v8 database must open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "a migratable database must not be moved aside"
+    );
+    let (name, auto): (String, Option<i64>) = conn
+        .query_row(
+            "SELECT name, auto_named FROM window_rows WHERE row_id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "bash", "the migration must keep the captured name");
+    assert_eq!(
+        auto, None,
+        "a row written before the column existed must not claim to know who \
+         named the window"
     );
 
     let version: u32 = conn

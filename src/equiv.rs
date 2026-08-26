@@ -51,6 +51,10 @@ pub struct WindowShape {
     pub id: String,
     pub idx: u32,
     pub name: String,
+    /// Whether tmux owned the name at the moment this shape was taken, or
+    /// `None` when the side it came from could not say — a snapshot row
+    /// written before the flag was recorded. See [`name_differs`].
+    pub auto_named: Option<bool>,
     /// The raw layout string, kept for error messages only.
     pub layout: String,
     /// The parsed geometry, or `None` when the string is not a layout at all.
@@ -144,6 +148,7 @@ pub fn window_shape(
     id: String,
     idx: u32,
     name: String,
+    auto_named: Option<bool>,
     layout: String,
     zoomed: bool,
     mut panes: Vec<RawPane>,
@@ -163,6 +168,7 @@ pub fn window_shape(
         id,
         idx,
         name,
+        auto_named,
         layout,
         geometry: parsed.map(|(node, _)| node),
         zoomed,
@@ -176,6 +182,56 @@ pub fn window_shape(
             .collect(),
         active_pane,
     }
+}
+
+/// Whether the two windows' names are a real difference between them, rather
+/// than a name tmux happened to be holding at one of the two moments.
+///
+/// # Why a window name is not always an identity
+///
+/// With `automatic-rename` on — tmux's default — tmux owns the name and
+/// rewrites it from the window's foreground command. A window that has just
+/// been created is briefly called `tmux` before settling to `bash`, and a
+/// capture that lands inside that gap records `tmux`. That value never matches
+/// again: the live window is `bash` from then on, `difference` reported a name
+/// mismatch forever, the session's carry debt could never be discharged, and
+/// the snapshot holding it was pinned out of retention permanently. Ordinary
+/// use reaches this — a hook-triggered capture firing just after a window is
+/// opened — and it was found by a CI runner slow enough to make the gap wide.
+///
+/// # Why *both* sides are consulted, and not only the captured one
+///
+/// The first fix asked only the captured side: compare the name when the
+/// snapshot says the user chose it, ignore it otherwise. That narrowed the
+/// check in one direction and blinded it in the other. A captured
+/// *auto-named* window then matched a live window **the user had explicitly
+/// named** — so an unrelated live `dev`, whose window the user called
+/// `notes`, was equivalent to a captured `dev` of the same shape, was adopted
+/// as it, and the snapshot that still held the real one was retired. Trading a
+/// pinned snapshot for a wrong adoption is the worse bug of the two, which is
+/// the thing that fix was commissioned not to do.
+///
+/// So a name is a difference whenever **either** side says a human chose it:
+///
+/// * the captured side is user-named — the name is a property the user set and
+///   a live window lacking it is a different window;
+/// * the live side is user-named — the user has named this window something,
+///   and a snapshot that never carried that name is not a snapshot of it.
+///
+/// Only when neither side owns its name — both are tmux's, or the snapshot
+/// predates the flag and the live window is auto-named — is the name ignored,
+/// which is exactly the `tmux`→`bash` transient the narrowing exists for.
+///
+/// `None` on the captured side — a snapshot row from before the flag was
+/// recorded — is read as "not an identity" for that side alone. The
+/// alternative, assuming those rows were user-named, would leave every
+/// pre-existing snapshot exposed to the very failure this fixes, with no way
+/// for the user to clear it.
+fn name_differs(want: &WindowShape, live: &WindowShape) -> bool {
+    if live.name == want.name {
+        return false;
+    }
+    want.auto_named == Some(false) || live.auto_named == Some(false)
 }
 
 /// Why `live` is **not** `want`, or `None` if it genuinely is.
@@ -201,7 +257,7 @@ pub fn difference(want: &SessionShape, live: &SessionShape) -> Option<String> {
                 live_w.idx, want_w.idx
             ));
         }
-        if live_w.name != want_w.name {
+        if name_differs(want_w, live_w) {
             return Some(format!(
                 "window {} is named {:?} live but {:?} in the snapshot",
                 live_w.idx, live_w.name, want_w.name
@@ -332,6 +388,7 @@ pub fn shape_of_plan(plan: &crate::model::SessionPlan) -> SessionShape {
                     w.tmux_window_id.clone(),
                     w.idx,
                     w.name.clone(),
+                    w.auto_named,
                     w.layout.clone(),
                     w.zoomed,
                     w.panes
@@ -348,4 +405,31 @@ pub fn shape_of_plan(plan: &crate::model::SessionPlan) -> SessionShape {
             .collect(),
         active_window,
     }
+}
+
+/// Every (captured pane id, live pane id) pair a matching comparison lines up.
+///
+/// Like [`window_pairs`], only meaningful after [`difference`] has returned
+/// `None` — and for the same reason, but the reason matters more here. Both
+/// sides' panes are held in **layout-cell order** (see the module docs), which
+/// is the order `difference` walked when it checked that cell *i* on the live
+/// server holds cell *i*'s captured working directory. So pairing by position
+/// is not a fresh guess: it is the identity the adoption was already validated
+/// against.
+///
+/// Pane *creation* order is deliberately not used. A window whose panes were
+/// created in one order and then rearranged has a cell order that disagrees
+/// with its `%N` order, and pairing by `%N` would then hand a conversation to
+/// the pane on the other side of the window.
+pub fn pane_pairs(want: &SessionShape, live: &SessionShape) -> Vec<(String, String)> {
+    want.windows
+        .iter()
+        .zip(live.windows.iter())
+        .flat_map(|(w, l)| {
+            w.panes
+                .iter()
+                .zip(l.panes.iter())
+                .map(|(wp, lp)| (wp.id.clone(), lp.id.clone()))
+        })
+        .collect()
 }

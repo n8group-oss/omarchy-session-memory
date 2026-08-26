@@ -95,7 +95,16 @@ fn a_server_replaced_between_two_sessions_delivers_nothing() {
     // The trap needs a server to be armed on, and a server needs a session.
     // `keeper` is not in the snapshot and plays no other part.
     dst.t()
-        .run(&["new-session", "-d", "-s", "keeper", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "keeper",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     dst.t()
         .run(&[

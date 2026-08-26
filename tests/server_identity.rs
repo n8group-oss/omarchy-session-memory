@@ -357,7 +357,7 @@ fn public_facts_token(t: &Tmux) -> String {
 fn the_server_identity_is_not_the_tuple_any_server_can_reproduce() {
     let s = Server::start("token");
     s.t()
-        .run(&["new-session", "-d", "-s", "x", "-c", "/tmp"])
+        .run(&["new-session", "-n", "code", "-d", "-s", "x", "-c", "/tmp"])
         .unwrap();
 
     let identity = s.t().server_incarnation().expect("a running server");
@@ -381,18 +381,22 @@ fn the_server_identity_is_not_the_tuple_any_server_can_reproduce() {
 fn a_restarted_server_gets_a_new_identity() {
     let s = Server::start("newid");
     s.t()
-        .run(&["new-session", "-d", "-s", "x", "-c", "/tmp"])
+        .run(&["new-session", "-n", "code", "-d", "-s", "x", "-c", "/tmp"])
         .unwrap();
     let first = s.t().server_incarnation().unwrap();
 
     common::shutdown(s.t());
-    let mut started = s.t().run(&["new-session", "-d", "-s", "x", "-c", "/tmp"]);
+    let mut started = s
+        .t()
+        .run(&["new-session", "-n", "code", "-d", "-s", "x", "-c", "/tmp"]);
     for _ in 0..50 {
         if started.is_ok() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-        started = s.t().run(&["new-session", "-d", "-s", "x", "-c", "/tmp"]);
+        started = s
+            .t()
+            .run(&["new-session", "-n", "code", "-d", "-s", "x", "-c", "/tmp"]);
     }
     started.expect("a fresh server on the same socket");
 
@@ -468,7 +472,7 @@ const CONFIGURED_ID: &str = "0123456789abcdef0123456789abcdef";
 /// `.tmux.conf` line or a restored dump of server options would leave it, and
 /// return the identity osm then reports for it.
 fn start_with_configured_id(t: &Tmux) -> String {
-    let args = ["new-session", "-d", "-s", "x", "-c", "/tmp"];
+    let args = ["new-session", "-n", "code", "-d", "-s", "x", "-c", "/tmp"];
     let mut started = t.run(&args);
     for _ in 0..50 {
         if started.is_ok() {
@@ -527,7 +531,16 @@ fn a_configured_server_id_does_not_carry_a_window_map_across_a_restart() {
     let dst = Server::start("cfg-dst");
     // The user's configuration, in place before osm ever looks at this server.
     dst.t()
-        .run(&["new-session", "-d", "-s", "keeper", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "keeper",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     dst.t()
         .run(&["set-option", "-s", SERVER_ID_OPTION, CONFIGURED_ID])
@@ -560,4 +573,112 @@ fn a_configured_server_id_does_not_carry_a_window_map_across_a_restart() {
         2,
         "the carried beta must bring its own window"
     );
+}
+
+/// The marker a guarded command leaves behind. A server option, because it is
+/// the plainest observable effect a tmux command can have that this test can
+/// then read back: either the command ran on this server or it did not.
+const DELIVERY_MARKER: &str = "@osm-guard-test-marker";
+
+fn marker(t: &Tmux) -> String {
+    t.run(&["display-message", "-p", &format!("#{{{DELIVERY_MARKER}}}")])
+        .expect("a running server")
+        .trim()
+        .to_string()
+}
+
+/// Replace the start-tick field of an incarnation token, leaving every other
+/// field — boot id, server id, **pid**, socket path — exactly as it is.
+///
+/// That is the whole of the difference between two consecutive servers that
+/// share a configured `@osm-server-id` and land on a reused pid: they are
+/// distinct incarnations, and the only field that says so is the one the
+/// kernel assigns. Producing the token this way rather than waiting for the
+/// kernel to reissue a pid is what makes the case testable at all.
+fn with_other_start_ticks(token: &str) -> String {
+    let mut fields = token.splitn(5, ':');
+    let boot = fields.next().unwrap();
+    let id = fields.next().unwrap();
+    let pid = fields.next().unwrap();
+    let ticks: u64 = fields
+        .next()
+        .unwrap()
+        .parse()
+        .expect("a numeric start tick");
+    let socket = fields.next().unwrap();
+    format!("{boot}:{id}:{pid}:{}:{socket}", ticks + 1)
+}
+
+/// A guarded delivery must not run on a server that merely *looks* like the
+/// one it was verified against.
+///
+/// The condition tmux evaluates used to be the two fields of the token a tmux
+/// format can read: the `@osm-server-id` option and the pid. Both are
+/// reusable. The option is one `.tmux.conf` line away from being identical on
+/// every server the user starts, and a pid is reissued within a boot as a
+/// matter of course — so a *replacement* server on the same socket satisfied
+/// the guard and was handed the resume, into the `%N` it had just minted for
+/// somebody else's pane.
+///
+/// Here the live server carries the user's configured id, and the token the
+/// delivery was verified against names the same id and the same pid — the
+/// state pid reuse produces — while being a different incarnation. Nothing may
+/// be run on it.
+#[test]
+fn a_guarded_command_refuses_a_configured_id_on_a_reused_pid() {
+    let s = Server::start("guard-reuse");
+    let live = start_with_configured_id(s.t());
+
+    // The positive control first, so the mechanism is known to work at all:
+    // the real incarnation runs the command.
+    s.t()
+        .run_if_incarnation(&live, &format!("set-option -s {DELIVERY_MARKER} ran"))
+        .unwrap();
+    assert_eq!(
+        marker(s.t()),
+        "ran",
+        "the guard must let the incarnation it names through, or this test \
+         proves nothing about the one it refuses"
+    );
+    s.t().run(&["set-option", "-su", DELIVERY_MARKER]).unwrap();
+
+    // Same configured id, same pid, different incarnation.
+    let stale = with_other_start_ticks(&live);
+    assert_ne!(stale, live);
+    s.t()
+        .run_if_incarnation(
+            &stale,
+            &format!("set-option -s {DELIVERY_MARKER} delivered"),
+        )
+        .unwrap();
+    assert_eq!(
+        marker(s.t()),
+        "",
+        "a server that shares only a copied id and a reused pid with the \
+         incarnation this delivery was verified against must be handed nothing"
+    );
+}
+
+/// The witnesses the guard places must not accumulate in the server it
+/// delivers to: they are per-call by construction, and a delivery that left
+/// one behind would grow a long-lived server's option table for every resume
+/// it ever received.
+#[test]
+fn a_guarded_command_leaves_no_witness_behind() {
+    let s = Server::start("guard-witness");
+    let live = start_with_configured_id(s.t());
+    for _ in 0..3 {
+        s.t()
+            .run_if_incarnation(&live, &format!("set-option -s {DELIVERY_MARKER} ran"))
+            .unwrap();
+    }
+    let options = s
+        .t()
+        .run(&["show-options", "-s"])
+        .expect("a running server");
+    let left: Vec<&str> = options
+        .lines()
+        .filter(|l| l.starts_with("@osm-delivery-"))
+        .collect();
+    assert!(left.is_empty(), "witnesses left on the server: {left:?}");
 }

@@ -9,6 +9,27 @@
 //!
 //! The retry suites stopped short of exactly this: the capture between one
 //! boot's restore and the next boot's selection.
+//!
+//! # Most windows here are created with an explicit `-n`
+//!
+//! It used to be all of them, and not as decoration. With no name given, tmux
+//! turns `automatic-rename` on and names the window after
+//! `#{pane_current_command}` — which, for a fraction of a second after the
+//! window is created, is `tmux` itself rather than the shell, because that is
+//! what the pty's foreground process group is until the shell has finished
+//! exec'ing. A capture taken inside that window recorded the window as `tmux`;
+//! the equivalence check that discharges carry debt then compared it against a
+//! live window called `bash` and reported that the two sessions were not the
+//! same. The result was a suite that passed on an idle machine and failed on a
+//! loaded one — this file failed in CI roughly one run in seven under load.
+//!
+//! Naming every window at creation hid that, because `-n` turns
+//! `automatic-rename` off. It was never only a test problem: the same capture
+//! fires from a tmux hook the moment a user opens a window, and the snapshot it
+//! pinned was pinned out of retention *permanently*. The engine now records
+//! `automatic-rename` beside the name and holds a live window only to a name
+//! the user chose (see `osm::equiv`), so the `-n` here is history rather than
+//! a shield — and the tests at the end of this file deliberately do without it.
 
 mod common;
 
@@ -70,6 +91,43 @@ fn owed(conn: &rusqlite::Connection, snap: i64) -> Vec<String> {
         .unwrap();
     names.sort();
     names
+}
+
+/// The name tmux gives a window for the moment between creating its pty and
+/// the shell in it finishing its exec.
+const TRANSIENT: &str = "tmux";
+
+/// Every window row's `auto_named`, in row order: `Some(1)` when tmux owned
+/// the name, `Some(0)` when the user did, `None` for a row that predates the
+/// column.
+fn auto_named(conn: &rusqlite::Connection, snap: i64) -> Vec<Option<i64>> {
+    conn.prepare("SELECT auto_named FROM window_rows WHERE snapshot_id=?1 ORDER BY row_id")
+        .unwrap()
+        .query_map([snap], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A session's current window name, once tmux has stopped deriving a new one
+/// for it.
+///
+/// Polling rather than sleeping: how long the shell takes to finish exec'ing is
+/// exactly the variable that made this suite flaky, so nothing here may assume
+/// a duration for it.
+fn settled_window_name(t: &Tmux, session: &str) -> String {
+    for _ in 0..400 {
+        let name = t
+            .run(&["display-message", "-p", "-t", session, "#{window_name}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        if name != TRANSIENT {
+            return name;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("the window never settled to a name other than {TRANSIENT:?}");
 }
 
 /// How many panes a snapshot holds for one session.
@@ -196,7 +254,7 @@ fn a_session_the_restore_missed_survives_into_the_next_generation() {
     let src = Server::start("abc-src");
     for name in ["alpha", "beta"] {
         src.t()
-            .run(&["new-session", "-d", "-s", name, "-c", "/tmp"])
+            .run(&["new-session", "-n", "code", "-d", "-s", name, "-c", "/tmp"])
             .unwrap();
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -406,7 +464,16 @@ fn a_carried_linked_window_stays_one_window() {
 
     let dst = Server::start("link-dst");
     dst.t()
-        .run(&["new-session", "-d", "-s", "gamma", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "gamma",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let carried = capture::snapshot(&mut conn, dst.t(), "hook").unwrap();
 
@@ -444,7 +511,16 @@ fn a_carried_linked_window_stays_one_window() {
 fn a_session_whose_name_is_live_is_not_carried() {
     let src = Server::start("name-src");
     src.t()
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
@@ -454,7 +530,16 @@ fn a_session_whose_name_is_live_is_not_carried() {
 
     let dst = Server::start("name-dst");
     dst.t()
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let carried = capture::snapshot(&mut conn, dst.t(), "hook").unwrap();
 
@@ -488,7 +573,7 @@ fn a_capture_after_an_interrupted_restore_carries_what_it_never_reached() {
     let src = Server::start("killed-src");
     for name in ["alpha", "beta"] {
         src.t()
-            .run(&["new-session", "-d", "-s", name, "-c", "/tmp"])
+            .run(&["new-session", "-n", "code", "-d", "-s", name, "-c", "/tmp"])
             .unwrap();
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -692,7 +777,7 @@ fn closing_a_session_the_restore_delivered_does_not_bring_it_back() {
     let src = Server::start("tomb-src");
     for name in ["alpha", "beta"] {
         src.t()
-            .run(&["new-session", "-d", "-s", name, "-c", "/tmp"])
+            .run(&["new-session", "-n", "code", "-d", "-s", name, "-c", "/tmp"])
             .unwrap();
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -713,7 +798,16 @@ fn closing_a_session_the_restore_delivered_does_not_bring_it_back() {
     // Something else the user is working in, so closing `alpha` below closes a
     // session rather than the whole tmux server.
     dst.t()
-        .run(&["new-session", "-d", "-s", "keeper", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "keeper",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let snap_b = capture::snapshot(&mut conn, dst.t(), "hook").unwrap();
     assert_eq!(
@@ -752,7 +846,7 @@ fn renaming_a_live_session_does_not_accumulate_dead_names() {
     let src = Server::start("rename-src");
     for name in ["alpha", "beta"] {
         src.t()
-            .run(&["new-session", "-d", "-s", name, "-c", "/tmp"])
+            .run(&["new-session", "-n", "code", "-d", "-s", name, "-c", "/tmp"])
             .unwrap();
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1158,5 +1252,244 @@ fn a_lookalike_is_still_refused_when_a_third_sharer_is_gone() {
         snapshot_exists(&conn, snap_b),
         "the snapshot that still proves the three shared a window must survive \
          retention"
+    );
+}
+
+/// The name tmux was **still deriving** must not pin a snapshot out of
+/// retention forever.
+///
+/// `automatic-rename` is on by default, and with it on tmux owns a window's
+/// name and rewrites it from the foreground command. For a fraction of a
+/// second after a window is created that command is `tmux` itself, and only
+/// then the shell — so a capture landing in that gap records the window as
+/// `tmux`. The live window is `bash` from then on, so the captured name never
+/// matched again: the session's carry debt could never be discharged, the
+/// snapshot holding it was exempt from retention permanently, and it stayed
+/// permanently ahead of every newer snapshot in the eyes of anything that
+/// reads the debt.
+///
+/// Nothing exotic reaches this in production — a hook-triggered capture firing
+/// just after a window is opened is enough. A CI runner slower than this
+/// machine found it first, in [`a_session_whose_name_is_live_is_not_carried`]
+/// above.
+///
+/// Constructed rather than raced for. The snapshot is given the transient name
+/// while the live window carries the settled one, which is precisely the state
+/// the race produces, on every run rather than one in seven.
+#[test]
+fn a_name_tmux_was_still_deriving_does_not_pin_the_snapshot() {
+    let src = Server::start("autoname-src");
+    src.t()
+        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+    let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+    drop(src);
+    snapshots::set_unresolved(&conn, snap, true).unwrap();
+
+    // The capture recorded that tmux, not the user, owns this name. Everything
+    // below rests on that flag having been written.
+    assert_eq!(
+        auto_named(&conn, snap),
+        vec![Some(1)],
+        "a window created without -n is one tmux keeps renaming"
+    );
+
+    // What a capture a few milliseconds earlier would have written down.
+    conn.execute(
+        "UPDATE window_rows SET name = ?2 WHERE snapshot_id = ?1",
+        rusqlite::params![snap, TRANSIENT],
+    )
+    .unwrap();
+
+    let dst = Server::start("autoname-dst");
+    dst.t()
+        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .unwrap();
+    // Without this the two names could agree and the test would prove nothing.
+    assert_ne!(
+        settled_window_name(dst.t(), "alpha"),
+        TRANSIENT,
+        "the live window must have settled to some other name"
+    );
+
+    let carried = capture::snapshot(&mut conn, dst.t(), "hook").unwrap();
+    assert_eq!(session_names(&conn, carried), vec!["alpha".to_string()]);
+    assert!(
+        owed(&conn, snap).is_empty(),
+        "the session is verifiably back — a name tmux was mid-way through \
+         deriving is not a difference: {:?}",
+        owed(&conn, snap)
+    );
+    assert!(
+        !unresolved(&conn, snap),
+        "…and the snapshot-level cache of that debt must be cleared with it"
+    );
+}
+
+/// The other half, and the half that makes the fix a narrowing rather than a
+/// blinding: a name the **user** chose is a real property of the session, and a
+/// live session that does not have it is not the captured one.
+///
+/// Trading a snapshot pinned forever for a snapshot adopted by the wrong
+/// session would be the worse bug of the two — the first costs retention, the
+/// second costs the user's windows.
+#[test]
+fn a_name_the_user_chose_still_refuses_to_discharge_when_it_differs() {
+    let src = Server::start("username-src");
+    src.t()
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-n",
+            "code",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+    let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+    drop(src);
+    snapshots::set_unresolved(&conn, snap, true).unwrap();
+    assert_eq!(
+        auto_named(&conn, snap),
+        vec![Some(0)],
+        "naming a window at creation turns automatic-rename off for it"
+    );
+
+    // Same topology, same directory, same focus — everything but the name the
+    // user gave the window.
+    let dst = Server::start("username-dst");
+    dst.t()
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-n",
+            "notes",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap();
+
+    capture::snapshot(&mut conn, dst.t(), "hook").unwrap();
+    assert_eq!(
+        owed(&conn, snap),
+        vec!["alpha".to_string()],
+        "a live session missing the window name the user chose is not the \
+         captured session, so the debt stays where it is"
+    );
+    assert!(
+        unresolved(&conn, snap),
+        "…and the snapshot must stay exempt from retention while it is owed"
+    );
+}
+
+/// Auto-named at capture, and the live window carries a name the **user**
+/// chose. That is a real difference between the two windows, not a name tmux
+/// happened to be holding, so the live session is not the captured one and the
+/// debt stays where it is.
+///
+/// This test asserted the opposite until it was found to: it required the
+/// discharge, on the reasoning that the captured name was never a choice. But
+/// the captured side saying nothing does not make the *live* side's name
+/// nothing — an unrelated live `alpha`, whose window the user named `notes`,
+/// has the same indices, layout and directory as the captured one, and
+/// discharging on that adopts a stranger's session and lets retention delete
+/// the snapshot that still knew the real one. The narrowing that removed the
+/// permanent `tmux`→`bash` pin (see the test above it) must not go this far:
+/// it is only when *neither* side owns its name that the name is ignorable.
+#[test]
+fn a_window_the_user_has_named_since_capture_does_not_discharge() {
+    let src = Server::start("renamed-src");
+    src.t()
+        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+    let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+    drop(src);
+    snapshots::set_unresolved(&conn, snap, true).unwrap();
+    assert_eq!(
+        auto_named(&conn, snap),
+        vec![Some(1)],
+        "a window created without -n is tmux's to name"
+    );
+
+    let dst = Server::start("renamed-dst");
+    dst.t()
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-n",
+            "notes",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap();
+
+    capture::snapshot(&mut conn, dst.t(), "hook").unwrap();
+    assert_eq!(
+        owed(&conn, snap),
+        vec!["alpha".to_string()],
+        "a live window the user named is not a window nobody named"
+    );
+    assert!(
+        unresolved(&conn, snap),
+        "…and the snapshot must stay exempt from retention while it is owed"
+    );
+}
+
+/// A window row written before the flag existed says nothing about who chose
+/// the name — and must not therefore become permanently unmatchable, which is
+/// the very failure the flag was added to fix.
+#[test]
+fn a_snapshot_predating_the_flag_can_still_discharge() {
+    let src = Server::start("preflag-src");
+    src.t()
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-n",
+            "code",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+    let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+    drop(src);
+    snapshots::set_unresolved(&conn, snap, true).unwrap();
+    // Exactly what the 8 → 9 migration leaves behind.
+    conn.execute(
+        "UPDATE window_rows SET auto_named = NULL WHERE snapshot_id = ?1",
+        [snap],
+    )
+    .unwrap();
+
+    // Nothing about the destination's name is the user's either: tmux owns it
+    // (it reads `bash`, not the captured `code`). Neither side claims the
+    // name, which is the only case in which it may be ignored.
+    let dst = Server::start("preflag-dst");
+    dst.t()
+        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .unwrap();
+
+    capture::snapshot(&mut conn, dst.t(), "hook").unwrap();
+    assert!(
+        owed(&conn, snap).is_empty(),
+        "a row that cannot say who named the window must not hold the \
+         snapshot hostage to that name: {:?}",
+        owed(&conn, snap)
     );
 }

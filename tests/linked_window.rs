@@ -64,14 +64,32 @@ fn window_id_named(t: &Tmux, name: &str) -> HashSet<String> {
 fn a_linked_window_is_captured_once_and_restored_as_one_shared_window() {
     let src = server("src");
     let t = &src.0;
-    t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
-        .unwrap();
+    t.run(&[
+        "new-session",
+        "-n",
+        "code",
+        "-d",
+        "-s",
+        "alpha",
+        "-c",
+        "/tmp",
+    ])
+    .unwrap();
     t.run(&["new-window", "-t", "alpha", "-n", "shared", "-c", "/tmp"])
         .unwrap();
     t.run(&["split-window", "-t", "alpha:shared", "-c", "/tmp"])
         .unwrap();
-    t.run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
-        .unwrap();
+    t.run(&[
+        "new-session",
+        "-n",
+        "code",
+        "-d",
+        "-s",
+        "beta",
+        "-c",
+        "/tmp",
+    ])
+    .unwrap();
     t.run(&["link-window", "-d", "-s", "alpha:shared", "-t", "beta:"])
         .unwrap();
 
@@ -186,8 +204,17 @@ fn a_linked_window_is_captured_once_and_restored_as_one_shared_window() {
 fn a_session_made_only_of_linked_windows_restores_without_a_stray_window() {
     let src = server("only-src");
     let t = &src.0;
-    t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
-        .unwrap();
+    t.run(&[
+        "new-session",
+        "-n",
+        "code",
+        "-d",
+        "-s",
+        "alpha",
+        "-c",
+        "/tmp",
+    ])
+    .unwrap();
     t.run(&["new-window", "-t", "alpha", "-n", "shared", "-c", "/tmp"])
         .unwrap();
     t.run(&["new-session", "-d", "-s", "beta", "-n", "own", "-c", "/tmp"])

@@ -1,3 +1,4 @@
+use crate::agent::resume::Outcome as AgentOutcome;
 use crate::restore::RestoreReport;
 use serde::Serialize;
 
@@ -92,6 +93,7 @@ pub struct StatusReport {
     pub capture: CaptureStatus,
     pub database: DatabaseStatus,
     pub tmux: TmuxStatus,
+    pub agents: AgentSupport,
 }
 
 impl StatusReport {
@@ -101,6 +103,7 @@ impl StatusReport {
         capture: CaptureStatus,
         database: DatabaseStatus,
         tmux: TmuxStatus,
+        agents: AgentSupport,
     ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
@@ -110,6 +113,46 @@ impl StatusReport {
             capture,
             database,
             tmux,
+            agents,
+        }
+    }
+}
+
+/// One agent kind osm will not capture or resume by itself, and why.
+#[derive(Debug, Serialize)]
+pub struct UnsupportedAgent {
+    pub kind: String,
+    pub reason: String,
+}
+
+/// Which of the configured agents osm actually acts on.
+///
+/// `enabled` is what the config asks for; `unsupported` is the subset osm will
+/// not bind a pane to or resume automatically, each with the reason a user is
+/// shown. The two used to be indistinguishable, and one of them — OpenCode —
+/// had an entire capture path that could never bind anything, with nothing
+/// anywhere saying so. A capability osm does not have is now stated where the
+/// user looks for capabilities.
+#[derive(Debug, Serialize)]
+pub struct AgentSupport {
+    pub enabled: Vec<String>,
+    pub unsupported: Vec<UnsupportedAgent>,
+}
+
+impl AgentSupport {
+    pub fn of(enabled: &[String]) -> Self {
+        let unsupported = crate::agent::adapters(enabled)
+            .iter()
+            .filter_map(|a| {
+                a.auto_unsupported_reason().map(|reason| UnsupportedAgent {
+                    kind: a.kind().as_str().to_string(),
+                    reason: reason.to_string(),
+                })
+            })
+            .collect();
+        Self {
+            enabled: enabled.to_vec(),
+            unsupported,
         }
     }
 }
@@ -147,6 +190,19 @@ pub struct RestoreSkippedLayout {
     pub session: String,
     pub window: String,
     pub layout: String,
+    pub reason: String,
+}
+
+/// One pane whose conversation was not resumed, and why.
+///
+/// Only the outcomes [`crate::restore::agent_outcomes_are_degraded`] treats
+/// as a failure appear here — `active_elsewhere` and `unsupported` are
+/// reported nowhere in this JSON, because leaving that pane as a shell was
+/// the correct outcome, not a shortfall. `pane` is `"session:window.idx"`,
+/// matching the labels [`crate::restore::resume_agents`] produces.
+#[derive(Debug, Serialize)]
+pub struct AgentResumeFailure {
+    pub pane: String,
     pub reason: String,
 }
 
@@ -215,6 +271,18 @@ pub struct RestoreJson {
     /// transient problem must not permanently cost the user the only copy of
     /// their pre-reboot state.
     pub retryable: bool,
+    /// How many panes were handed a resume command and confirmed to have
+    /// started it — [`crate::agent::resume::Outcome::Resumed`] only. Does not
+    /// count a pane left alone because its conversation was already alive
+    /// elsewhere, or one this run never attempted (auto-resume off, no
+    /// adapter enabled for its kind, or its conversation too old to
+    /// auto-resume).
+    pub agents_resumed: usize,
+    /// Every pane whose conversation should have come back but did not —
+    /// the same set [`crate::restore::agent_outcomes_are_degraded`] uses to
+    /// decide `state`. A non-empty list here on a `partial` restore is why
+    /// it is `partial` rather than `succeeded`.
+    pub agents_failed: Vec<AgentResumeFailure>,
 }
 
 impl RestoreJson {
@@ -234,6 +302,8 @@ impl RestoreJson {
             skipped_layouts: Vec::new(),
             // Nothing was attempted, so whatever source exists is untouched.
             retryable: true,
+            agents_resumed: 0,
+            agents_failed: Vec::new(),
         }
     }
 
@@ -298,6 +368,181 @@ impl RestoreJson {
                 })
                 .collect(),
             retryable: report.retryable,
+            agents_resumed: report
+                .outcome
+                .agent_outcomes
+                .iter()
+                .filter(|(_, o)| matches!(o, AgentOutcome::Resumed))
+                .count(),
+            agents_failed: report
+                .outcome
+                .agent_outcomes
+                .iter()
+                .filter_map(|(pane, o)| match o {
+                    AgentOutcome::Failed(reason) => Some(AgentResumeFailure {
+                        pane: pane.clone(),
+                        reason: reason.clone(),
+                    }),
+                    // `OwnershipUnknown` belongs here and not with the two
+                    // below: nothing was delivered and a pane that should
+                    // hold a conversation holds a shell, which is precisely
+                    // what this list is for. Reporting it as "nothing to do"
+                    // is how a restore came to call itself a success having
+                    // sent nothing.
+                    AgentOutcome::PaneBusy
+                    | AgentOutcome::PaneMissing
+                    | AgentOutcome::OwnershipUnknown => Some(AgentResumeFailure {
+                        pane: pane.clone(),
+                        reason: o.as_str().to_string(),
+                    }),
+                    AgentOutcome::Resumed
+                    | AgentOutcome::ActiveElsewhere
+                    | AgentOutcome::Unsupported => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One conversation in `osm agents --json`.
+///
+/// The same shape in both lists so a consumer can read one field set
+/// regardless of which array an entry came from: `pane` and `confidence`
+/// are `null` for a resumable conversation (nothing is running it, so there
+/// is no pane and nothing was scored), and `alive` restates in one boolean
+/// which list the entry is in, for a consumer that flattens them.
+///
+/// `store_path` is a path, never transcript *contents*: nothing in osm ever
+/// reads what was said in a conversation (see the design's privacy note).
+#[derive(Debug, Serialize)]
+pub struct AgentEntry {
+    pub kind: String,
+    pub native_id: String,
+    /// The tmux pane holding this conversation open right now, for a `live`
+    /// entry; `null` in `resumable`.
+    pub pane: Option<String>,
+    /// What [`crate::agent::detect::bind`] scored this pane at. `null` in
+    /// `resumable`: nothing was bound, so nothing was scored.
+    pub confidence: Option<f32>,
+    pub project_dir: Option<String>,
+    pub store_path: Option<String>,
+    pub last_active: Option<i64>,
+    pub size_bytes: Option<i64>,
+    pub alive: bool,
+}
+
+/// The `osm agents` wire contract: every conversation the enabled adapters
+/// know about, split by whether a pane is running it.
+///
+/// The two arrays are disjoint. A live conversation is deliberately absent
+/// from `resumable`: "resume" for one that is already running means
+/// attaching a second client to it, which is exactly what
+/// [`crate::agent::resume::Outcome::ActiveElsewhere`] refuses.
+#[derive(Debug, Serialize)]
+pub struct AgentsJson {
+    pub protocol_version: u32,
+    pub live: Vec<AgentEntry>,
+    pub resumable: Vec<AgentEntry>,
+    /// Agents osm could not read, and why — never silently dropped into an
+    /// empty listing. An entry here means the two arrays above are incomplete
+    /// for that kind, which is a different thing from that kind having no
+    /// conversations.
+    pub problems: Vec<AgentProblem>,
+}
+
+/// One agent osm could not read.
+#[derive(Debug, Serialize)]
+pub struct AgentProblem {
+    pub kind: String,
+    pub error: String,
+}
+
+impl AgentsJson {
+    pub fn from_inventory(inv: &crate::agent::Inventory) -> Self {
+        let live = inv
+            .live
+            .iter()
+            .map(|l| AgentEntry {
+                kind: l.kind.as_str().to_string(),
+                native_id: l.native_id.clone(),
+                pane: Some(l.pane_id.clone()),
+                confidence: Some(l.confidence),
+                project_dir: l.session.as_ref().and_then(|s| s.project_dir.clone()),
+                store_path: l.session.as_ref().and_then(|s| s.store_path.clone()),
+                last_active: l.session.as_ref().and_then(|s| s.last_active),
+                size_bytes: l.session.as_ref().and_then(|s| s.size_bytes),
+                alive: true,
+            })
+            .collect();
+        let resumable = inv
+            .resumable
+            .iter()
+            .map(|s| AgentEntry {
+                kind: s.kind.as_str().to_string(),
+                native_id: s.native_id.clone(),
+                pane: None,
+                confidence: None,
+                project_dir: s.project_dir.clone(),
+                store_path: s.store_path.clone(),
+                last_active: s.last_active,
+                size_bytes: s.size_bytes,
+                alive: false,
+            })
+            .collect();
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            live,
+            resumable,
+            problems: inv
+                .problems
+                .iter()
+                .map(|(kind, error)| AgentProblem {
+                    kind: kind.as_str().to_string(),
+                    error: error.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The `osm resume` wire contract.
+///
+/// `outcome` is [`crate::agent::resume::Outcome::as_str`] — a stable
+/// snake_case token, never the `Debug` form. `reason` carries the detail of
+/// a `failed` outcome and is `null` for every other one.
+///
+/// The exit status follows `outcome`: 0 only for `resumed`. Every other
+/// outcome means the conversation is not in the pane, which a caller
+/// scripting this (a keybinding, a menu entry) must be able to see without
+/// parsing the JSON — including `active_elsewhere`, which is a correct
+/// refusal but still not the thing that was asked for.
+#[derive(Debug, Serialize)]
+pub struct ResumeJson {
+    pub protocol_version: u32,
+    pub kind: String,
+    pub native_id: String,
+    pub pane: String,
+    pub outcome: String,
+    pub reason: Option<String>,
+}
+
+impl ResumeJson {
+    pub fn new(
+        kind: crate::agent::AgentKind,
+        native_id: &str,
+        pane: &str,
+        outcome: &AgentOutcome,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            kind: kind.as_str().to_string(),
+            native_id: native_id.to_string(),
+            pane: pane.to_string(),
+            outcome: outcome.as_str().to_string(),
+            reason: match outcome {
+                AgentOutcome::Failed(reason) => Some(reason.clone()),
+                _ => None,
+            },
         }
     }
 }

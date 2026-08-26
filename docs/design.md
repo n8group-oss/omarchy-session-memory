@@ -11,8 +11,9 @@
 Restore a developer's full working state after a reboot: Hyprland workspaces
 populated with terminal windows, each terminal attached to the tmux session it
 had before, each pane back in its working directory, and — the headline feature
-— AI coding-agent conversations (Claude Code, Codex, OpenCode) resumed in the
-panes where they were running.
+— AI coding-agent conversations (Claude Code and Codex) resumed in the panes
+where they were running. OpenCode is discovered and listed but never captured
+or resumed automatically; see "Agent resume" for why.
 
 The project is distributed as an Omarchy marketplace plugin: a Quickshell bar
 widget and menu that surface session state, backed by a standalone Rust engine
@@ -230,6 +231,29 @@ CREATE TABLE terminal_windows (
   rel_w            REAL,
   rel_h            REAL,
   UNIQUE (snapshot_id, hypr_address)
+);
+
+-- Which conversations a restore has put a *pane* back for without (yet)
+-- putting the conversation into it. The one reason a capture may carry an
+-- agent binding forward instead of recording what it detected: a capture
+-- landing in the reboot window sees bare shells everywhere.
+--
+-- Recorded per object by the restore that incurred it, with the boot it
+-- belongs to and the moment it was taken on — never inferred from a ratio. The
+-- rule this replaced compared the *set* of bound conversations between two
+-- captures and threw the new map away when more than half had gone, which
+-- reads a user quitting conversation A and starting B in the same pane as 100%
+-- loss: the correct binding was discarded and A carried forward for ever.
+CREATE TABLE agent_resume_debt (
+  row_id       INTEGER PRIMARY KEY,
+  boot_id      TEXT    NOT NULL,
+  kind         TEXT    NOT NULL,
+  native_id    TEXT    NOT NULL,
+  session_name TEXT    NOT NULL,        -- the place, in the identity a restore preserves
+  window_idx   INTEGER NOT NULL,
+  pane_idx     INTEGER NOT NULL,
+  recorded_at  INTEGER NOT NULL,
+  UNIQUE (boot_id, kind, native_id, session_name, window_idx, pane_idx)
 );
 
 CREATE TABLE agent_sessions (
@@ -494,43 +518,107 @@ a window.
 
 ```rust
 trait AgentAdapter {
-    fn kind(&self) -> &'static str;
+    fn kind(&self) -> AgentKind;
     fn discover(&self) -> Result<Vec<AgentSession>>;
-    fn detect(&self, pane: &PaneProbe) -> Option<(String, f32)>;
+    /// This agent's transcripts keyed by (device, inode) — the only thing an
+    /// open file descriptor is ever matched against.
+    fn transcript_index(&self) -> Result<TranscriptIndex>;
     fn resume_argv(&self, id: &str) -> Vec<String>;
-    fn is_active_elsewhere(&self, id: &str) -> Result<bool>;
+    /// Active / Inactive / **Unknown**. Unknown is not Inactive.
+    fn is_active_elsewhere(&self, id: &str) -> Result<Liveness>;
+    /// Why osm will not capture or resume this agent by itself, or None.
+    fn auto_unsupported_reason(&self) -> Option<&'static str>;
 }
 ```
 
-| Adapter | Discovery | Resume |
-|---|---|---|
-| claude | scan `~/.claude/projects/*/*.jsonl` for id, cwd, mtime, size | `claude --resume <id>` |
-| codex | scan `$CODEX_HOME/sessions/**/rollout-*.jsonl` | `codex resume <uuid>` |
-| opencode | `opencode session list --format json` | `opencode --session <id>` |
+| Adapter | Discovery | Resume | Automatic |
+|---|---|---|---|
+| claude | scan `~/.claude/projects/*/*.jsonl` for id, cwd, mtime, size | `claude --resume <id>` | yes |
+| codex | scan `$CODEX_HOME/sessions/**/rollout-*.jsonl` | `codex resume <uuid>` | yes |
+| opencode | `opencode session list --format json` | `opencode --session <id>` | **no** |
 
 OpenCode is driven exclusively through its public CLI. Its on-disk store has
-changed shape across versions and is not a stable interface; the engine records
-the detected OpenCode version alongside each session.
+changed shape across versions and is not a stable interface.
+
+That confinement has a consequence the first draft of this design did not
+follow through: everything osm does automatically rests on two questions it
+must answer from the machine — *which conversation is this pane running*, and
+*does anything else have this conversation open* — and the OpenCode CLI answers
+neither. Left implicit, it produced a capture path that could never bind
+anything (no transcript means at most 0.4 against a 0.75 threshold, so the
+threshold was never reachable) and a liveness check that returned a bare
+`false`, which callers read as "verified nobody has it". So the answer is
+declared once, in `auto_unsupported_reason`, and every consequence follows from
+it: no binding, no auto-resume, `osm resume` refuses with `unsupported`, and
+`osm status --json` lists the kind under `agents.unsupported`. Discovery still
+runs, so the conversations remain listed for a human to open by hand.
+
+**Absent is not failed.** No agent home is no conversations and legitimate; a
+home that exists and cannot be read, or an `opencode` that exits non-zero or
+prints something other than the array of sessions it documents, is osm being
+unable to look. The first is an empty inventory, the second an error — a
+per-pane `Failed` during restore (so the run is `partial` and the snapshot
+stays retryable), a `problems` entry in `osm agents --json`, and a carry-forward
+cause during capture (which still records the topology: losing tmux snapshots
+over an unreadable `~/.claude` would be the larger loss).
 
 Any subprocess output parsed as JSON must tolerate leading non-JSON lines.
 Version managers such as `mise` print an activation banner ahead of command
 output, which corrupts naive parsers. The engine resolves absolute binary paths
 where possible and strips content before the first `{` or `[` otherwise.
 
+### Binding: identity, never a proxy for it
+
+A pane is bound to a conversation only when both halves of the evidence come
+from **the same process lineage**: a descendant of the pane running under the
+adapter's binary name (read from `/proc/<pid>/cmdline`, the same source tmux's
+`#{pane_current_command}` uses), or a descendant of that, holding open a file
+that **is** one of the transcripts discovery found — matched by device and
+inode, not by its path.
+
+Both qualifications are load-bearing. Pooling every descendant's descriptors
+let a background job tailing another conversation's transcript bind the pane to
+*that* conversation; matching by name let any `.jsonl` with a UUID stem count,
+anywhere on the filesystem. File identity also fixes the opposite error: a
+symlinked or bind-mounted agent home resolves to the same file and is
+recognised.
+
 ### Resume preconditions
 
-All must hold before a resume is sent:
+All must hold before a resume is sent, and the whole sequence runs under an
+exclusive lock keyed by `(agent kind, native id)` — taken **before** the
+liveness check and released only after the identity is confirmed. Without it,
+two `osm resume <same-id>` runs both finish their `/proc` scan before either
+agent opens the transcript, both pass, and both send: the exact double attach
+the check exists to prevent.
 
-- The target pane exists and its foreground process is an idle shell.
-- No live process anywhere owns that agent session id.
-- The adapter reports the session is not active elsewhere. Codex refuses
-  sessions with an active writer, and OpenCode has known hazards with concurrent
-  continuation of one session.
+- The target pane exists (exact membership in the live pane list, never `-t`
+  resolution) and its foreground process is an idle shell.
+- The pane is not in copy mode and its input is not disabled.
+- The adapter reports the session is not active elsewhere — and *reports* it.
+  `Unknown` is `unsupported`, not a licence to proceed.
 
-The engine then sends the resume argv, waits with a bounded timeout for the
-expected agent process to appear, and records the outcome: `resumed`,
-`active_elsewhere`, `failed`, or `unsupported`. A failed resume is surfaced in
-the menu and never retried by sending a second command into the same pane.
+The engine then sends the resume argv, bound to the tmux server incarnation the
+work was verified against — the check and the send are one tmux operation, so a
+server replaced in between cannot receive the input — and waits with a bounded
+timeout. Success is **not** a process with the right name appearing: the pane is
+re-bound afterwards by the rules above and must hold exactly `(kind, id)`, and
+go on holding it. An agent that starts, rejects the id and exits is `failed`.
+Outcomes: `resumed`, `active_elsewhere`, `pane_busy`, `pane_missing`,
+`unsupported`, `failed`. A failed resume is surfaced in the menu and never
+retried by sending a second command into the same pane.
+
+### Which pane a conversation goes back into
+
+Never re-derived from the snapshot. The restore records a captured-pane →
+live-pane map as it makes it — creation order for a window it built, the
+already-validated layout-cell order for one it adopted — and a resume is
+addressed only through that map, only for sessions the run verifiably
+delivered, and only on the one server incarnation verified for the whole run.
+Navigating by captured session name and window index instead sent a
+conversation into an unrelated live session that merely held the same name;
+pairing an adopted window's panes by `%N` order sent it into the wrong pane of
+the right window.
 
 ### Auto-resume policy
 

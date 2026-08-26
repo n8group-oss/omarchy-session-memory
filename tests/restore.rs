@@ -63,8 +63,24 @@ fn restores_sessions_windows_and_pane_counts() {
         .unwrap();
     t.run(&["new-window", "-t", "alpha", "-n", "logs", "-c", "/tmp"])
         .unwrap();
-    t.run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
-        .unwrap();
+    // Named, like `alpha` above, and for a related reason: a window whose
+    // name tmux owns is called `tmux` for the first few milliseconds of its
+    // life — the pty's foreground process group is tmux itself until the
+    // shell has exec'd — so this topology is read three times (here, at
+    // capture, and after the restore) and any two of them can disagree.
+    // Naming it turns automatic-rename off and removes the race; what this
+    // test is about is that sessions, windows and pane counts round-trip.
+    t.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "beta",
+        "-n",
+        "shell",
+        "-c",
+        "/tmp",
+    ])
+    .unwrap();
 
     let expected = topology(t);
 
@@ -86,7 +102,16 @@ fn restores_sessions_windows_and_pane_counts() {
 fn restore_is_idempotent_and_adopts_existing_sessions() {
     let src = Server::start("idem-src");
     src.t()
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-n",
+            "code",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -117,7 +142,16 @@ fn restores_a_pane_into_its_captured_directory() {
 
     let src = Server::start("cwd-ok-src");
     src.t()
-        .run(&["new-session", "-d", "-s", "alpha", "-c", &path])
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-n",
+            "code",
+            "-c",
+            &path,
+        ])
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -155,7 +189,16 @@ fn a_missing_captured_directory_is_reported_as_degraded_not_as_success() {
 
     let src = Server::start("cwd-src");
     src.t()
-        .run(&["new-session", "-d", "-s", "alpha", "-c", &gone_path])
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-n",
+            "code",
+            "-c",
+            &gone_path,
+        ])
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -198,8 +241,17 @@ fn a_missing_captured_directory_is_reported_as_degraded_not_as_success() {
 fn restores_active_window_selection() {
     let src = Server::start("act-src");
     let t = src.t();
-    t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
-        .unwrap();
+    t.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "-n",
+        "code",
+        "-c",
+        "/tmp",
+    ])
+    .unwrap();
     t.run(&["new-window", "-t", "alpha", "-n", "second", "-c", "/tmp"])
         .unwrap();
     t.run(&["new-window", "-t", "alpha", "-n", "third", "-c", "/tmp"])
@@ -381,5 +433,111 @@ fn restores_five_pane_window_at_captured_size_not_default_80x24() {
     assert_eq!(
         actual_wh, expected_wh,
         "restored layout dimensions must match the captured layout, not tmux's 80x24 default"
+    );
+}
+
+/// A window's `automatic-rename` state survives the restore, in both
+/// directions — and that is a decision about what a restored window should be
+/// called, not an implementation detail.
+///
+/// A name tmux derived is a fact about what was in the window's foreground at
+/// the instant of capture, and nothing is in that foreground any more after a
+/// reboot. Replaying it through `new-window -n` would do two wrong things at
+/// once: name the window after a process that is gone, and — because `-n`
+/// turns `automatic-rename` off — freeze that stale name permanently on a
+/// window the user had always let tmux name. So an auto-named window is
+/// recreated without `-n` and tmux derives a fresh name, arriving back at what
+/// the user actually saw.
+///
+/// A name the *user* chose is the opposite: it is the whole point of session
+/// memory, and it is applied exactly as captured.
+#[test]
+fn a_restored_window_keeps_who_owned_its_name() {
+    let src = Server::start("autoname-src");
+    // `code` is named by the user; the second window is left to tmux.
+    src.t()
+        .run(&["new-session", "-d", "-s", "dev", "-n", "code", "-c", "/tmp"])
+        .unwrap();
+    src.t()
+        .run(&["new-window", "-d", "-t", "dev", "-c", "/tmp"])
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+    let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+    let mut tree = model::load(&conn, snap).unwrap();
+    drop(src);
+
+    // The captured flags, which the restore is about to act on.
+    let session = &mut tree.sessions[0];
+    session.windows.sort_by_key(|w| w.idx);
+    // Only the flags: what tmux has derived for the second window by now is
+    // the very thing that is not stable, so asserting it would be asserting a
+    // race.
+    assert_eq!(
+        session
+            .windows
+            .iter()
+            .map(|w| (w.name.clone(), w.auto_named))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|(n, a)| (n.as_str(), *a))
+            .collect::<Vec<_>>()[0],
+        ("code", Some(false)),
+        "the user named the first window"
+    );
+    assert_eq!(
+        session.windows[1].auto_named,
+        Some(true),
+        "and tmux named the second"
+    );
+    // A stale derived name, exactly as a capture inside the rename gap would
+    // have recorded it. If the restore replayed it, it would stick forever.
+    session.windows[1].name = "tmux".to_string();
+
+    let dst = Server::start("autoname-dst");
+    restore::restore_tree(dst.t(), &tree).unwrap();
+
+    // Read after the derived name has settled, not immediately. A pane's
+    // foreground process group is tmux itself until the shell has finished
+    // exec'ing, so a window tmux owns the name of is *called* `tmux` for its
+    // first few milliseconds — 60 observations out of 60 on 3.7c. Asserting
+    // straight after `restore_tree` is asserting that race, and it loses on a
+    // machine fast enough to get there first (it failed exactly this way in
+    // CI). The wait is on the observable condition and bounded; if the name
+    // never settles the assertions below still run and still fail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut live: Vec<(u32, String, bool)> = loop {
+        let mut live: Vec<(u32, String, bool)> = dst
+            .t()
+            .list_windows()
+            .unwrap()
+            .into_iter()
+            .map(|w| (w.idx, w.name, w.auto_named))
+            .collect();
+        live.sort();
+        let settled = live.iter().all(|(_, name, auto)| !*auto || name != "tmux");
+        if settled || std::time::Instant::now() >= deadline {
+            break live;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    live.sort();
+    assert_eq!(
+        live.iter()
+            .map(|(_, n, a)| (n.as_str(), *a))
+            .collect::<Vec<_>>()[0],
+        ("code", false),
+        "the name the user chose comes back, still owned by the user"
+    );
+    let (_, derived, auto) = &live[1];
+    assert!(
+        *auto,
+        "a window tmux named must come back still named by tmux, not frozen \
+         on the name it happened to have at capture"
+    );
+    assert_ne!(
+        derived, "tmux",
+        "…and so must not be wearing the transient name the snapshot held"
     );
 }

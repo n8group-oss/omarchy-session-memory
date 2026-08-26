@@ -52,7 +52,7 @@ fn previous_boot_snapshot(
 ) -> (tempfile::TempDir, rusqlite::Connection, i64) {
     for name in sessions {
         src.t()
-            .run(&["new-session", "-d", "-s", name, "-c", "/tmp"])
+            .run(&["new-session", "-n", "code", "-d", "-s", name, "-c", "/tmp"])
             .unwrap();
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -255,7 +255,16 @@ fn a_conflict_leaves_the_snapshot_restorable() {
     // Someone else already owns the name, with a different shape.
     let dst = Server::start("conflict-dst");
     dst.t()
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
 
     let report = restore::run_restore(&mut conn, dst.t(), false).unwrap();

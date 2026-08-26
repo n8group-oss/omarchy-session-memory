@@ -41,7 +41,7 @@ impl Server {
         &self.0
     }
     fn session(&self, name: &str) {
-        let args = ["new-session", "-d", "-s", name, "-c", "/tmp"];
+        let args = ["new-session", "-n", "code", "-d", "-s", name, "-c", "/tmp"];
         let mut started = self.0.run(&args);
         for _ in 0..50 {
             if started.is_ok() {

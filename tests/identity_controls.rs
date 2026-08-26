@@ -29,7 +29,7 @@ impl Server {
         &self.0
     }
     fn session(&self, name: &str) {
-        let args = ["new-session", "-d", "-s", name, "-c", "/tmp"];
+        let args = ["new-session", "-n", "code", "-d", "-s", name, "-c", "/tmp"];
         let mut started = self.0.run(&args);
         for _ in 0..50 {
             if started.is_ok() {
@@ -52,7 +52,16 @@ impl Drop for Server {
 fn captured(src: &Server) -> (tempfile::TempDir, rusqlite::Connection, i64) {
     src.session("alpha");
     src.t()
-        .run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "beta",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
@@ -225,7 +234,17 @@ fn a_client_attaching_and_detaching_does_not_break_a_restore() {
     );
     helper
         .t()
-        .run(&["new-session", "-d", "-s", "holder", "-c", "/tmp", &attach])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "holder",
+            "-c",
+            "/tmp",
+            &attach,
+        ])
         .unwrap();
 
     let mut clients = String::new();

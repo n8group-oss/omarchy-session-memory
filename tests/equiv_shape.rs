@@ -45,6 +45,7 @@ fn ordered(layout: &str) -> Vec<(String, String)> {
         "@0".to_string(),
         0,
         "code".to_string(),
+        Some(false),
         layout.to_string(),
         false,
         panes(),

@@ -1,3 +1,4 @@
+use crate::agent::{self, detect::PaneProbe, AgentAdapter, AgentKind};
 use crate::boot;
 use crate::lock::SingleInstance;
 use crate::tmux::{PaneRec, SessionRec, Tmux, WindowRec};
@@ -242,6 +243,330 @@ pub fn write_topology(
     Ok(snapshot_id)
 }
 
+/// The adapters to probe panes against during capture: whichever agents
+/// `agents.enabled` names.
+///
+/// A config that fails to load must not turn agent detection off — that
+/// would read as "every pane's agent quietly stopped being tracked" the
+/// moment a config file typo appeared, which is a worse silent failure than
+/// falling back to the built-in default list. `status --json` already
+/// reports the same config as invalid, so the user has somewhere to see it.
+fn agent_adapters_for_capture() -> Vec<Box<dyn AgentAdapter>> {
+    let enabled = match crate::paths::config_path().and_then(|p| crate::config::load(&p)) {
+        Ok(cfg) => cfg.agents.enabled,
+        Err(e) => {
+            eprintln!("osm: {e:#}; using the default enabled agent adapters for this capture");
+            crate::config::AgentsCfg::default().enabled
+        }
+    };
+    agent::adapters(&enabled)
+}
+
+/// One conversation the previous snapshot recorded as bound to a pane,
+/// together with the confidence that binding was made at.
+#[derive(Debug, Clone)]
+struct PrevBinding {
+    kind: AgentKind,
+    native_id: String,
+    confidence: f32,
+}
+
+/// Where a bound pane sat: the name of a session the window is linked into,
+/// that window's index within that session, and the pane's index within the
+/// window.
+///
+/// This is the only pane identity that survives a restore. A tmux pane id is
+/// issued by one server incarnation and means nothing on the next, but a
+/// restore puts the session back under its captured *name*, the window back
+/// at its captured *index*, and the panes back in their captured order — the
+/// same three facts `restore::resume_agents` navigates by.
+type Place = (String, u32, u32);
+
+/// Everything the immediate predecessor snapshot knew about which
+/// conversation was bound where.
+///
+/// Only the single newest other snapshot is consulted, never a chain of
+/// them: the guard exists to survive one capture landing in the reboot
+/// window before resume completes, not to resurrect a binding a human
+/// deliberately let lapse two captures ago.
+#[derive(Debug, Default)]
+struct PreviousBindings {
+    /// Which server incarnation that snapshot was read from, so a caller can
+    /// tell whether its pane ids still name anything (see
+    /// [`carry_bindings_forward`]).
+    server: Option<String>,
+    /// Keyed by that snapshot's tmux pane ids.
+    by_pane: HashMap<String, PrevBinding>,
+    /// Keyed by [`Place`]. A window linked into several sessions is recorded
+    /// under each of them, since any one of those places locates it.
+    by_place: HashMap<Place, PrevBinding>,
+}
+
+impl PreviousBindings {
+    fn is_empty(&self) -> bool {
+        self.by_pane.is_empty()
+    }
+}
+
+fn previous_agent_bindings(
+    tx: &rusqlite::Transaction,
+    excluding_snapshot: i64,
+) -> Result<PreviousBindings> {
+    let mut out = PreviousBindings::default();
+    let previous: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT id, server FROM snapshots WHERE id <> ?1 ORDER BY taken_at DESC, id DESC LIMIT 1",
+            [excluding_snapshot],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((previous, server)) = previous else {
+        return Ok(out);
+    };
+    out.server = server;
+    let mut stmt = tx.prepare(
+        "SELECT p.tmux_pane_id, p.idx, p.agent_kind, p.agent_session_id, p.agent_confidence,
+                s.name, l.idx
+         FROM pane_rows p
+         JOIN window_rows w ON w.row_id = p.window_row_id
+         JOIN session_window_links l ON l.window_row_id = w.row_id
+         JOIN session_rows s ON s.row_id = l.session_row_id
+         WHERE w.snapshot_id = ?1 AND p.agent_kind IS NOT NULL AND p.agent_session_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([previous], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, u32>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<f32>>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, u32>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (pane_id, pane_idx, kind, native_id, confidence, session_name, window_idx) = row?;
+        let Some(kind) = AgentKind::parse(&kind) else {
+            continue; // Unreachable in practice: this column is only ever written from AgentKind::as_str.
+        };
+        let binding = PrevBinding {
+            kind,
+            native_id,
+            confidence: confidence.unwrap_or(0.0),
+        };
+        out.by_place
+            .insert((session_name, window_idx, pane_idx), binding.clone());
+        out.by_pane.insert(pane_id, binding);
+    }
+    Ok(out)
+}
+
+/// Re-key the previous snapshot's bindings onto the panes that exist *now*.
+///
+/// Carrying a binding forward is only worth doing if it can still be acted
+/// on, and a binding is acted on through the pane it names. The map that
+/// comes out of [`previous_agent_bindings`] is keyed by the pane ids of the
+/// server that snapshot was read from — which, after a restore, is a server
+/// that no longer exists. Written down verbatim those keys match no live
+/// pane at all (so every binding is silently dropped, which is exactly the
+/// loss the guard exists to prevent) or, worse, collide by coincidence with
+/// a *different* pane the new server happened to number the same way, and
+/// bind someone's conversation to a pane it was never in.
+///
+/// So pane ids are trusted only when this topology comes from the very same
+/// server incarnation the previous snapshot was read from. Otherwise — and
+/// as a fallback whenever an id no longer matches — a binding is placed by
+/// [`Place`], the identity a restore actually preserves.
+///
+/// A conversation the previous snapshot recorded against two panes is
+/// carried onto both: this reproduces what was recorded, faithfully, rather
+/// than inventing a rule for a shape only a mis-detection can produce.
+fn carry_bindings_forward(
+    prev: &PreviousBindings,
+    topo: &Topology,
+) -> HashMap<String, (AgentKind, String, f32)> {
+    let same_server = prev.server.is_some() && prev.server == topo.server;
+    let session_names: HashMap<&str, &str> = topo
+        .sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.as_str()))
+        .collect();
+    let mut out: HashMap<String, (AgentKind, String, f32)> = HashMap::new();
+    for w in &topo.windows {
+        // A window whose session is missing cannot be placed; `write_topology_in`
+        // refuses such a topology outright before this ever runs.
+        let Some(session_name) = session_names.get(w.session_id.as_str()) else {
+            continue;
+        };
+        for p in topo.panes.iter().filter(|p| p.window_id == w.id) {
+            if out.contains_key(&p.id) {
+                continue; // same pane, seen through another link
+            }
+            let found = if same_server {
+                prev.by_pane.get(&p.id)
+            } else {
+                None
+            }
+            .or_else(|| {
+                prev.by_place
+                    .get(&((*session_name).to_string(), w.idx, p.idx))
+            });
+            if let Some(b) = found {
+                out.insert(p.id.clone(), (b.kind, b.native_id.clone(), b.confidence));
+            }
+        }
+    }
+    out
+}
+
+/// Every [`Place`] each live pane occupies, one per link: a pane in a window
+/// linked into two sessions is at two of them.
+///
+/// A debt names one pane by place, and this is how a pane in front of us is
+/// asked whether it is that one.
+fn pane_places(topo: &Topology) -> HashMap<String, Vec<Place>> {
+    let session_names: HashMap<&str, &str> = topo
+        .sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.as_str()))
+        .collect();
+    let mut out: HashMap<String, Vec<Place>> = HashMap::new();
+    for w in &topo.windows {
+        let Some(session_name) = session_names.get(w.session_id.as_str()) else {
+            continue;
+        };
+        for p in topo.panes.iter().filter(|p| p.window_id == w.id) {
+            out.entry(p.id.clone())
+                .or_default()
+                .push(((*session_name).to_string(), w.idx, p.idx));
+        }
+    }
+    out
+}
+
+/// Add the bindings this capture could not see but is still *owed*, without
+/// ever displacing one it could.
+///
+/// # The rule
+///
+/// A pane keeps whatever this capture detected on it. Where a pane has no
+/// fresh binding, the previous snapshot's binding for that place is added —
+/// but only when a restore has recorded that the conversation is still owed
+/// (see [`crate::debt`]) and the conversation is not already running
+/// somewhere else on this server.
+///
+/// # What it replaced, and why
+///
+/// The previous rule compared the *set* of bound conversations with the
+/// previous snapshot's and threw the whole new map away when more than half
+/// of them had gone. Two things were wrong with it, and the second is the
+/// serious one:
+///
+/// * it was a percentage, so the cause ("a restore has not finished putting
+///   the conversations back") was inferred from a ratio rather than known;
+/// * it *overwrote fresh bindings with stale ones*. A user who exits
+///   conversation A and starts B in the same pane produces `prev = {A}`,
+///   `next = {B}` — 100% loss by that measure — so the correct binding `{B}`
+///   was discarded and A carried forward, every capture, for ever. After a
+///   reboot, A was then resumed into B's pane.
+///
+/// Now a fresh binding is never a candidate for replacement: carrying only
+/// ever fills a gap.
+///
+/// # The two admissible causes
+///
+/// * `detection_ran` and the conversation is in [`crate::debt`]: a restore has
+///   put this pane back and has not (yet) put the conversation into it;
+/// * `!detection_ran`: this capture could not read the enabled agents at all,
+///   so it has nothing to say about any pane. That is a fact about the
+///   capture, recorded here, not a ratio inferred from its results — and the
+///   capture goes ahead, because the tmux topology is what the snapshot exists
+///   for and losing it over an unreadable agent home would be the larger loss;
+/// * the pane is in `unknown_panes`: detection ran, looked at this pane, and
+///   could not tell what it holds — its agent has a transcript open whose file
+///   has been unlinked, which is what an atomic replacement leaves behind. Not
+///   knowing is not the same as there being nothing there, so the previous
+///   binding stands until ownership can be established again.
+fn carry_owed_bindings(
+    tx: &rusqlite::Transaction,
+    topo: &Topology,
+    detected: HashMap<String, (AgentKind, String, f32)>,
+    live_now: &[(AgentKind, String)],
+    snapshot_id: i64,
+    detection_ran: bool,
+    unknown_panes: &HashSet<String>,
+) -> Result<HashMap<String, (AgentKind, String, f32)>> {
+    let previous = previous_agent_bindings(tx, snapshot_id)?;
+    if previous.is_empty() {
+        return Ok(detected);
+    }
+    // The second admissible cause, and the reason it is one: detection did not
+    // run. "No pane is running an agent" and "osm could not tell what any pane
+    // is running" are opposite statements, and writing the first when the
+    // second is true destroys the map. No debt is consulted, because this is
+    // not a claim about any conversation — it is a fact about this capture.
+    let owed = if detection_ran {
+        crate::debt::pending(
+            tx,
+            &crate::boot::current_boot_id()?,
+            crate::boot::now_epoch(),
+        )?
+    } else {
+        HashSet::new()
+    };
+    if detection_ran && owed.is_empty() && unknown_panes.is_empty() {
+        return Ok(detected);
+    }
+    let running: HashSet<(AgentKind, &str)> =
+        live_now.iter().map(|(k, id)| (*k, id.as_str())).collect();
+
+    let places = pane_places(topo);
+    let mut bindings = detected;
+    let mut carried = 0usize;
+    for (pane_id, binding) in carry_bindings_forward(&previous, topo) {
+        // Fresh evidence wins, always.
+        if bindings.contains_key(&pane_id) {
+            continue;
+        }
+        let conversation = (binding.0, binding.1.clone());
+        // It came back somewhere; that pane is where it is, and putting it on
+        // this one as well would bind one conversation to two panes.
+        if running.contains(&(conversation.0, conversation.1.as_str())) {
+            continue;
+        }
+        // No recorded cause. Whatever happened to this conversation between
+        // the two captures, nothing on this machine says a restore still owes
+        // it and this capture could read the pane, so the honest record is
+        // that the pane holds no conversation.
+        // Owed *here*, at one of the places this very pane occupies — never
+        // merely somewhere. A conversation-level permission would authorise
+        // carrying it onto any pane the previous snapshot happens to map onto,
+        // including panes of sessions this restore never touched.
+        let owed_here = places.get(&pane_id).is_some_and(|here| {
+            here.iter()
+                .any(|place| owed.contains(&(place.clone(), conversation.clone())))
+        });
+        if detection_ran && !owed_here && !unknown_panes.contains(&pane_id) {
+            continue;
+        }
+        bindings.insert(pane_id, binding);
+        carried += 1;
+    }
+    if carried > 0 {
+        let cause = if detection_ran {
+            "recorded as still owed by this boot's restore, or held open by an agent \
+             through a descriptor osm cannot identify, and not detected on any pane"
+        } else {
+            "not checked at all, because this capture could not read the enabled agents"
+        };
+        eprintln!(
+            "osm: {carried} conversation(s) {cause}; carrying their bindings forward \
+             onto the panes that hold their place"
+        );
+    }
+    Ok(bindings)
+}
+
 /// Persist an already-collected topology inside a transaction the caller
 /// owns.
 ///
@@ -333,12 +658,18 @@ pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &s
                     .map(|p| p.id.clone());
                 tx.execute(
                     "INSERT INTO window_rows
-                       (snapshot_id, tmux_window_id, name, layout, active_pane_id, zoomed)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                       (snapshot_id, tmux_window_id, name, auto_named, layout,
+                        active_pane_id, zoomed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         snapshot_id,
                         w.id,
                         w.name,
+                        // Recorded beside the name because it is what says
+                        // whether the name means anything: with it on, tmux is
+                        // still deriving the name and this capture may well
+                        // have caught it mid-flight.
+                        w.auto_named as i64,
                         w.layout,
                         active_pane,
                         w.zoomed as i64
@@ -355,6 +686,81 @@ pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &s
             rusqlite::params![session_row_id, window_row_id, w.idx, w.active as i64],
         )?;
     }
+
+    // Which conversation, if any, each live pane is bound to. Detected fresh
+    // for this capture; a binding it could not see is only ever *added* to,
+    // never allowed to displace one it could — see `carry_owed_bindings`.
+    let adapters = agent_adapters_for_capture();
+    // Each adapter's conversations are read once for the whole capture.
+    //
+    // A failure here is not "no pane holds a conversation", and it is not a
+    // reason to abandon the capture either: the tmux topology is the thing
+    // this snapshot exists for, and refusing to record it because an agent's
+    // home directory became unreadable would cost the user their sessions over
+    // an unrelated problem. What it *is* is a specific, recorded cause for
+    // carrying the previous bindings forward — detection did not run.
+    let prepared = match agent::detect::prepare(&adapters) {
+        Ok(prepared) => Some(prepared),
+        Err(e) => {
+            eprintln!(
+                "osm: could not read the enabled agents' conversations ({e:#}); this \
+                 capture cannot tell which pane is running what, so it carries the \
+                 previous snapshot's bindings rather than recording that there are none"
+            );
+            None
+        }
+    };
+    let detection_ran = prepared.is_some();
+    let mut detected: HashMap<String, (AgentKind, String, f32)> = HashMap::new();
+    // Panes detection looked at and could not answer for. See
+    // `agent::detect::lineage_ownership_unknown`.
+    let mut unknown_panes: HashSet<String> = HashSet::new();
+    if let Some(prepared) = &prepared {
+        for p in &topo.panes {
+            if detected.contains_key(&p.id) {
+                continue; // same pane, seen through another link
+            }
+            let probe = PaneProbe {
+                pane_id: p.id.clone(),
+                pane_pid: p.pid,
+                cwd: p.cwd.clone(),
+                foreground_cmd: p.cmd.clone(),
+            };
+            if let Some(binding) = agent::detect::bind(&probe, prepared) {
+                detected.insert(
+                    p.id.clone(),
+                    (binding.kind, binding.native_id, binding.confidence),
+                );
+            } else if agent::detect::lineage_ownership_unknown(&probe, prepared) {
+                // Not "this pane holds no conversation": this pane holds a
+                // transcript whose file has been unlinked out from under its
+                // agent, so nothing can be matched by device and inode. The
+                // pane's previous binding is the best evidence anyone has and
+                // is kept until ownership can be established again.
+                unknown_panes.insert(p.id.clone());
+            }
+        }
+    }
+
+    // What this capture can *see* running, which is the only thing that is
+    // ever written down as a fresh binding. A conversation observed live owes
+    // nobody anything, so any debt recorded against it is discharged here,
+    // from evidence, before the carry decision is made.
+    let live_now: Vec<(AgentKind, String)> = detected
+        .values()
+        .map(|(kind, id, _)| (*kind, id.clone()))
+        .collect();
+    crate::debt::discharge(tx, &live_now)?;
+
+    let bindings = carry_owed_bindings(
+        tx,
+        topo,
+        detected,
+        &live_now,
+        snapshot_id,
+        detection_ran,
+        &unknown_panes,
+    )?;
 
     // `list-panes -a` likewise repeats a linked window's panes once per
     // link. Deduplicate explicitly rather than by INSERT OR IGNORE, so the
@@ -374,11 +780,21 @@ pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &s
         if !seen_panes.insert((p.window_id.as_str(), p.id.as_str())) {
             continue; // same pane, seen through another link
         }
+        let (restore_policy, agent_kind, agent_session_id, agent_confidence) =
+            match bindings.get(&p.id) {
+                Some((kind, native_id, confidence)) => (
+                    "agent_resume",
+                    Some(kind.as_str()),
+                    Some(native_id.as_str()),
+                    Some(*confidence),
+                ),
+                None => ("shell", None, None, None),
+            };
         tx.execute(
             "INSERT INTO pane_rows
                (window_row_id, tmux_pane_id, idx, cwd, title, foreground_cmd,
-                dead, restore_policy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'shell')",
+                dead, restore_policy, agent_kind, agent_session_id, agent_confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 window_row_id,
                 p.id,
@@ -386,7 +802,11 @@ pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &s
                 p.cwd,
                 p.title,
                 p.cmd,
-                p.dead as i64
+                p.dead as i64,
+                restore_policy,
+                agent_kind,
+                agent_session_id,
+                agent_confidence
             ],
         )?;
     }
@@ -472,6 +892,7 @@ fn live_shapes(topo: &Topology) -> HashMap<String, crate::equiv::SessionShape> {
                             w.id.clone(),
                             w.idx,
                             w.name.clone(),
+                            Some(w.auto_named),
                             w.layout.clone(),
                             w.zoomed,
                             panes.get(w.id.as_str()).cloned().unwrap_or_default(),
@@ -958,11 +1379,21 @@ fn copy_session(
     map: &HashMap<String, String>,
     same_server: bool,
 ) -> Result<()> {
-    type LinkedWindow = (i64, String, String, String, Option<String>, i64, u32, i64);
+    type LinkedWindow = (
+        i64,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        i64,
+        u32,
+        i64,
+    );
     let windows: Vec<LinkedWindow> = tx
         .prepare(
-            "SELECT w.row_id, w.tmux_window_id, w.name, w.layout, w.active_pane_id,
-                    w.zoomed, l.idx, l.active
+            "SELECT w.row_id, w.tmux_window_id, w.name, w.auto_named, w.layout,
+                    w.active_pane_id, w.zoomed, l.idx, l.active
              FROM session_window_links l
              JOIN window_rows w ON w.row_id = l.window_row_id
              WHERE l.session_row_id = ?1 ORDER BY l.idx",
@@ -977,6 +1408,7 @@ fn copy_session(
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?
         .collect::<Result<_, _>>()?;
@@ -1025,7 +1457,17 @@ fn copy_session(
     let new_session_row = tx.last_insert_rowid();
 
     for (
-        (window_row, tmux_window_id, wname, layout, active_pane_id, zoomed, idx, active),
+        (
+            window_row,
+            tmux_window_id,
+            wname,
+            auto_named,
+            layout,
+            active_pane_id,
+            zoomed,
+            idx,
+            active,
+        ),
         target,
     ) in windows.into_iter().zip(targets)
     {
@@ -1034,12 +1476,16 @@ fn copy_session(
             WindowTarget::Carry => {
                 tx.execute(
                     "INSERT INTO window_rows
-                       (snapshot_id, tmux_window_id, name, layout, active_pane_id, zoomed)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                       (snapshot_id, tmux_window_id, name, auto_named, layout,
+                        active_pane_id, zoomed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         into,
                         carried_id(source, &tmux_window_id),
                         wname,
+                        // Carried verbatim, NULL included: a carried copy must
+                        // not claim to know something its source did not.
+                        auto_named,
                         layout,
                         active_pane_id.as_deref().map(|id| carried_id(source, id)),
                         zoomed

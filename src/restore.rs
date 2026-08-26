@@ -1,3 +1,5 @@
+use crate::agent::{self, resume, AgentKind};
+use crate::config::Config;
 use crate::equiv;
 use crate::layout;
 use crate::model::{SessionPlan, SnapshotTree, WindowPlan};
@@ -54,6 +56,23 @@ pub struct RestoreOutcome {
     /// carries it forward, and the only fact that says the live `@7` is the
     /// captured `@0` is this restore's own record of having made it.
     pub window_map: HashMap<String, String>,
+    /// Captured pane id → the pane id it now has on the destination server,
+    /// for every pane this restore created or verifiably adopted.
+    ///
+    /// The only identity a resume may be addressed by. A captured pane id
+    /// names a pane on a server that no longer exists, and nothing else on
+    /// the machine can say which live pane took its place — so the restore
+    /// that made it writes it down, once, at the moment it made it. For a
+    /// created window that is `fill_window`'s own creation order; for an
+    /// adopted one it is the layout-cell order [`adoption_mismatch`] already
+    /// validated the session against (see [`equiv::pane_pairs`]).
+    ///
+    /// Emptied, exactly like [`Self::window_map`], when the run cannot be
+    /// attributed to a single server incarnation: half these ids would name
+    /// panes on a server that is gone and the other half panes on one that
+    /// never held the captured session, and nothing downstream can tell them
+    /// apart.
+    pub pane_map: HashMap<String, String>,
     /// The server incarnation every window id above belongs to, or `None`
     /// when this restore cannot attribute its work to one server.
     ///
@@ -64,6 +83,17 @@ pub struct RestoreOutcome {
     /// ran, with what changed. Everything this attempt did is then reported
     /// as failed — see [`ServerWatch`] for why nothing else is honest.
     pub server_changed: Option<String>,
+    /// `(pane label, outcome)` for every pane this restore tried — or
+    /// deliberately declined — to hand a resume command to, in the shape
+    /// `"session:window.pane_idx"`. Empty when nothing was bound to a
+    /// conversation, when `agents.auto_resume` is off, or before this field
+    /// is populated (every path above [`resume_agents`] leaves it empty by
+    /// [`Default`]).
+    ///
+    /// Populated by [`resume_agents`], called from [`run_restore`] after
+    /// every pane exists and the captured layouts are applied — see that
+    /// call site for why the ordering matters.
+    pub agent_outcomes: Vec<(String, resume::Outcome)>,
 }
 
 /// Watches the destination server's identity for the whole of a restore.
@@ -297,14 +327,19 @@ struct LiveWindow {
     active: bool,
     /// Whether one of its panes is zoomed.
     zoomed: bool,
+    /// Whether tmux owns the name (`automatic-rename` on) rather than the user.
+    auto_named: bool,
 }
 
 fn live_windows(tmux: &Tmux, session: &str) -> Result<Vec<LiveWindow>> {
-    const FIELDS: [&str; 6] = [
+    const FIELDS: [&str; 7] = [
         "window_id",
         "window_index",
         "window_active",
         "window_zoomed_flag",
+        // A window *option*, so its real hyphenated name — see
+        // `crate::tmux::WINDOW_FIELDS`.
+        "automatic-rename",
         "window_name",
         "window_layout",
     ];
@@ -322,8 +357,9 @@ fn live_windows(tmux: &Tmux, session: &str) -> Result<Vec<LiveWindow>> {
             idx: f[1].parse().context("window index")?,
             active: f[2] == "1",
             zoomed: f[3] == "1",
-            name: f[4].clone(),
-            layout: f[5].clone(),
+            auto_named: f[4] == "1",
+            name: f[5].clone(),
+            layout: f[6].clone(),
         });
     }
     windows.sort_by_key(|w| w.idx);
@@ -381,7 +417,15 @@ fn live_shape(tmux: &Tmux, session: &str) -> Result<equiv::SessionShape> {
             .into_iter()
             .map(|w| {
                 let own = panes.remove(&w.idx).unwrap_or_default();
-                equiv::window_shape(w.id, w.idx, w.name, w.layout, w.zoomed, own)
+                equiv::window_shape(
+                    w.id,
+                    w.idx,
+                    w.name,
+                    Some(w.auto_named),
+                    w.layout,
+                    w.zoomed,
+                    own,
+                )
             })
             .collect(),
         active_window,
@@ -392,9 +436,11 @@ fn live_shape(tmux: &Tmux, session: &str) -> Result<equiv::SessionShape> {
 /// name.
 enum Adoption {
     /// It really is the captured session. Carries every
-    /// (captured window id, live window id) pair the comparison matched up,
-    /// which is what lets a linked window be re-linked rather than rebuilt.
-    Match(Vec<(String, String)>),
+    /// (captured window id, live window id) pair the comparison matched up —
+    /// which is what lets a linked window be re-linked rather than rebuilt —
+    /// and every (captured pane id, live pane id) pair, in the layout-cell
+    /// order the comparison itself walked.
+    Match(Vec<(String, String)>, Vec<(String, String)>),
     /// It is something else. Carries what differs.
     Mismatch(String),
 }
@@ -431,7 +477,10 @@ fn adoption_mismatch(tmux: &Tmux, plan: &SessionPlan) -> Adoption {
     let want = equiv::shape_of_plan(plan);
     match equiv::difference(&want, &live) {
         Some(why) => Adoption::Mismatch(why),
-        None => Adoption::Match(equiv::window_pairs(&want, &live)),
+        None => Adoption::Match(
+            equiv::window_pairs(&want, &live),
+            equiv::pane_pairs(&want, &live),
+        ),
     }
 }
 
@@ -447,6 +496,10 @@ pub fn restore_tree(tmux: &Tmux, tree: &SnapshotTree) -> Result<RestoreOutcome> 
     // the destination rather than rebuilt as independent copies that then
     // drift apart.
     let mut created_windows: HashMap<String, String> = HashMap::new();
+    // Captured pane id -> the live pane it became, for every pane this run
+    // created or adopted. Recorded here, where it is known, because it cannot
+    // be reconstructed anywhere else — see `RestoreOutcome::pane_map`.
+    let mut created_panes: HashMap<String, String> = HashMap::new();
 
     for session in &tree.sessions {
         // Whether this iteration may have left something on the destination
@@ -458,16 +511,21 @@ pub fn restore_tree(tmux: &Tmux, tree: &SnapshotTree) -> Result<RestoreOutcome> 
             // non-destructive — but "a session with this name exists" is not
             // evidence that the captured state is back.
             match adoption_mismatch(tmux, session) {
-                Adoption::Match(pairs) => match seed_window_map(&mut created_windows, pairs) {
-                    Ok(()) => outcome.adopted.push(session.name.clone()),
-                    // The live session matches on its own, but the window it
-                    // holds is not the one another session in this same tree
-                    // already accounted for — so the captured link relation
-                    // is not what is live. Reported rather than adopted: the
-                    // snapshot is the only remaining record that those
-                    // sessions shared a window.
-                    Err(why) => outcome.conflicted.push((session.name.clone(), why)),
-                },
+                Adoption::Match(window_pairs, pane_pairs) => {
+                    match seed_window_map(&mut created_windows, window_pairs) {
+                        Ok(()) => {
+                            created_panes.extend(pane_pairs);
+                            outcome.adopted.push(session.name.clone())
+                        }
+                        // The live session matches on its own, but the window it
+                        // holds is not the one another session in this same tree
+                        // already accounted for — so the captured link relation
+                        // is not what is live. Reported rather than adopted: the
+                        // snapshot is the only remaining record that those
+                        // sessions shared a window.
+                        Err(why) => outcome.conflicted.push((session.name.clone(), why)),
+                    }
+                }
                 Adoption::Mismatch(why) => outcome.conflicted.push((session.name.clone(), why)),
             }
         } else {
@@ -475,8 +533,14 @@ pub fn restore_tree(tmux: &Tmux, tree: &SnapshotTree) -> Result<RestoreOutcome> 
             // sessions tmux already created for earlier entries in this loop
             // are real, live side effects and every other session in the tree
             // still deserves its own attempt.
-            match restore_session(tmux, session, &mut created_windows, &mut degradations)
-                .with_context(|| format!("restore session {}", session.name))
+            match restore_session(
+                tmux,
+                session,
+                &mut created_windows,
+                &mut created_panes,
+                &mut degradations,
+            )
+            .with_context(|| format!("restore session {}", session.name))
             {
                 Ok(()) => outcome.created.push(session.name.clone()),
                 // `{:#}` (anyhow's "alternate" Display) renders the full cause
@@ -522,11 +586,12 @@ pub fn restore_tree(tmux: &Tmux, tree: &SnapshotTree) -> Result<RestoreOutcome> 
         for name in lost {
             outcome.failed.push((name, why.clone()));
         }
-        // `created_windows` is deliberately never moved into the outcome: a
-        // mapping records which live window a captured one became, half of
-        // these name windows on a server that is gone and the other half
-        // windows on one that never held the captured session, and nothing
-        // downstream can tell them apart.
+        // Neither `created_windows` nor `created_panes` is moved into the
+        // outcome: a mapping records which live window or pane a captured one
+        // became, half of these name objects on a server that is gone and the
+        // other half objects on one that never held the captured session, and
+        // nothing downstream can tell them apart. An empty `pane_map` is what
+        // stops `resume_agents` sending anything at all on this path.
         outcome.server_changed = Some(why);
         outcome.degraded = degradations.dirs;
         outcome.skipped_layouts = degradations.layouts;
@@ -553,6 +618,7 @@ pub fn restore_tree(tmux: &Tmux, tree: &SnapshotTree) -> Result<RestoreOutcome> 
     outcome.degraded = degradations.dirs;
     outcome.skipped_layouts = degradations.layouts;
     outcome.window_map = created_windows;
+    outcome.pane_map = created_panes;
     Ok(outcome)
 }
 
@@ -727,6 +793,7 @@ fn restore_session(
     tmux: &Tmux,
     session: &SessionPlan,
     created_windows: &mut HashMap<String, String>,
+    created_panes: &mut HashMap<String, String>,
     degraded: &mut Degradations,
 ) -> Result<()> {
     if session.windows.is_empty() {
@@ -815,51 +882,66 @@ fn restore_session(
                 used: cwd.clone(),
             });
         }
+        // Only a name somebody actually chose is applied. A captured name that
+        // tmux owned (`automatic-rename` on) is one it derived from whatever
+        // happened to be in the window's foreground at capture time — usually
+        // `bash`, and, when the capture caught a window in the moment after it
+        // was created, `tmux`. Replaying it through `-n` would be wrong twice
+        // over: it names the window after a process that is not running in it
+        // any more, and `-n` *switches `automatic-rename` off*, so that stale
+        // derived name would then stick permanently to a window the user had
+        // always let tmux name. Omitting `-n` leaves the flag on and tmux
+        // re-derives the name — arriving at what the user saw before the
+        // reboot instead of a fossil of the instant of capture.
+        //
+        // `None` — a snapshot row from before the flag was recorded — keeps
+        // the old behaviour and applies the name. It may be a name the user
+        // chose, and losing one of those across a reboot is the failure this
+        // whole engine exists to prevent; freezing a stale `bash` on a window
+        // is a cosmetic cost the user can undo in one command.
+        //
+        // Nothing downstream depends on the applied name: every tmux command
+        // in this restore targets windows by id, and equivalence does not
+        // compare an auto name at all (see `equiv`).
+        let name_arg: Vec<&str> = if window.auto_named == Some(true) {
+            Vec::new()
+        } else {
+            vec!["-n", window.name.as_str()]
+        };
         let window_id = if session_exists {
-            tmux.run(&[
-                "new-window",
-                "-d",
-                "-t",
-                &target,
-                "-n",
-                &window.name,
-                "-c",
-                &cwd,
-                "-P",
-                "-F",
-                "#{window_id}",
-            ])?
-            .trim()
-            .to_string()
+            let mut args: Vec<&str> = vec!["new-window", "-d", "-t", target.as_str()];
+            args.extend_from_slice(&name_arg);
+            args.extend_from_slice(&["-c", cwd.as_str(), "-P", "-F", "#{window_id}"]);
+            tmux.run(&args)?.trim().to_string()
         } else {
             session_exists = true;
-            let id = tmux
-                .run(&[
-                    "new-session",
-                    "-d",
-                    "-s",
-                    &session.name,
-                    "-x",
-                    &width,
-                    "-y",
-                    &height,
-                    "-n",
-                    &window.name,
-                    "-c",
-                    &cwd,
-                    "-P",
-                    "-F",
-                    "#{window_id}",
-                ])?
-                .trim()
-                .to_string();
+            let mut args: Vec<&str> = vec![
+                "new-session",
+                "-d",
+                "-s",
+                session.name.as_str(),
+                "-x",
+                width.as_str(),
+                "-y",
+                height.as_str(),
+            ];
+            args.extend_from_slice(&name_arg);
+            args.extend_from_slice(&["-c", cwd.as_str(), "-P", "-F", "#{window_id}"]);
+            let id = tmux.run(&args)?.trim().to_string();
             // `new-session` has no way to name the initial window's index,
             // so it lands on the destination's base-index and is moved here.
             place_window(tmux, &session.name, &id, window.idx)?;
             id
         };
 
-        fill_window(tmux, &window_id, window, &session.name, degraded)?;
+        fill_window(
+            tmux,
+            &window_id,
+            window,
+            &session.name,
+            created_panes,
+            degraded,
+        )?;
         created_windows.insert(window.tmux_window_id.clone(), window_id.clone());
         dst_window_ids.push(window_id);
     }
@@ -891,6 +973,7 @@ fn fill_window(
     window_id: &str,
     window: &WindowPlan,
     session: &str,
+    created_panes: &mut HashMap<String, String>,
     degraded: &mut Degradations,
 ) -> Result<()> {
     // Ruling 2: restore the active pane, not just the active window/zoom.
@@ -965,6 +1048,15 @@ fn fill_window(
                 reason,
             });
         }
+    }
+
+    // Written down here, next to the creation that established it: pane
+    // `window.panes[i]` was rebuilt as `created_ids[i]`, and after this
+    // function returns nothing can tell that from the server. `zip` rather
+    // than indexing, so a window whose splits ran out of room records the
+    // panes it did create instead of panicking on the ones it did not.
+    for (captured, live) in window.panes.iter().zip(created_ids.iter()) {
+        created_panes.insert(captured.tmux_pane_id.clone(), live.clone());
     }
 
     if let Some(active_pane_id) = &window.active_pane_id {
@@ -1236,6 +1328,457 @@ pub fn is_retryable(attempt_state: &str) -> bool {
     attempt_state != "succeeded"
 }
 
+/// Whether `outcomes` contain work the restore did not do.
+///
+/// A pane left as a bare shell when it should hold a conversation is exactly
+/// that: [`resume::Outcome::Failed`], [`resume::Outcome::PaneBusy`] and
+/// [`resume::Outcome::PaneMissing`] all mean the conversation did not come
+/// back, so the restore must not be reported as a full success — the
+/// snapshot is the only remaining record of which pane held which
+/// conversation, and retiring it over a shell that should have been a
+/// conversation loses that permanently.
+///
+/// [`resume::Outcome::OwnershipUnknown`] is a failure too, and it is the one
+/// that hid behind `Unsupported`. osm could not establish whether the
+/// conversation was already open somewhere, so it deliberately sent nothing —
+/// leaving a bare shell in a pane that should hold a conversation, which is
+/// exactly the state above. It is also *retryable* in a way the others are
+/// not: the descriptor that could not be identified belongs to a process that
+/// may well be gone by the next attempt.
+///
+/// [`resume::Outcome::Resumed`] is success. [`resume::Outcome::ActiveElsewhere`]
+/// is deliberately **not** a failure: the conversation is alive in another
+/// pane already, and leaving this one as a shell instead of forcing a second
+/// attach is the correct, safe outcome. [`resume::Outcome::Unsupported`] is
+/// likewise not a failure — nothing here was capable of resuming it, which
+/// is not the restore's fault.
+pub fn agent_outcomes_are_degraded(outcomes: &[(String, resume::Outcome)]) -> bool {
+    outcomes.iter().any(|(_, outcome)| {
+        matches!(
+            outcome,
+            resume::Outcome::Failed(_)
+                | resume::Outcome::PaneBusy
+                | resume::Outcome::PaneMissing
+                | resume::Outcome::OwnershipUnknown
+        )
+    })
+}
+
+/// The pane rows a snapshot bound to a conversation, grouped by the window
+/// they belong to.
+///
+/// One entry per window that has at least one bound pane. Only the bound
+/// panes are carried: since the restore now records which live pane each
+/// captured one became (see [`RestoreOutcome::pane_map`]), a pane's identity
+/// no longer has to be inferred from where its siblings landed.
+struct BoundWindow {
+    /// **Every** session this window is linked into in the snapshot, in link
+    /// order. All of them, not one of them: a resume may only be delivered
+    /// into a window whose sessions this restore actually put back, and a
+    /// window linked into a delivered session and a conflicted one is not
+    /// that. Picking "any one session" is how a window belonging to a
+    /// conflicted session could be treated as delivered.
+    ///
+    /// Each entry is `(session name, this window's index within it)` — the two
+    /// halves of the place a debt is recorded at, which is what lets a
+    /// confirmed resume discharge the debt for *this* pane and no other.
+    sessions: Vec<(String, u32)>,
+    window_name: String,
+    /// `(captured pane id, captured idx, kind, native id)`, ordered by `idx`.
+    panes: Vec<BoundPane>,
+}
+
+/// One captured pane that is bound to a conversation.
+type BoundPane = (String, u32, AgentKind, String);
+
+fn agent_bound_windows(conn: &Connection, snapshot_id: i64) -> Result<Vec<BoundWindow>> {
+    let mut w_stmt = conn.prepare(
+        "SELECT DISTINCT w.row_id
+         FROM pane_rows p JOIN window_rows w ON w.row_id = p.window_row_id
+         WHERE w.snapshot_id = ?1 AND p.agent_kind IS NOT NULL AND p.agent_session_id IS NOT NULL
+         ORDER BY w.row_id",
+    )?;
+    let window_row_ids: Vec<i64> = w_stmt
+        .query_map([snapshot_id], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(w_stmt);
+
+    let mut out = Vec::new();
+    for window_row_id in window_row_ids {
+        let window_name: String = conn.query_row(
+            "SELECT name FROM window_rows WHERE row_id = ?1",
+            [window_row_id],
+            |r| r.get(0),
+        )?;
+        let mut s_stmt = conn.prepare(
+            "SELECT s.name, l.idx
+             FROM session_window_links l
+             JOIN session_rows s ON s.row_id = l.session_row_id
+             WHERE l.window_row_id = ?1
+             ORDER BY l.row_id",
+        )?;
+        let sessions: Vec<(String, u32)> = s_stmt
+            .query_map([window_row_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(s_stmt);
+
+        let mut p_stmt = conn.prepare(
+            "SELECT tmux_pane_id, idx, agent_kind, agent_session_id
+             FROM pane_rows
+             WHERE window_row_id = ?1 AND agent_kind IS NOT NULL AND agent_session_id IS NOT NULL
+             ORDER BY idx",
+        )?;
+        let panes: Vec<Option<BoundPane>> = p_stmt
+            .query_map([window_row_id], |r| {
+                let pane_id: String = r.get(0)?;
+                let idx: u32 = r.get(1)?;
+                let kind: String = r.get(2)?;
+                let native_id: String = r.get(3)?;
+                // Unreachable in practice: this column is only ever written
+                // from `AgentKind::as_str`.
+                Ok(AgentKind::parse(&kind).map(|k| (pane_id, idx, k, native_id)))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(p_stmt);
+
+        out.push(BoundWindow {
+            sessions,
+            window_name,
+            panes: panes.into_iter().flatten().collect(),
+        });
+    }
+    Ok(out)
+}
+
+/// How long [`resume_agents`] waits for one pane's conversation to start
+/// before giving up on it. The same budget `osm resume` uses for a single
+/// pane, so a conversation that comes back by hand also comes back on a
+/// boot restore.
+const AGENT_RESUME_TIMEOUT: std::time::Duration = resume::DEFAULT_TIMEOUT;
+
+/// Resume every conversation this snapshot bound to a pane, into the panes
+/// **this restore attempt verifiably put them in**.
+///
+/// # The invariant
+///
+/// > A resume may only be delivered to a pane that this attempt verifiably
+/// > created or adopted, on the server incarnation verified for the whole
+/// > run, identified by a mapping the restore itself recorded.
+///
+/// Every clause is load-bearing and each one closes a way a conversation
+/// could otherwise be typed into somebody else's pane:
+///
+/// * **verifiably created or adopted** — the pane must belong to a session in
+///   [`delivered_sessions`]. Navigating by the captured session *name* and
+///   window *index* instead meant that an unrelated live `dev`, which made
+///   this restore report a topology conflict and put nothing back, was still
+///   a `dev` that `=dev:0` resolved against; the captured conversation went
+///   into a pane of the user's live session. Conflicted, failed, skipped and
+///   degraded sessions are not delivered, so nothing in them is ever sent
+///   anything.
+/// * **on the server incarnation verified for the whole run** — every
+///   delivery is bound to `outcome.server`, and the check happens *inside the
+///   same tmux operation as the send* (see [`resume::deliver`]). Protection
+///   that ends when `restore_tree` returns is protection that ends before the
+///   conversation is delivered: a server dying in between is replaced on the
+///   same socket, reissues the same pane ids, and receives the input.
+///   Publication notices afterwards, which is too late for a pane that has
+///   already been typed into.
+/// * **a mapping the restore itself recorded** — [`RestoreOutcome::pane_map`],
+///   written where each pane was created or matched. Pane identity was
+///   previously reconstructed from `%N` creation order, which is not identity
+///   at all for an *adopted* window: adoption validates a session in
+///   layout-cell order, and a window whose panes were created in one order
+///   and rearranged into another has the two disagreeing — so the
+///   conversation landed in the wrong pane of the right window.
+///
+/// # Placement
+///
+/// Called from [`run_restore`] after `run_restore_attempt` returns — i.e.
+/// after every pane in this restore exists and every window's captured
+/// layout has been applied — and before the source snapshot's fate
+/// (`retire_or_return` / `publish_current_boot`) is decided. Resuming any
+/// earlier would target panes that are still being split and laid out;
+/// deciding the snapshot's fate before this runs would let a restore that
+/// only put back bare shells retire the one record of what should have been
+/// running in them.
+///
+/// # What is and is not attempted
+///
+/// Nothing is attempted at all when `agents.auto_resume` is off. A binding
+/// whose kind has no adapter enabled in `agents.enabled` right now is
+/// skipped — not reported, since nothing here was ever going to attempt it,
+/// consistent with [`resume::Outcome::Unsupported`] not being a failure. A
+/// binding whose conversation is not fresh enough (`last_active` older than
+/// `agents.auto_resume_max_age_mins`) is likewise skipped rather than
+/// attempted and failed: it is left as a shell on purpose, for a human to
+/// resume later through Plan 4's menu, not because anything went wrong.
+pub fn resume_agents(
+    tmux: &Tmux,
+    conn: &Connection,
+    snapshot_id: i64,
+    cfg: &Config,
+    outcome: &RestoreOutcome,
+) -> ResumePass {
+    if !cfg.agents.auto_resume {
+        return ResumePass::default();
+    }
+
+    let windows = match agent_bound_windows(conn, snapshot_id) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "osm: could not read the agent bindings for snapshot {snapshot_id} ({e:#}); \
+                 no conversation will be resumed this run"
+            );
+            return ResumePass::default();
+        }
+    };
+    if windows.iter().all(|w| w.panes.is_empty()) {
+        return ResumePass::default();
+    }
+
+    // The one incarnation this restore's whole run was verified against. With
+    // none there is no server any of this work can be said to be on, so there
+    // is no pane a conversation may safely be put into.
+    let Some(server) = outcome.server.as_deref() else {
+        let mut out = Vec::new();
+        for bw in &windows {
+            for (_, idx, _, native_id) in &bw.panes {
+                out.push((
+                    label_of(bw, *idx),
+                    resume::Outcome::Failed(format!(
+                        "this restore cannot be attributed to one tmux server \
+                         incarnation, so {native_id} was not delivered anywhere"
+                    )),
+                ));
+            }
+        }
+        return ResumePass {
+            outcomes: out,
+            resumed: Vec::new(),
+        };
+    };
+
+    let delivered: HashSet<&str> = delivered_sessions(outcome).into_iter().collect();
+    let adapters = agent::adapters(&cfg.agents.enabled);
+    let live_pane_ids: Vec<String> = tmux
+        .list_panes()
+        .map(|panes| panes.into_iter().map(|p| p.id).collect())
+        .unwrap_or_default();
+    let max_age_secs = (cfg.agents.auto_resume_max_age_mins * 60) as i64;
+    let now = boot::now_epoch();
+
+    let mut out = Vec::new();
+    let mut resumed = Vec::new();
+    let boot_id = boot::current_boot_id().ok();
+    for bw in &windows {
+        // Fail closed on the whole window. A window is one window however
+        // many sessions hold it, so if any of them is a session this restore
+        // did not deliver, this restore did not verifiably put this window
+        // back and may not type into its panes.
+        let undelivered: Vec<&str> = bw
+            .sessions
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !delivered.contains(name))
+            .collect();
+        for (captured_pane, idx, kind, native_id) in &bw.panes {
+            let label = label_of(bw, *idx);
+            if !undelivered.is_empty() {
+                out.push((
+                    label,
+                    resume::Outcome::Failed(format!(
+                        "this restore did not deliver session(s) {:?}, which hold the \
+                         window {:?} that {native_id} was captured in, so nothing was \
+                         sent to any pane",
+                        undelivered, bw.window_name
+                    )),
+                ));
+                continue;
+            }
+            // The only identity available. A pane this attempt did not create
+            // or adopt has no entry, and there is no second way to look one up
+            // — that is the point.
+            let Some(live_pane_id) = outcome.pane_map.get(captured_pane) else {
+                out.push((
+                    label,
+                    resume::Outcome::Failed(format!(
+                        "this restore has no record of putting captured pane \
+                         {captured_pane} back, so it does not know which live pane \
+                         {native_id} belongs in"
+                    )),
+                ));
+                continue;
+            };
+            let Some(adapter) = adapters.iter().find(|a| a.kind() == *kind) else {
+                // Not attempted, not reported: nothing here was ever capable
+                // of resuming this kind, same as `Outcome::Unsupported`.
+                continue;
+            };
+            if let Some(why) = adapter.auto_unsupported_reason() {
+                // Said out loud rather than silently skipped: the user has a
+                // pane that should hold a conversation and will not, and the
+                // restore must not report itself as having put everything
+                // back. `Unsupported` is not counted as a failure — nothing
+                // went wrong — but it is in the record.
+                eprintln!("osm: not resuming {native_id} into {label}: {why}");
+                out.push((label, resume::Outcome::Unsupported));
+                continue;
+            }
+
+            // A discovery failure is not "the conversation is too old to be
+            // worth resuming". Reading them as the same thing is how an
+            // unreadable agent home became a restore that reported success
+            // over a bare shell: the freshness lookup went through `.ok()`,
+            // the binding was silently skipped, and nothing anywhere said the
+            // conversation had not come back.
+            let discovered = match adapter.discover() {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    out.push((
+                        label,
+                        resume::Outcome::Failed(format!(
+                            "could not read the {} conversations to find {native_id} \
+                             ({e:#}); this pane was left as a shell",
+                            adapter.kind().as_str()
+                        )),
+                    ));
+                    continue;
+                }
+            };
+            let last_active = discovered
+                .into_iter()
+                .find(|s| &s.native_id == native_id)
+                .and_then(|s| s.last_active);
+            let fresh = matches!(last_active, Some(t) if now.saturating_sub(t) <= max_age_secs);
+            if !fresh {
+                // Older than the auto-resume window, or no longer
+                // discoverable at all: left as a shell on purpose, for a
+                // human to pick up later — not an outcome to report here.
+                continue;
+            }
+
+            // A pane this restore built moments ago still reports `tmux` as
+            // its foreground command until the shell has finished exec'ing —
+            // 60 times out of 60 when asked immediately — and `preflight`
+            // reads that field to decide whether a pane is idle. Without this
+            // wait a restore refuses its own fresh pane as busy, reports
+            // itself `partial`, and leaves the conversation behind, more often
+            // the busier the machine is. Waiting on the observable condition,
+            // not on a duration: a pane that is genuinely running something is
+            // still refused below.
+            resume::wait_until_idle(tmux, live_pane_id, resume::SETTLE_TIMEOUT);
+
+            // Through `resume_into`, which holds one lock on this
+            // conversation from before the exclusivity check until after the
+            // identity is confirmed. A boot restore and a person typing
+            // `osm resume` are two processes that can reach for the same
+            // conversation at the same moment.
+            let outcome = resume::resume_into(
+                tmux,
+                live_pane_id,
+                adapter.as_ref(),
+                native_id,
+                &live_pane_ids,
+                AGENT_RESUME_TIMEOUT,
+                server,
+            );
+            // A confirmed resume pays the debt for the pane it was confirmed
+            // in, there and then. Waiting for a later capture to observe the
+            // conversation leaves the promise standing over a pane that is
+            // already back: a user who closes this conversation while the
+            // restore is still working through the panes after it makes the
+            // publication find a bare shell with the debt still pending, and
+            // the conversation they just closed is carried forward and
+            // resurrected on the next boot.
+            if outcome == resume::Outcome::Resumed {
+                resumed.push(ResumedConversation {
+                    kind: *kind,
+                    native_id: native_id.clone(),
+                    live_pane_id: live_pane_id.clone(),
+                    label: label.clone(),
+                });
+                if let Some(boot_id) = &boot_id {
+                    for (session_name, window_idx) in &bw.sessions {
+                        let place = (session_name.clone(), *window_idx, *idx);
+                        if let Err(e) = crate::debt::discharge_at(
+                            conn,
+                            boot_id,
+                            &place,
+                            &(*kind, native_id.clone()),
+                        ) {
+                            eprintln!(
+                                "osm: {native_id} is back in {label} but the debt for it \
+                                 could not be discharged ({e:#}); a capture may carry it \
+                                 forward as though it were still owed"
+                            );
+                        }
+                    }
+                }
+            }
+            out.push((label, outcome));
+        }
+    }
+    ResumePass {
+        outcomes: out,
+        resumed,
+    }
+}
+
+/// What one restore's resume pass did: what to report, and what it actually
+/// put back.
+///
+/// The second half is not derivable from the first. An outcome is a label and
+/// a verdict, for a human and for `osm restore --json`; the publication needs
+/// the *conversations* it confirmed, to check that the topology it is about to
+/// write down still holds them.
+#[derive(Debug, Default)]
+pub struct ResumePass {
+    pub outcomes: Vec<(String, resume::Outcome)>,
+    /// Every conversation confirmed back into its pane, in the order they were
+    /// resumed.
+    pub resumed: Vec<ResumedConversation>,
+}
+
+/// A conversation this restore put back, **and the live pane it was confirmed
+/// in**.
+///
+/// The pane is not decoration. A resume is a statement about one pane, and the
+/// publication's job is to check that the statement still holds before the
+/// source — the only other record of it — is retired. Carrying only `(kind,
+/// id)` made the check answer a weaker question: "is this conversation running
+/// anywhere on the server". A conversation confirmed in pane P that then exits
+/// P and is started by the user in pane Q satisfies that, so the source was
+/// retired and the attempt succeeded although the binding this restore built
+/// is gone and nothing anywhere records that P should have held it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumedConversation {
+    pub kind: AgentKind,
+    pub native_id: String,
+    /// The live pane [`resume::deliver`] confirmed the conversation in — not
+    /// merely the pane it was sent to.
+    pub live_pane_id: String,
+    /// The `session:window.pane` label the pane is reported under, so a
+    /// failure can name the place a human would recognise.
+    pub label: String,
+}
+
+/// The `session:window.pane_idx` label a pane is reported under.
+///
+/// The first session the window is linked into, which for the overwhelmingly
+/// common unlinked window is its only one. Which name it is affects nothing
+/// but the string an operator reads: whether the resume happens at all is
+/// decided against *every* session in [`BoundWindow::sessions`].
+fn label_of(bw: &BoundWindow, idx: u32) -> String {
+    let session = bw
+        .sessions
+        .first()
+        .map(|(name, _)| name.as_str())
+        .unwrap_or("?");
+    format!("{}:{}.{}", session, bw.window_name, idx)
+}
+
 /// Rebuilds tmux topology from the newest snapshot of a previous boot.
 ///
 /// # The caller must already hold the restore lock
@@ -1315,6 +1858,78 @@ pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<
         }
     };
 
+    // Every pane this restore is going to build now exists and every
+    // window's captured layout has been applied — `run_restore_attempt` has
+    // returned, which is exactly what makes this the right moment. Resuming
+    // any earlier would target panes still being split and laid out;
+    // deciding the snapshot's fate (below) any earlier would let a restore
+    // that only put back bare shells retire the one record of what should
+    // have been running in them. Skipped when nothing was actually restored
+    // (`state == "failed"`): by construction that means no pane exists to
+    // resume anything into.
+    let mut state = state;
+    // The conversations the resume pass confirmed back into their panes, which
+    // the publication below has to find still there before it may retire the
+    // snapshot that is the only other record of them.
+    let mut resumed: Vec<ResumedConversation> = Vec::new();
+    if state != "failed" {
+        let cfg = match crate::paths::config_path().and_then(|p| crate::config::load(&p)) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "osm: {e:#}; using the default agent config for this restore's resume pass"
+                );
+                Config::default()
+            }
+        };
+        // Written down *before* anything is delivered, and regardless of
+        // whether `auto_resume` is on: from here until the conversations are
+        // back in their panes (or a human gives up on them), every pane this
+        // restore rebuilt is a bare shell, and a capture landing in that
+        // window would otherwise record "no agent anywhere" over the only
+        // record of which conversation belonged where. This is the recorded
+        // cause that lets such a capture carry the bindings instead — see
+        // `crate::debt`, and note that it is the *restore* that knows this,
+        // which is why it is the restore that says so.
+        // Only about the panes this attempt verifiably put back. A binding in
+        // a session it conflicted on is not owed by anybody: nothing was
+        // restored there, and recording it let a later capture carry that
+        // conversation onto a pane belonging to whoever the live session
+        // belongs to.
+        let delivered: HashSet<&str> = delivered_sessions(&outcome).into_iter().collect();
+        let restored_panes: HashSet<&str> = outcome.pane_map.keys().map(String::as_str).collect();
+        if let Err(e) = crate::debt::record(
+            conn,
+            snapshot_id,
+            &boot_id,
+            boot::now_epoch(),
+            &delivered,
+            &restored_panes,
+        ) {
+            eprintln!(
+                "osm: could not record which conversations this restore still owes \
+                 ({e:#}); a capture taken before they come back may drop their bindings"
+            );
+        }
+        // The verified outcome goes in, not just the connection: which panes
+        // this attempt actually delivered — and on which server incarnation —
+        // is the whole of what makes a resume safe to send. See
+        // `resume_agents`' invariant.
+        let pass = resume_agents(tmux, conn, snapshot_id, &cfg, &outcome);
+        resumed = pass.resumed;
+        let agent_outcomes = pass.outcomes;
+        // Consistent with Plan 1's rule that a snapshot retires only after
+        // verified success: a pane left as a shell when it should hold a
+        // conversation is work this restore did not do, so a run that would
+        // otherwise be `succeeded` is downgraded to `partial` and the
+        // snapshot stays retryable. A run that is already `partial` (or, one
+        // paragraph up, `failed`) needs no further downgrading.
+        if state == "succeeded" && agent_outcomes_are_degraded(&agent_outcomes) {
+            state = "partial".to_string();
+        }
+        outcome.agent_outcomes = agent_outcomes;
+    }
+
     // A verified success is the only path that retires the source, and it
     // must not retire it into a gap. Every hook fired *by* the restore loses
     // the race for the exclusive lock this function's caller holds and
@@ -1329,7 +1944,6 @@ pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<
     // carry-forward asks the source what it is still owed, and a session this
     // restore verifiably delivered must not be carried into the very snapshot
     // that already holds it live. Every other path discharges it below.
-    let mut state = state;
     let mut unsecured = false;
     if state == "succeeded" {
         let published = publish_current_boot(
@@ -1339,9 +1953,24 @@ pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<
             snapshot_id,
             outcome.server.as_deref(),
             &delivered_sessions(&outcome),
+            &resumed,
         );
         match published {
-            Ok(()) => {}
+            Ok(Published { unobserved }) if !unobserved.is_empty() => {
+                // A conversation this restore confirmed is not in the topology
+                // it just wrote down. Its debt is paid — the resume really did
+                // happen — so nothing will carry it, and carrying it anyway
+                // would be guessing about a pane whose conversation has since
+                // gone. The honest report is a partial restore whose source
+                // stays restorable, so the record of what belonged there
+                // survives for a human to act on.
+                eprintln!(
+                    "osm: {}; snapshot {snapshot_id} stays restorable",
+                    unobserved.join("; ")
+                );
+                state = "partial".to_string();
+            }
+            Ok(_) => {}
             // The sessions really are on the server; only the record of them
             // is missing. Its own terminal state, not a success with a
             // footnote. Storing this as `succeeded` produced a report that
@@ -1457,7 +2086,8 @@ fn publish_current_boot(
     snapshot_id: i64,
     expected: Option<&str>,
     delivered: &[&str],
-) -> std::result::Result<(), PublishFailure> {
+    resumed: &[ResumedConversation],
+) -> std::result::Result<Published, PublishFailure> {
     let topo = match crate::capture::collect(tmux) {
         Ok(topo) => topo,
         // A collection that fails because the destination is no longer the
@@ -1494,29 +2124,117 @@ fn publish_current_boot(
             topo.server.as_deref().unwrap_or("no server"),
         )));
     }
-    (|| -> Result<()> {
+    (|| -> Result<Published> {
         let tx = conn.transaction()?;
         // Before `write_topology_in`, whose carry-forward asks the source what
         // it is still owed.
         snapshots::resolve_sessions(&tx, snapshot_id, delivered)?;
         snapshots::refresh_unresolved(&tx, snapshot_id)?;
-        crate::capture::write_topology_in(&tx, &topo, "post_restore")?;
-        tx.execute(
-            "UPDATE restore_attempts SET state = 'succeeded', finished_at = ?2 WHERE id = ?1",
-            rusqlite::params![attempt_id, boot::now_epoch()],
-        )?;
-        tx.execute(
-            "UPDATE snapshots SET state = 'restored', unresolved = 0 WHERE id = ?1",
-            [snapshot_id],
-        )?;
-        tx.execute(
-            "UPDATE session_rows SET unresolved = 0 WHERE snapshot_id = ?1",
-            [snapshot_id],
-        )?;
+        let published_id = crate::capture::write_topology_in(&tx, &topo, "post_restore")?;
+        // Every conversation the resume pass confirmed has had its debt paid,
+        // so nothing will carry it forward. If the topology just written does
+        // not hold it either, this restore's work is not all there: the user
+        // closed it, or it exited on its own, between the confirmation and
+        // here. Retiring the source on that would leave no record anywhere of
+        // where it belonged.
+        let unobserved = unobserved_conversations(&tx, published_id, resumed)?;
+        if unobserved.is_empty() {
+            tx.execute(
+                "UPDATE restore_attempts SET state = 'succeeded', finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![attempt_id, boot::now_epoch()],
+            )?;
+            tx.execute(
+                "UPDATE snapshots SET state = 'restored', unresolved = 0 WHERE id = ?1",
+                [snapshot_id],
+            )?;
+            tx.execute(
+                "UPDATE session_rows SET unresolved = 0 WHERE snapshot_id = ?1",
+                [snapshot_id],
+            )?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(Published { unobserved })
     })()
     .map_err(PublishFailure::Other)
+}
+
+/// What a publication that went through has to say for itself.
+#[derive(Debug, Default)]
+struct Published {
+    /// Conversations the resume pass confirmed back into a pane that the
+    /// published topology binds nowhere. Empty is the ordinary case, and the
+    /// only one in which the source may be retired: the attempt's terminal
+    /// state and the source's fate are then written here, in the same
+    /// transaction as the topology. Otherwise the caller downgrades the run
+    /// and writes them on the ordinary non-success path, which keeps the
+    /// source selectable.
+    unobserved: Vec<String>,
+}
+
+/// The conversations in `resumed` that snapshot `published_id` does not bind
+/// **to the pane they were confirmed in**, each with what the snapshot says
+/// instead, in the order they were resumed.
+///
+/// The pane is the whole check. A restore's claim is never "this conversation
+/// is running somewhere" — it is "this conversation is back in *this* pane",
+/// and the source snapshot is retired on the strength of it. Asking only
+/// whether `(kind, id)` appears anywhere in the published topology let a
+/// conversation that exited the pane this restore built and was started by
+/// hand in another one stand in for the binding that is gone, so the source
+/// was retired and the run reported success with the promise unkept.
+fn unobserved_conversations(
+    tx: &rusqlite::Transaction,
+    published_id: i64,
+    resumed: &[ResumedConversation],
+) -> Result<Vec<String>> {
+    if resumed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT p.agent_kind, p.agent_session_id, p.tmux_pane_id
+         FROM pane_rows p JOIN window_rows w ON w.row_id = p.window_row_id
+         WHERE w.snapshot_id = ?1
+           AND p.agent_kind IS NOT NULL AND p.agent_session_id IS NOT NULL",
+    )?;
+    let bound: Vec<(String, String, String)> = stmt
+        .query_map([published_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut out = Vec::new();
+    for r in resumed {
+        let kind = r.kind.as_str().to_string();
+        if bound
+            .iter()
+            .any(|(k, id, pane)| *k == kind && *id == r.native_id && *pane == r.live_pane_id)
+        {
+            continue;
+        }
+        // Where it went instead, when it went anywhere: an operator reading
+        // this needs to know whether the conversation is gone or merely
+        // somewhere else.
+        let elsewhere: Vec<&str> = bound
+            .iter()
+            .filter(|(k, id, _)| *k == kind && *id == r.native_id)
+            .map(|(_, _, pane)| pane.as_str())
+            .collect();
+        out.push(if elsewhere.is_empty() {
+            format!(
+                "{} was resumed and confirmed in {} ({}) but is not running \
+                 anywhere in the topology this restore published",
+                r.native_id, r.live_pane_id, r.label
+            )
+        } else {
+            format!(
+                "{} was resumed and confirmed in {} ({}) but the topology this \
+                 restore published has it in {}, so the binding this restore \
+                 built is not there",
+                r.native_id,
+                r.live_pane_id,
+                r.label,
+                elsewhere.join(", ")
+            )
+        });
+    }
+    Ok(out)
 }
 
 /// Take back every claim an attempt made about work it turns out cannot be
@@ -1711,6 +2429,7 @@ mod tests {
             snap,
             outcome.server.as_deref(),
             &delivered,
+            &[],
         )
         .expect_err("a topology from another server is not this restore's work");
         match &failure {
@@ -1797,6 +2516,7 @@ mod tests {
             snap,
             outcome.server.as_deref(),
             &delivered,
+            &[],
         )
         .unwrap_or_else(|e| match e {
             PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),
@@ -1817,5 +2537,343 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, "restored");
+    }
+
+    /// A conversation this restore confirmed back into a pane, and that the
+    /// topology it then wrote down does not hold.
+    ///
+    /// The confirmation discharged its debt — the resume really did happen —
+    /// so nothing will carry the binding forward, and carrying it anyway would
+    /// be guessing about a pane whose conversation has since gone. What must
+    /// not happen is the third thing: publishing a topology without it *and*
+    /// retiring the snapshot that still knows where it belonged, leaving no
+    /// record of it anywhere while the run reports success.
+    #[test]
+    fn a_resume_the_published_topology_does_not_hold_keeps_the_source() {
+        let src = Server::start("unobs-src");
+        src.session("alpha");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+        let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+        conn.execute("UPDATE snapshots SET boot_id='boot-a' WHERE id=?1", [snap])
+            .unwrap();
+        conn.execute(
+            "UPDATE session_rows SET unresolved=1 WHERE snapshot_id=?1",
+            [snap],
+        )
+        .unwrap();
+        src.kill();
+
+        let dst = Server::start("unobs-dst");
+        let tree = model::load(&conn, snap).unwrap();
+        let outcome = restore_tree(dst.t(), &tree).unwrap();
+        assert_eq!(outcome.created, vec!["alpha".to_string()], "{outcome:?}");
+
+        conn.execute(
+            "INSERT INTO restore_attempts (snapshot_id, started_at, state) VALUES (?1, ?2, 'running')",
+            rusqlite::params![snap, boot::now_epoch()],
+        )
+        .unwrap();
+        let attempt = conn.last_insert_rowid();
+
+        // Nothing is running in the destination's panes, so a conversation
+        // reported as confirmed cannot be in the topology about to be written.
+        let live_pane = dst.t().list_panes().unwrap()[0].id.clone();
+        let resumed = vec![ResumedConversation {
+            kind: AgentKind::Claude,
+            native_id: "gone-since".to_string(),
+            live_pane_id: live_pane.clone(),
+            label: "alpha:0.0".to_string(),
+        }];
+        let delivered = delivered_sessions(&outcome);
+        let published = publish_current_boot(
+            &mut conn,
+            dst.t(),
+            attempt,
+            snap,
+            outcome.server.as_deref(),
+            &delivered,
+            &resumed,
+        )
+        .unwrap_or_else(|e| match e {
+            PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),
+            PublishFailure::Other(e) => panic!("publication failed: {e:#}"),
+        });
+
+        assert_eq!(published.unobserved.len(), 1, "{:?}", published.unobserved);
+        let why = &published.unobserved[0];
+        assert!(
+            why.contains("gone-since") && why.contains(&live_pane),
+            "the publication has to say which conversation it could not find, \
+             and where it was supposed to be: {why}"
+        );
+        assert_eq!(
+            reasons(&conn),
+            vec!["test".to_string(), "post_restore".to_string()],
+            "the topology on the machine is still written down: it is real"
+        );
+        let state: String = conn
+            .query_row("SELECT state FROM snapshots WHERE id=?1", [snap], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            state, "complete",
+            "the source is the only record of where that conversation belonged, \
+             so it must stay restorable"
+        );
+        let attempt_state: String = conn
+            .query_row(
+                "SELECT state FROM restore_attempts WHERE id=?1",
+                [attempt],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempt_state, "running",
+            "a run missing part of its work is not a success; the caller writes \
+             the downgraded terminal state"
+        );
+    }
+
+    /// The conversation is running, and in the wrong pane.
+    ///
+    /// A restore's claim is never "this conversation is somewhere on the
+    /// server" — it is "this conversation is back in *this* pane", and the
+    /// source snapshot, the only other record of that binding, is retired on
+    /// the strength of it. Checking only `(kind, id)` let a conversation that
+    /// left the pane this restore built and was started by hand in another one
+    /// stand in for the binding that is gone: the source was retired, the
+    /// attempt succeeded, and nothing anywhere recorded that the pane the
+    /// restore built should have been holding it.
+    ///
+    /// The second half of this test is its own control: the same publication,
+    /// with the pane the conversation is *actually* in, still goes through and
+    /// still retires the source. A check that refused both would be no better
+    /// than the one it replaced.
+    #[test]
+    fn a_resume_the_published_topology_holds_in_another_pane_keeps_the_source() {
+        const ID: &str = "0cfebf91-81c0-43d5-af63-c9fe7e845a01";
+
+        let src = Server::start("wrongpane-src");
+        src.session("alpha");
+        src.t()
+            .run(&["split-window", "-t", "=alpha:", "-c", "/tmp"])
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+        let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+        conn.execute("UPDATE snapshots SET boot_id='boot-a' WHERE id=?1", [snap])
+            .unwrap();
+        conn.execute(
+            "UPDATE session_rows SET unresolved=1 WHERE snapshot_id=?1",
+            [snap],
+        )
+        .unwrap();
+        src.kill();
+
+        let dst = Server::start("wrongpane-dst");
+        let tree = model::load(&conn, snap).unwrap();
+        let outcome = restore_tree(dst.t(), &tree).unwrap();
+        assert_eq!(outcome.created, vec!["alpha".to_string()], "{outcome:?}");
+
+        // A conversation on disk, and a real process holding it open in the
+        // *second* pane. The stub is a copy of the shell binary named `claude`,
+        // so `#{pane_current_command}` reads `claude` — see
+        // `tests/agent_capture_replaced_transcript.rs` for why that has to be
+        // the process's own name.
+        let home = tmp.path().join("claude-home");
+        let transcript = home.join("projects/-tmp").join(format!("{ID}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{\"cwd\":\"/tmp\"}\n").unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sh = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("a sh binary");
+        let claude_bin = bin.join("claude");
+        std::fs::copy(sh, &claude_bin).unwrap();
+        let runner = bin.join("run.sh");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nexec {:?} -c 'exec 3<\"$1\"; read line' -- {:?}\n",
+                claude_bin, transcript
+            ),
+        )
+        .unwrap();
+        for path in [&claude_bin, &runner] {
+            let mut perm = std::fs::metadata(path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            std::fs::set_permissions(path, perm).unwrap();
+        }
+
+        // SAFETY: nothing else in this module reads OSM_CLAUDE_HOME, and a
+        // capture running concurrently would only discover this one fixture
+        // conversation, which no pane of its own holds.
+        std::env::set_var("OSM_CLAUDE_HOME", &home);
+
+        let panes = dst.t().list_panes().unwrap();
+        assert_eq!(panes.len(), 2, "the fixture needs two panes: {panes:?}");
+        let built = panes[0].id.clone();
+        let elsewhere = panes[1].id.clone();
+        dst.t()
+            .run(&[
+                "send-keys",
+                "-t",
+                &elsewhere,
+                runner.to_str().unwrap(),
+                "C-m",
+            ])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = dst.t().list_panes().unwrap();
+            let cmd = now.iter().find(|p| p.id == elsewhere).unwrap().cmd.clone();
+            if cmd == "claude" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the conversation never started in {elsewhere} (it is running {cmd})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        conn.execute(
+            "INSERT INTO restore_attempts (snapshot_id, started_at, state) VALUES (?1, ?2, 'running')",
+            rusqlite::params![snap, boot::now_epoch()],
+        )
+        .unwrap();
+        let attempt = conn.last_insert_rowid();
+        let delivered = delivered_sessions(&outcome);
+
+        // ---- the finding: confirmed in one pane, running in another --------
+        let published = publish_current_boot(
+            &mut conn,
+            dst.t(),
+            attempt,
+            snap,
+            outcome.server.as_deref(),
+            &delivered,
+            &[ResumedConversation {
+                kind: AgentKind::Claude,
+                native_id: ID.to_string(),
+                live_pane_id: built.clone(),
+                label: "alpha:0.0".to_string(),
+            }],
+        )
+        .unwrap_or_else(|e| match e {
+            PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),
+            PublishFailure::Other(e) => panic!("publication failed: {e:#}"),
+        });
+
+        // The published topology really does hold the conversation — in the
+        // pane the restore did not build it in.
+        let first_published: i64 = conn
+            .query_row("SELECT MAX(id) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        let bound: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT p.tmux_pane_id, p.agent_session_id
+                 FROM pane_rows p JOIN window_rows w ON w.row_id = p.window_row_id
+                 WHERE w.snapshot_id = ?1 AND p.agent_session_id IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([first_published], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            bound,
+            vec![(elsewhere.clone(), ID.to_string())],
+            "the fixture only means anything if the conversation is bound to \
+             the other pane"
+        );
+
+        assert_eq!(
+            published.unobserved.len(),
+            1,
+            "the binding this restore built is gone; a conversation running in \
+             some other pane must not stand in for it: {:?}",
+            published.unobserved
+        );
+        let why = &published.unobserved[0];
+        assert!(
+            why.contains(ID) && why.contains(&built) && why.contains(&elsewhere),
+            "the publication has to name the conversation, the pane it was \
+             confirmed in and the pane it is in instead: {why}"
+        );
+        let state: String = conn
+            .query_row("SELECT state FROM snapshots WHERE id=?1", [snap], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            state, "complete",
+            "the source is the only record that {built} should hold this \
+             conversation, so it must stay restorable"
+        );
+        let attempt_state: String = conn
+            .query_row(
+                "SELECT state FROM restore_attempts WHERE id=?1",
+                [attempt],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempt_state, "running",
+            "the binding this restore built is gone, so the publication must \
+             not mark the attempt succeeded"
+        );
+        assert!(
+            is_retryable("partial"),
+            "the state the caller downgrades to must leave the source selectable"
+        );
+
+        // ---- the control: the same check, with the pane it is really in ----
+        let published = publish_current_boot(
+            &mut conn,
+            dst.t(),
+            attempt,
+            snap,
+            outcome.server.as_deref(),
+            &delivered,
+            &[ResumedConversation {
+                kind: AgentKind::Claude,
+                native_id: ID.to_string(),
+                live_pane_id: elsewhere.clone(),
+                label: "alpha:0.1".to_string(),
+            }],
+        )
+        .unwrap_or_else(|e| match e {
+            PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),
+            PublishFailure::Other(e) => panic!("publication failed: {e:#}"),
+        });
+        assert!(
+            published.unobserved.is_empty(),
+            "a conversation confirmed in the pane it is running in is observed: \
+             {:?}",
+            published.unobserved
+        );
+        let state: String = conn
+            .query_row("SELECT state FROM snapshots WHERE id=?1", [snap], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "restored", "a verified restore retires its source");
+        let attempt_state: String = conn
+            .query_row(
+                "SELECT state FROM restore_attempts WHERE id=?1",
+                [attempt],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "succeeded");
+
+        std::env::remove_var("OSM_CLAUDE_HOME");
     }
 }

@@ -197,10 +197,28 @@ fn a_conflicting_session_does_not_stop_the_other_sessions_from_restoring() {
     let src = Server::start("mix-src");
     let (_tmp, _conn, tree) = {
         let t = src.t();
-        t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
-            .unwrap();
-        t.run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
-            .unwrap();
+        t.run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap();
+        t.run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "beta",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap();
         t.run(&[
             "new-window",
             "-d",
@@ -221,7 +239,16 @@ fn a_conflicting_session_does_not_stop_the_other_sessions_from_restoring() {
 
     let dst = Server::start("mix-dst");
     dst.t()
-        .run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "beta",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
 
     let out = restore::restore_tree(dst.t(), &tree).unwrap();
@@ -555,6 +582,80 @@ fn a_captured_layout_naming_one_pane_twice_is_a_conflict_not_a_crash() {
     assert_eq!(
         window_names(dst.t(), "dev"),
         vec!["shell".to_string()],
+        "a conflict must never clobber the live session"
+    );
+}
+
+/// A live window the **user** named is not a window nobody named, however
+/// perfectly the rest of it lines up.
+///
+/// The snapshot's window here is auto-named — tmux chose `bash` for it — and
+/// the live `dev` has the same one window at the same index, the same single
+/// pane, the same directory and the same geometry. The only difference is that
+/// the user has called their window `notes`. Adopting across that difference
+/// takes over a session the user is working in *and* retires the snapshot that
+/// still holds the real `dev`, which is the one trade this comparison exists
+/// not to make.
+#[test]
+fn a_live_window_the_user_named_is_not_an_auto_named_captured_one() {
+    let src = Server::start("username-src");
+    src.t()
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "dev",
+            "-c",
+            "/tmp",
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ])
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+    let id = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+    let tree = model::load(&conn, id).unwrap();
+    drop(src);
+
+    // Same shape, same place, same directory — a name the user chose.
+    let dst = Server::start("username-dst");
+    dst.t()
+        .run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "dev",
+            "-n",
+            "notes",
+            "-c",
+            "/tmp",
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ])
+        .unwrap();
+
+    let out = restore::restore_tree(dst.t(), &tree).unwrap();
+
+    assert!(
+        out.adopted.is_empty(),
+        "a session whose window the user named must not be adopted as an \
+         auto-named captured one: {:?}",
+        out.adopted
+    );
+    assert_eq!(out.conflicted.len(), 1, "{out:?}");
+    assert_eq!(out.conflicted[0].0, "dev");
+    assert!(
+        out.conflicted[0].1.contains("named"),
+        "the conflict must say the names differ, got {:?}",
+        out.conflicted[0].1
+    );
+    assert_eq!(
+        window_names(dst.t(), "dev"),
+        vec!["notes".to_string()],
         "a conflict must never clobber the live session"
     );
 }

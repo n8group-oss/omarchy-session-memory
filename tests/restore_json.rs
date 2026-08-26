@@ -260,8 +260,17 @@ fn a_successful_restore_emits_the_full_contract() {
     let t = env.tmux();
     let _server = Server(t.clone());
 
-    t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
-        .expect("start tmux");
+    t.run(&[
+        "new-session",
+        "-n",
+        "code",
+        "-d",
+        "-s",
+        "alpha",
+        "-c",
+        "/tmp",
+    ])
+    .expect("start tmux");
 
     let snapshot = env.osm().arg("snapshot").output().unwrap();
     assert!(
@@ -293,10 +302,28 @@ fn a_partial_restore_emits_the_full_contract_and_exits_non_zero() {
     let t = env.tmux();
     let _server = Server(t.clone());
 
-    t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
-        .expect("start tmux");
-    t.run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
-        .expect("second session");
+    t.run(&[
+        "new-session",
+        "-n",
+        "code",
+        "-d",
+        "-s",
+        "alpha",
+        "-c",
+        "/tmp",
+    ])
+    .expect("start tmux");
+    t.run(&[
+        "new-session",
+        "-n",
+        "code",
+        "-d",
+        "-s",
+        "beta",
+        "-c",
+        "/tmp",
+    ])
+    .expect("second session");
 
     let snapshot = env.osm().arg("snapshot").output().unwrap();
     assert!(

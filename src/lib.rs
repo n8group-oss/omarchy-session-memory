@@ -1,7 +1,9 @@
+pub mod agent;
 pub mod boot;
 pub mod capture;
 pub mod config;
 pub mod db;
+pub mod debt;
 pub mod equiv;
 pub mod health;
 pub mod hooks;

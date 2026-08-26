@@ -304,21 +304,27 @@ pub fn parse_records(out: &str, n: usize) -> Result<Vec<Vec<String>>> {
 /// to read in a debugger; correctness no longer depends on that order, since
 /// every field is escaped.
 const SESSION_FIELDS: [&str; 2] = ["session_id", "session_name"];
-const WINDOW_FIELDS: [&str; 7] = [
+const WINDOW_FIELDS: [&str; 8] = [
     "session_id",
     "window_id",
     "window_index",
     "window_active",
     "window_zoomed_flag",
+    // Not a `window_` format variable but a *window option*, which formats
+    // resolve by its real, hyphenated name — `#{automatic_rename}` expands to
+    // the empty string on every tmux tested. Documented under FORMATS as
+    // `#{?automatic-rename,yes,no}`.
+    "automatic-rename",
     "window_name",
     "window_layout",
 ];
-const PANE_FIELDS: [&str; 8] = [
+const PANE_FIELDS: [&str; 9] = [
     "window_id",
     "pane_id",
     "pane_index",
     "pane_active",
     "pane_dead",
+    "pane_pid",
     "pane_current_path",
     "pane_title",
     "pane_current_command",
@@ -345,6 +351,18 @@ pub struct WindowRec {
     pub layout: String,
     pub active: bool,
     pub zoomed: bool,
+    /// Whether tmux owns this window's name (`automatic-rename` is on for it).
+    ///
+    /// When it is, [`Self::name`] is a *derived* value — tmux rewrites it from
+    /// the foreground command, so a window created a moment ago reads `tmux`
+    /// and settles to `bash` shortly after. Recorded so equivalence can tell a
+    /// name the user chose from one tmux is still editing; see
+    /// [`crate::equiv::difference`].
+    ///
+    /// tmux turns the flag off by itself the moment a name is given — by
+    /// `rename-window`, or by `-n` at creation — so "off" really does mean
+    /// "somebody said this window is called that".
+    pub auto_named: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +372,11 @@ pub struct PaneRec {
     pub idx: u32,
     pub active: bool,
     pub dead: bool,
+    /// The pid of the process leading the pane (`#{pane_pid}`), used to walk
+    /// its process tree and open file descriptors when detecting which
+    /// agent conversation, if any, the pane is running — see
+    /// `crate::agent::detect`.
+    pub pid: u32,
     pub cwd: String,
     pub title: String,
     pub cmd: String,
@@ -386,8 +409,9 @@ pub fn parse_windows(out: &str) -> Result<Vec<WindowRec>> {
                 idx: f[2].parse().context("window index")?,
                 active: flag(&f[3]),
                 zoomed: flag(&f[4]),
-                name: f[5].clone(),
-                layout: f[6].clone(),
+                auto_named: flag(&f[5]),
+                name: f[6].clone(),
+                layout: f[7].clone(),
             })
         })
         .collect()
@@ -403,9 +427,10 @@ pub fn parse_panes(out: &str) -> Result<Vec<PaneRec>> {
                 idx: f[2].parse().context("pane index")?,
                 active: flag(&f[3]),
                 dead: flag(&f[4]),
-                cwd: f[5].clone(),
-                title: f[6].clone(),
-                cmd: f[7].clone(),
+                pid: f[5].parse().context("pane pid")?,
+                cwd: f[6].clone(),
+                title: f[7].clone(),
+                cmd: f[8].clone(),
             })
         })
         .collect()
@@ -439,6 +464,10 @@ const SERVER_ID_OPTION: &str = "@osm-server-id";
 
 /// 128 bits, written as hex.
 const SERVER_ID_HEX_LEN: usize = 32;
+
+/// Distinguishes the delivery witnesses one process places, so two
+/// concurrent guarded runs cannot overwrite each other's.
+static WITNESS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 128 fresh bits from the kernel, as lowercase hex.
 ///
@@ -481,6 +510,25 @@ fn fresh_server_id() -> Result<String> {
 /// A `/proc` entry that cannot be read or parsed is an error rather than a
 /// fallback: an identity missing the half that makes it unforgeable is not a
 /// weaker identity, it is the forgeable one.
+/// The `@osm-server-id` value and the pid embedded in an incarnation token
+/// minted by [`Tmux::server_incarnation`], which formats them as
+/// `boot:id:pid:ticks:socket`.
+///
+/// The socket path is taken as everything after the fourth colon, because a
+/// path may contain one; the four fields before it may not (a boot id and the
+/// server id are hex, and the pid and ticks are digits).
+fn incarnation_id_and_pid(token: &str) -> Option<(&str, &str)> {
+    let mut fields = token.splitn(5, ':');
+    let _boot = fields.next()?;
+    let id = fields.next()?;
+    let pid = fields.next()?;
+    let _ticks = fields.next()?;
+    let _socket = fields.next()?;
+    let hex = id.len() == SERVER_ID_HEX_LEN && id.bytes().all(|b| b.is_ascii_hexdigit());
+    let digits = !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit());
+    (hex && digits).then_some((id, pid))
+}
+
 fn process_start_ticks(pid: u32) -> Result<u64> {
     let path = format!("/proc/{pid}/stat");
     let stat = std::fs::read_to_string(&path)
@@ -714,6 +762,106 @@ impl Tmux {
                 "tmux did not report a server identity line: {line:?}"
             )),
         }
+    }
+
+    /// Run `command` — one tmux command, in tmux's own syntax — **only if**
+    /// this server is still the incarnation `incarnation` names, with the
+    /// check and the command evaluated together inside the server.
+    ///
+    /// # Why the check cannot be a separate call
+    ///
+    /// Reading the identity and then acting on the answer leaves a gap, and
+    /// the thing on the other side of that gap is a resume command carrying
+    /// somebody's conversation. A server that dies after the read and is
+    /// replaced before the send hands the replacement the same socket, and
+    /// the replacement mints `%0`, `%1`, … from zero — so the pane id the
+    /// caller verified now names an unrelated pane belonging to whatever the
+    /// user has started since. Noticing afterwards is not a remedy: the input
+    /// has been delivered.
+    ///
+    /// `if-shell -F` closes it. The condition is a format, so tmux evaluates
+    /// it in the server process and runs `command` in the same command
+    /// invocation, with no window in between for a different server to answer
+    /// in. A server that is *not* the named incarnation cannot run the
+    /// command, and a socket whose server has gone away cannot run anything
+    /// at all.
+    ///
+    /// # Why the condition is a witness and not the identity's own fields
+    ///
+    /// The condition used to compare the two fields of the token tmux can
+    /// read about itself — the `@osm-server-id` option and the pid — and that
+    /// is a *partial* identity standing in for a whole one. An incarnation is
+    /// the option **bound to the process start tick** (see
+    /// [`process_start_ticks`]), precisely because the option alone is
+    /// forgeable: a `.tmux.conf` line, or a restored dump of server options,
+    /// hands every server the user starts the same well-formed id. A
+    /// replacement server carrying such a configured id, onto a pid the kernel
+    /// has since reissued, satisfied both halves — and received the resume
+    /// into its own freshly-minted `%N`. A tmux format cannot read `/proc`, so
+    /// the missing half cannot simply be added to the condition.
+    ///
+    /// What can be put in the condition is something the recorded server holds
+    /// and no later server can: 128 fresh bits from the kernel, written into a
+    /// server option of its own before the identity is checked, and named
+    /// uniquely per call so two concurrent deliveries cannot overwrite each
+    /// other's. The order is what makes it sound:
+    ///
+    /// 1. the witness is written to whatever server is on the socket;
+    /// 2. the **full** incarnation is read back and compared, start tick and
+    ///    all. A server on a socket is never succeeded by an earlier one, so a
+    ///    server that reads back as the recorded incarnation now is the server
+    ///    step 1 wrote to;
+    /// 3. the guarded command runs only where that witness is, which after
+    ///    step 2 is the recorded incarnation and nowhere else. A replacement
+    ///    cannot hold it: it is random, is minted after the replacement's
+    ///    configuration was written, and is never persisted anywhere.
+    ///
+    /// The id and the pid stay in the condition alongside it. They carry none
+    /// of its uniqueness; they make the refusal legible to somebody reading
+    /// the command tmux was asked to run.
+    ///
+    /// Returns `Ok(())` whether or not the condition held, and also when the
+    /// identity read in step 2 shows the server has moved: `if-shell` with a
+    /// false condition and no else-branch is a successful no-op, and so is
+    /// declining to ask. Callers must therefore confirm the *effect* rather
+    /// than the exit status, which is what [`crate::agent::resume::deliver`]
+    /// does by waiting for the agent to appear and re-reading the identity if
+    /// it never does.
+    pub fn run_if_incarnation(&self, incarnation: &str, command: &str) -> Result<()> {
+        let (id, pid) = incarnation_id_and_pid(incarnation).ok_or_else(|| {
+            anyhow!("{incarnation:?} is not a tmux server incarnation token osm minted")
+        })?;
+        // Unique per call, so a second delivery running at the same moment
+        // sets its own witness rather than overwriting this one — which would
+        // turn a sound delivery into a silent refusal.
+        let witness_option = format!(
+            "@osm-delivery-{}-{}",
+            std::process::id(),
+            WITNESS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let witness = fresh_server_id()?;
+        self.run(&["set-option", "-s", &witness_option, &witness])
+            .with_context(|| format!("place a delivery witness for {incarnation}"))?;
+        let guarded = (|| -> Result<()> {
+            // Step 2. Anything but the whole recorded incarnation — a
+            // different server, no server, a server that will not identify
+            // itself — means the witness above may have landed somewhere else,
+            // so nothing is asked of anyone.
+            if self.server_incarnation()? != incarnation {
+                return Ok(());
+            }
+            let condition = format!(
+                "#{{&&:#{{==:#{{{SERVER_ID_OPTION}}},{id}}},\
+                 #{{&&:#{{==:#{{pid}},{pid}}},#{{==:#{{{witness_option}}},{witness}}}}}}}"
+            );
+            self.run(&["if-shell", "-F", &condition, command])?;
+            Ok(())
+        })();
+        // Best effort, and only ever about this server's memory: a witness
+        // left behind names no incarnation but the one that is holding it, and
+        // dies with it.
+        let _ = self.run(&["set-option", "-su", &witness_option]);
+        guarded
     }
 
     pub fn server_running(&self) -> bool {

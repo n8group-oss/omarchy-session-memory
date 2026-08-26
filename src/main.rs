@@ -47,6 +47,20 @@ enum Command {
     UninstallHooks,
     /// Run the capture daemon (fallback-interval loop)
     Daemon,
+    /// Report every AI coding-agent conversation as JSON: the ones a pane is
+    /// running right now, and the ones that are only resumable
+    Agents {
+        /// Accepted for forward compatibility and ignored: `agents` output
+        /// is always JSON, exactly as `status` is.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume one conversation into the current pane (`$TMUX_PANE`)
+    Resume {
+        /// The agent's own id for the conversation, as printed by
+        /// `osm agents --json` under `native_id`.
+        native_id: String,
+    },
 }
 
 /// The tmux server to use when neither `--socket` nor `OSM_TMUX_SOCKET` is
@@ -76,6 +90,25 @@ fn default_server_tmux() -> Result<osm::tmux::Tmux> {
 /// right answer for a transient cause and a visible one for a persistent
 /// cause. Silently looping forever is what let a broken capture go unnoticed.
 const MAX_CONSECUTIVE_CAPTURE_FAILURES: u32 = 3;
+
+/// The configuration the agent subcommands read, falling back to the
+/// defaults when it cannot be loaded.
+///
+/// A broken config must not make `osm agents` and `osm resume` unusable:
+/// the field they need is which adapters are enabled, and the default set
+/// is the right answer for a user who never wrote a config at all. The
+/// problem is still said out loud on stderr, and `osm status --json`
+/// reports it as a real problem — the same treatment `daemon` gives its
+/// timings.
+fn agent_config() -> osm::config::Config {
+    match osm::paths::config_path().and_then(|p| osm::config::load(&p)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("osm: {e:#}; using the default agent configuration");
+            osm::config::Config::default()
+        }
+    }
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -221,7 +254,16 @@ fn main() -> Result<()> {
             let ready = problems.is_empty();
             problems.extend(notices);
             let message = (!problems.is_empty()).then(|| problems.join("; "));
-            let report = osm::ipc::StatusReport::new(ready, message, capture, database, tmux);
+            // Which agents osm will actually act on, not merely which the
+            // config lists. An adapter whose automatic capture and resume are
+            // unsupported says so here, with its reason.
+            let enabled = cfg
+                .as_ref()
+                .map(|c| c.agents.enabled.clone())
+                .unwrap_or_else(|| osm::config::AgentsCfg::default().enabled);
+            let agents = osm::ipc::AgentSupport::of(&enabled);
+            let report =
+                osm::ipc::StatusReport::new(ready, message, capture, database, tmux, agents);
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Snapshot { reason, debounced } => {
@@ -431,6 +473,117 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+        Command::Agents { json: _ } => {
+            let tmux = resolve_tmux()?;
+            let cfg = agent_config();
+            let adapters = osm::agent::adapters(&cfg.agents.enabled);
+            // Probing every pane on this server is the whole inventory: a
+            // conversation is "live" because a pane is holding its
+            // transcript open, which is a fact about the running processes,
+            // not about anything osm recorded earlier.
+            let probes: Vec<osm::agent::detect::PaneProbe> = tmux
+                .list_panes()?
+                .into_iter()
+                .map(|p| osm::agent::detect::PaneProbe {
+                    pane_id: p.id,
+                    pane_pid: p.pid,
+                    cwd: p.cwd,
+                    foreground_cmd: p.cmd,
+                })
+                .collect();
+            let inventory = osm::agent::inventory(&probes, &adapters)?;
+            println!(
+                "{}",
+                serde_json::to_string(&osm::ipc::AgentsJson::from_inventory(&inventory))?
+            );
+        }
+        Command::Resume { native_id } => {
+            let tmux = resolve_tmux()?;
+            let cfg = agent_config();
+            let adapters = osm::agent::adapters(&cfg.agents.enabled);
+
+            // The pane this command was typed in. Never inferred: with no
+            // TMUX_PANE there is no "current pane", and choosing one would
+            // mean sending a conversation into a pane someone is working in
+            // — the single worst thing this feature can do.
+            let pane = match std::env::var("TMUX_PANE") {
+                Ok(p) if !p.is_empty() => p,
+                _ => anyhow::bail!(
+                    "TMUX_PANE is not set, so there is no current pane to resume into; \
+                     run this from inside the tmux pane you want the conversation in"
+                ),
+            };
+
+            // Which adapter owns this conversation is decided by asking each
+            // one what it has on disk — never by the id's shape, which two
+            // agents can share (both Claude and Codex name conversations
+            // with a UUID).
+            let mut owner = None;
+            for adapter in &adapters {
+                if adapter
+                    .discover()?
+                    .iter()
+                    .any(|session| session.native_id == native_id)
+                {
+                    owner = Some(adapter);
+                    break;
+                }
+            }
+            let Some(adapter) = owner else {
+                anyhow::bail!(
+                    "no conversation {native_id:?} in any enabled agent ({}); \
+                     `osm agents --json` lists the ids that exist",
+                    cfg.agents.enabled.join(", ")
+                );
+            };
+
+            // The incarnation this resume is bound to, read once and then
+            // re-checked inside the same tmux operation as the delivery. A
+            // server that dies between the preflight and the send is replaced
+            // on the same socket and reissues the same `%N`, so without this
+            // the conversation would be typed into whatever pane the
+            // replacement has given that id to.
+            let server = match tmux.running_server_incarnation()? {
+                Some(server) => server,
+                None => anyhow::bail!(
+                    "there is no tmux server on this socket, so there is no pane to \
+                     resume {native_id:?} into"
+                ),
+            };
+            let live_pane_ids: Vec<String> = tmux.list_panes()?.into_iter().map(|p| p.id).collect();
+            // Every precondition failure is reported as itself, not collapsed
+            // into a generic error: "the pane is busy" and "this conversation
+            // is already running elsewhere" call for different things from
+            // whoever asked. `resume_into` holds one lock on the conversation
+            // across the whole of it, so two of these started at the same
+            // moment cannot both get past the exclusivity check.
+            let outcome = osm::agent::resume::resume_into(
+                &tmux,
+                &pane,
+                adapter.as_ref(),
+                &native_id,
+                &live_pane_ids,
+                osm::agent::resume::DEFAULT_TIMEOUT,
+                &server,
+            );
+            let resumed = matches!(outcome, osm::agent::resume::Outcome::Resumed);
+            println!(
+                "{}",
+                serde_json::to_string(&osm::ipc::ResumeJson::new(
+                    adapter.kind(),
+                    &native_id,
+                    &pane,
+                    &outcome
+                ))?
+            );
+            // The JSON is written first and always. The status exists for
+            // the caller that does not parse it — a keybinding or a menu
+            // entry — which must still be able to see that the conversation
+            // is not in the pane.
+            if !resumed {
+                std::process::exit(1);
             }
         }
     }

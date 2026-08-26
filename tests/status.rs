@@ -299,3 +299,47 @@ fn status_reports_a_database_preserved_by_a_schema_change() {
     // forever.
     assert_eq!(v["ready"], true, "{v}");
 }
+
+/// What osm will and will not do automatically, said where a user looks for
+/// capabilities.
+///
+/// OpenCode's automatic capture path was unreachable — it owns no transcript,
+/// so binding could score it at most 0.4 against a 0.75 threshold — and
+/// nothing anywhere said so, in the output, in the README, or in a test. A
+/// capability osm does not have now has to be declared, and this is the
+/// declaration a consumer can read.
+#[test]
+fn status_names_the_agents_osm_will_not_capture_or_resume_by_itself() {
+    let env = Env::new("agents");
+    env.write_config("[agents]\nenabled = [\"claude\", \"codex\", \"opencode\"]\n");
+
+    let v = env.status();
+    let agents = &v["agents"];
+    assert_eq!(
+        agents["enabled"],
+        serde_json::json!(["claude", "codex", "opencode"]),
+        "{v}"
+    );
+    let unsupported = agents["unsupported"].as_array().unwrap();
+    assert_eq!(
+        unsupported.len(),
+        1,
+        "exactly the one kind osm cannot act on: {v}"
+    );
+    assert_eq!(unsupported[0]["kind"], "opencode");
+    let reason = unsupported[0]["reason"].as_str().unwrap();
+    assert!(
+        !reason.is_empty() && reason.contains("osm"),
+        "the reason is prose a user can act on: {reason}"
+    );
+
+    // And a configuration without it says there is nothing unsupported,
+    // rather than listing a kind that is simply absent.
+    env.write_config("[agents]\nenabled = [\"claude\"]\n");
+    let v = env.status();
+    assert_eq!(v["agents"]["enabled"], serde_json::json!(["claude"]), "{v}");
+    assert!(
+        v["agents"]["unsupported"].as_array().unwrap().is_empty(),
+        "{v}"
+    );
+}

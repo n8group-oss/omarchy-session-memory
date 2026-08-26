@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 /// 7 by server identity, which added `snapshots.server` and
 /// `restore_attempts.destination_server` — the tmux server *incarnation* a
 /// topology was read from and a restore's window ids belong to, without which
-/// a window map outlived the server that gave it meaning.
+/// a window map outlived the server that gave it meaning, and to 9 by
+/// `window_rows.auto_named` — whether tmux owned a window's name at capture
+/// time, without which a name tmux was still deriving was compared as if the
+/// user had chosen it (see [`crate::equiv`]).
 ///
 /// # What happens to a database written under another version
 ///
@@ -35,9 +38,18 @@ use std::path::{Path, PathBuf};
 /// | 4       | migrated in place (one `ALTER TABLE`, adding `snapshots.unresolved`) |
 /// | 5       | migrated in place (adds `session_rows.unresolved` and `restore_window_map`, rebuilds `restore_attempts` for its wider `CHECK`) |
 /// | 6       | migrated in place (two added columns, both nullable: the server identities) |
-/// | 7       | opened in place |
+/// | 7       | migrated in place (adds `agent_resume_debt`) |
+/// | 8       | migrated in place (one added column, nullable: `window_rows.auto_named`) |
+/// | 9       | opened in place |
 /// | unversioned (osm tables, no `schema_version`) | preserved as `state.db.unversioned.bak` |
 /// | newer than this build | preserved as `state.db.v<N>.bak` |
+///
+/// 8 is migrated too, and the added column is nullable on purpose: a row
+/// written before it existed cannot say whether the user chose the window's
+/// name, and NULL is read as "not an identity" — the same direction as an
+/// auto-renamed window. Defaulting those rows to "the user named it" would
+/// leave every snapshot already on disk exposed to the bug the column exists
+/// to fix, with no way for the user to clear it.
 ///
 /// 1, 2 and 3 are deliberately not migrated: v1 keyed windows by
 /// session, so its rows cannot be lifted into the link relation without
@@ -50,7 +62,7 @@ use std::path::{Path, PathBuf};
 /// rather than linking the wrong window. What matters is that the file is still there
 /// afterwards. [`preserved`] reports the situation and `osm status --json`
 /// prints it, so a preserved database is visible rather than silent.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 9;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -111,6 +123,15 @@ CREATE TABLE IF NOT EXISTS window_rows (
   tmux_window_id TEXT    NOT NULL,
   name           TEXT    NOT NULL,
   layout         TEXT    NOT NULL,
+  -- Whether tmux owned `name` when this row was written (`automatic-rename`
+  -- on for the window), or NULL when the row predates this column.
+  --
+  -- Load-bearing for equivalence, not decoration: with the flag on, `name` is
+  -- a value tmux derives from the foreground command and rewrites as it
+  -- changes, so a capture that lands in the moment a fresh window is still
+  -- called `tmux` records a name that never matches again. Comparing it then
+  -- pinned the snapshot out of retention forever. See `crate::equiv`.
+  auto_named     INTEGER CHECK (auto_named IN (0,1)),
   active_pane_id TEXT,
   zoomed         INTEGER NOT NULL DEFAULT 0 CHECK (zoomed IN (0,1)),
   UNIQUE (snapshot_id, tmux_window_id)
@@ -222,6 +243,40 @@ CREATE TABLE IF NOT EXISTS restore_objects (
                               'conflicted','degraded','failed')),
   detail     TEXT,
   UNIQUE (attempt_id, kind, ref)
+);
+
+-- Which conversations a restore has put a *pane* back for without (yet)
+-- putting the conversation back into it.
+--
+-- The one reason a capture may carry an agent binding forward instead of
+-- writing down what it detected. A capture landing between a restore building
+-- its panes and the resumes completing sees bare shells everywhere, and
+-- recording that verbatim erases the only record of which conversation
+-- belonged where. The previous rule — "more than half the conversations are
+-- gone, so distrust the whole map" — inferred that cause from a ratio, and
+-- inference is what made it fire on a user who simply closed an agent: the
+-- correct fresh binding was discarded and the closed conversation carried
+-- forward for ever. Debt is therefore recorded per object, by the restore
+-- that incurred it, with the boot it belongs to and the moment it was taken
+-- on, exactly as Plan 1 concluded for session carry-forward.
+--
+-- `boot_id` scopes it: a debt is a statement about panes on this boot's
+-- server, and nothing owed before a reboot survives one. `recorded_at` bounds
+-- it: see `debt::WINDOW_SECS`.
+CREATE TABLE IF NOT EXISTS agent_resume_debt (
+  row_id       INTEGER PRIMARY KEY,
+  boot_id      TEXT    NOT NULL,
+  kind         TEXT    NOT NULL,
+  native_id    TEXT    NOT NULL,
+  -- Where the pane was, in the only identity that survives a restore: the
+  -- session's name, the window's index in it, and the pane's index in the
+  -- window. Kept so an operator can see what is owed and where, and so two
+  -- panes owing the same conversation are two rows rather than one.
+  session_name TEXT    NOT NULL,
+  window_idx   INTEGER NOT NULL,
+  pane_idx     INTEGER NOT NULL,
+  recorded_at  INTEGER NOT NULL,
+  UNIQUE (boot_id, kind, native_id, session_name, window_idx, pane_idx)
 );
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1011,6 +1066,44 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
                      ALTER TABLE restore_attempts ADD COLUMN destination_server TEXT;",
                 )?;
                 version = 7;
+            }
+            // Pending resume debt. A new, empty table: a database written
+            // before this build recorded no debt, and an empty table is the
+            // truthful reading of that — nothing is owed, so nothing is
+            // carried, which is the conservative half. The alternative
+            // (treating every existing binding as owed) would resurrect
+            // conversations the user closed under the old build.
+            7 => {
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS agent_resume_debt (
+                       row_id       INTEGER PRIMARY KEY,
+                       boot_id      TEXT    NOT NULL,
+                       kind         TEXT    NOT NULL,
+                       native_id    TEXT    NOT NULL,
+                       session_name TEXT    NOT NULL,
+                       window_idx   INTEGER NOT NULL,
+                       pane_idx     INTEGER NOT NULL,
+                       recorded_at  INTEGER NOT NULL,
+                       UNIQUE (boot_id, kind, native_id, session_name,
+                               window_idx, pane_idx)
+                     );",
+                )?;
+                version = 8;
+            }
+            // Whether tmux owned a window's name. Nullable, and every existing
+            // row keeps NULL — "this row cannot say". Equivalence reads that
+            // as "the name is not an identity" and skips it, which is the only
+            // safe reading: the rows were written by a build that could not
+            // distinguish a name the user chose from one tmux was still
+            // deriving, so a captured `tmux` or `bash` in them may be either.
+            // Believing them would keep exactly the snapshots the user already
+            // has pinned out of retention forever.
+            8 => {
+                tx.execute_batch(
+                    "ALTER TABLE window_rows ADD COLUMN auto_named INTEGER
+                     CHECK (auto_named IN (0,1))",
+                )?;
+                version = 9;
             }
             _ => return Ok(false),
         }

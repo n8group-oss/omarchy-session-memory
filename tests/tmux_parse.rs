@@ -80,21 +80,29 @@ fn parses_session_lines() {
 
 #[test]
 fn parses_window_lines_with_flags() {
+    // Field 5 is `automatic-rename`, between the zoom flag and the name: `1`
+    // when tmux owns the window's name, `0` when the user set it. It is what
+    // tells a name that is *identity* from one tmux is merely deriving from
+    // the foreground command.
     let input = format!(
         "{}{}",
-        record(&["$0", "@1", "1", "1", "0", "main", "c2b4,80x24,0,0,0"]),
-        record(&["$0", "@2", "2", "0", "1", "logs", "c2b4,80x24,0,0,1"]),
+        record(&["$0", "@1", "1", "1", "0", "1", "main", "c2b4,80x24,0,0,0"]),
+        record(&["$0", "@2", "2", "0", "1", "0", "logs", "c2b4,80x24,0,0,1"]),
     );
     let out = tmux::parse_windows(&input).unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].session_id, "$0");
     assert_eq!(out[0].id, "@1");
     assert_eq!(out[0].idx, 1);
+    assert_eq!(out[0].name, "main");
     assert_eq!(out[0].layout, "c2b4,80x24,0,0,0");
     assert!(out[0].active);
     assert!(!out[0].zoomed);
+    assert!(out[0].auto_named, "tmux owns @1's name");
     assert!(!out[1].active);
     assert!(out[1].zoomed);
+    assert_eq!(out[1].name, "logs");
+    assert!(!out[1].auto_named, "the user set @2's name");
 }
 
 #[test]
@@ -105,6 +113,7 @@ fn parses_pane_lines_preserving_paths_with_spaces() {
         "0",
         "1",
         "0",
+        "4242",
         "/home/u/my projects/app",
         "claude",
         "node",
@@ -112,6 +121,7 @@ fn parses_pane_lines_preserving_paths_with_spaces() {
     let out = tmux::parse_panes(&input).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].window_id, "@1");
+    assert_eq!(out[0].pid, 4242);
     assert_eq!(out[0].id, "%0");
     assert!(out[0].active);
     assert!(!out[0].dead);
@@ -129,7 +139,7 @@ fn empty_output_yields_empty_vec() {
 #[test]
 fn malformed_record_is_an_error_not_a_panic() {
     let err = tmux::parse_panes(&record(&["not-enough-fields"])).unwrap_err();
-    assert!(err.to_string().contains("expected 8 fields"));
+    assert!(err.to_string().contains("expected 9 fields"));
 }
 
 /// Output that never went through the escaping substitutions — an ancient
@@ -176,7 +186,7 @@ fn free_text_containing_a_separator_round_trips() {
 #[test]
 fn free_text_containing_a_newline_round_trips() {
     for value in ["/tmp/a\nb", "\nleading", "trailing\n", "a\n\nb"] {
-        let input = record(&["@1", "%0", "0", "1", "0", value, "title", "sh"]);
+        let input = record(&["@1", "%0", "0", "1", "0", "1", value, "title", "sh"]);
         let out = tmux::parse_panes(&input)
             .unwrap_or_else(|e| panic!("cwd {value:?} must parse, got {e}"));
         assert_eq!(out.len(), 1, "cwd {value:?}");

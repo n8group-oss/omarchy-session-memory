@@ -37,7 +37,16 @@ fn second_lock_holder_is_refused() {
 fn run_restore_marks_snapshot_restored_and_records_objects() {
     let src = Server::start("src");
     src.0
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -88,7 +97,16 @@ fn run_restore_marks_snapshot_restored_and_records_objects() {
 fn run_restore_without_a_previous_boot_snapshot_is_a_noop() {
     let src = Server::start("noop");
     src.0
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
@@ -125,7 +143,16 @@ fn wedge_as_if_killed_mid_restore(conn: &rusqlite::Connection, snapshot_id: i64)
 fn restore_reclaims_a_snapshot_wedged_by_a_killed_restore() {
     let src = Server::start("wedged-src");
     src.0
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
@@ -175,7 +202,16 @@ fn restore_reclaims_a_snapshot_wedged_by_a_killed_restore() {
 fn a_reclaimed_restore_adopts_live_sessions_instead_of_duplicating() {
     let src = Server::start("readopt-src");
     src.0
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
@@ -209,7 +245,16 @@ fn a_reclaimed_restore_adopts_live_sessions_instead_of_duplicating() {
 fn error_after_attempt_row_exists_fails_the_attempt_and_keeps_the_snapshot() {
     let src = Server::start("finda-src");
     src.0
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -314,10 +359,28 @@ fn break_session_restore(conn: &rusqlite::Connection, snap: i64, session: &str) 
 fn partial_state_is_reached_when_one_session_fails_and_another_succeeds() {
     let src = Server::start("partial-src");
     src.0
-        .run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     src.0
-        .run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "beta",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();

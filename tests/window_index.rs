@@ -101,7 +101,16 @@ fn source_with_a_gap(t: &Tmux) {
 fn destination_with_base_index_5(label: &str) -> Server {
     let dst = Server::start(label);
     dst.t()
-        .run(&["new-session", "-d", "-s", "osm-keeper", "-c", "/tmp"])
+        .run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "osm-keeper",
+            "-c",
+            "/tmp",
+        ])
         .unwrap();
     dst.t()
         .run(&["set-option", "-g", "base-index", "5"])

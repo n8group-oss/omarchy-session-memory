@@ -250,7 +250,7 @@ fn restoring_twice_after_reboot_does_not_duplicate() {
     let before = Server(Tmux::with_socket(&sock("dup-before")));
     before
         .0
-        .run(&["new-session", "-d", "-s", "dev", "-c", "/tmp"])
+        .run(&["new-session", "-n", "code", "-d", "-s", "dev", "-c", "/tmp"])
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();

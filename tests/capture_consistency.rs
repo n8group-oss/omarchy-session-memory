@@ -20,8 +20,17 @@ struct Server(Tmux);
 impl Server {
     fn start(label: &str) -> Self {
         let t = Tmux::with_socket(&format!("osm-cons-{}-{}", label, std::process::id()));
-        t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
-            .unwrap();
+        t.run(&[
+            "new-session",
+            "-n",
+            "code",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap();
         Server(t)
     }
 }
@@ -48,6 +57,7 @@ fn window(session_id: &str, id: &str, idx: u32, name: &str) -> WindowRec {
         layout: "abcd,80x24,0,0,0".to_string(),
         active: true,
         zoomed: false,
+        auto_named: false,
     }
 }
 
@@ -58,6 +68,7 @@ fn pane(window_id: &str, id: &str) -> PaneRec {
         idx: 0,
         active: true,
         dead: false,
+        pid: 1,
         cwd: "/tmp".to_string(),
         title: "t".to_string(),
         cmd: "bash".to_string(),
@@ -185,8 +196,17 @@ fn a_real_server_including_a_linked_window_reads_as_consistent() {
         .unwrap();
     t.run(&["split-window", "-t", "alpha:logs", "-c", "/tmp"])
         .unwrap();
-    t.run(&["new-session", "-d", "-s", "beta", "-c", "/tmp"])
-        .unwrap();
+    t.run(&[
+        "new-session",
+        "-n",
+        "code",
+        "-d",
+        "-s",
+        "beta",
+        "-c",
+        "/tmp",
+    ])
+    .unwrap();
     t.run(&["link-window", "-d", "-s", "alpha:logs", "-t", "beta:"])
         .unwrap();
 
