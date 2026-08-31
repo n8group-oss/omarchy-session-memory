@@ -112,8 +112,16 @@ impl AgentAdapter for Claude {
                 let metadata = file_entry.metadata().ok();
                 // The transcript's own `cwd` line is exact; the directory
                 // name is a lossy fallback used only when that's missing.
-                let project_dir = super::project_dir_from_transcript(&file_path)
-                    .or_else(|| decode_project_dir_name(&project_path));
+                // The decoder cannot tell a path separator from a hyphen in a
+                // real directory name, so it turns `n8group-oss` into
+                // `n8group/oss`. Only trust its answer when the directory it
+                // names actually exists: a wrong path is worse than none,
+                // because a restore would recreate the pane somewhere the
+                // user never was.
+                let project_dir = super::project_dir_from_transcript(&file_path).or_else(|| {
+                    decode_project_dir_name(&project_path)
+                        .filter(|d| std::path::Path::new(d).is_dir())
+                });
                 found.push(AgentSession {
                     kind: AgentKind::Claude,
                     native_id: id,

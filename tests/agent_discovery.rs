@@ -68,9 +68,44 @@ fn claude_falls_back_to_the_encoded_directory_name_when_the_first_line_has_no_cw
 
     assert_eq!(found.len(), 1);
     assert_eq!(
+        found[0].project_dir, None,
+        "the decode names /home/u/app, which does not exist here, so it is \
+         not claimed -- a wrong directory would have a restore recreate the \
+         pane somewhere the user has never been: {:?}",
+        found[0]
+    );
+}
+
+#[test]
+fn claude_uses_the_decoded_directory_name_when_it_names_a_real_directory() {
+    // The other half of the same rule: the decode IS used, but only once it
+    // points at something that exists.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let id = "0cfebf91-81c0-43d5-af63-c9fe7e844ede";
+
+    // A real directory whose path contains no hyphen, so the encoding is
+    // unambiguous and the decode can be exact.
+    let project = root.join("realproject");
+    std::fs::create_dir_all(&project).unwrap();
+    let encoded = project.to_str().unwrap().replace('/', "-");
+
+    write(
+        &root
+            .join("projects")
+            .join(&encoded)
+            .join(format!("{id}.jsonl")),
+        "not json at all\n",
+    );
+
+    let found = osm::agent::claude::Claude::with_home(root)
+        .discover()
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(
         found[0].project_dir.as_deref(),
-        Some("/home/u/app"),
-        "unparseable first line falls back to decoding the directory name, not erroring: {:?}",
+        project.to_str(),
+        "a decode naming a real directory is used: {:?}",
         found[0]
     );
 }
@@ -96,9 +131,10 @@ fn claude_project_dir_never_reads_past_the_capped_prefix() {
         .unwrap();
 
     assert_eq!(found.len(), 1);
-    // Truncated mid-token JSON never parses, so this falls back to the
-    // directory-name decode rather than erroring or hanging.
-    assert_eq!(found[0].project_dir.as_deref(), Some("/home/u/app"));
+    // The point of this test is that a 64 MiB line with no newline neither
+    // hangs nor reads the whole file. Nothing parses, and the decode names
+    // a directory that does not exist, so no path is claimed.
+    assert_eq!(found[0].project_dir, None);
 }
 
 #[test]

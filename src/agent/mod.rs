@@ -75,28 +75,46 @@ pub(crate) fn extract_uuid(s: &str) -> Option<String> {
 /// hundreds of megabytes, and a corrupt one may have no newline at all, so
 /// this is a hard cap on the read itself — never "read until newline
 /// found".
-const FIRST_LINE_CAP_BYTES: usize = 8 * 1024;
+const PREFIX_SCAN_CAP_BYTES: usize = 64 * 1024;
 
 /// The `cwd` field from the first line of the transcript at `path`, read as
-/// at most [`FIRST_LINE_CAP_BYTES`] bytes regardless of the file's real
+/// at most [`PREFIX_SCAN_CAP_BYTES`] bytes regardless of the file's real
 /// size or whether it contains a newline at all. Anything that doesn't
 /// parse cleanly out of that capped prefix — truncated JSON, no `cwd`
 /// field, non-UTF-8 bytes — is "no project directory", not an error.
 pub(crate) fn project_dir_from_transcript(path: &Path) -> Option<String> {
     use std::io::Read;
+    // The first line is not the one that carries `cwd`.
+    //
+    // A real transcript opens with metadata records — `last-prompt`, `mode`,
+    // `permission-mode` — and the working directory appears only on a later
+    // message record. Reading line one alone therefore found nothing on
+    // every transcript on the maintainer's machine, silently fell through to
+    // the lossy directory-name decoder, and turned
+    // `/home/user/projects/n8group-oss/proj-alpha` into
+    // `/home/user/projects/n8group/oss/proj-alpha` — because that decoder
+    // cannot tell a path separator from a hyphen in a real directory name.
+    //
+    // Scan a bounded prefix for the first record that has one. Still bounded:
+    // a transcript can be hundreds of megabytes.
     let mut file = fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; FIRST_LINE_CAP_BYTES];
+    let mut buf = vec![0u8; PREFIX_SCAN_CAP_BYTES];
     let n = file.read(&mut buf).ok()?;
     buf.truncate(n);
-    if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-        buf.truncate(nl);
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines() {
+        // The final line of the read prefix may be truncated mid-record;
+        // it simply fails to parse, which is the correct outcome.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
     }
-    let text = std::str::from_utf8(&buf).ok()?;
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    value
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    None
 }
 
 /// Minimum agreement required before a pane is bound to a conversation.

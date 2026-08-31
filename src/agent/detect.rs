@@ -264,6 +264,53 @@ pub fn open_transcripts(pid: u32) -> Vec<PathBuf> {
     held_transcripts(pid).present
 }
 
+/// Conversation ids this pane's agent lineage names in its own argv.
+///
+/// A process running `claude --resume <uuid>` is not evidence *about* a
+/// conversation; it is the process saying which one it is running. That is
+/// the strongest signal available, and on the maintainer's machine it is the
+/// only one: measured across 20 live panes, 20 named the id in argv and
+/// **none** held the transcript open. Claude Code appends and closes rather
+/// than keeping the file open, so a detector resting on open descriptors
+/// finds nothing at all.
+///
+/// Only the flags that name an existing conversation count. `--session-id`
+/// on a fresh launch mints an id that is equally a statement of identity, so
+/// both are read; a bare `claude` with no id yields nothing.
+pub fn argv_conversation_ids(pane_pid: u32, binary: &str) -> Vec<String> {
+    const FLAGS: [&str; 3] = ["--resume", "--session-id", "--session"];
+    let mut out: Vec<String> = Vec::new();
+    for pid in descendants(pane_pid) {
+        if process_name(pid).as_deref() != Some(binary) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        for (i, a) in args.iter().enumerate() {
+            // `--resume <id>` and `--resume=<id>` are both real spellings.
+            let candidate = if let Some(eq) = a.find('=') {
+                FLAGS.contains(&&a[..eq]).then(|| a[eq + 1..].to_string())
+            } else if FLAGS.contains(&a.as_str()) {
+                args.get(i + 1).cloned()
+            } else {
+                None
+            };
+            if let Some(id) = candidate {
+                if !id.is_empty() && !id.starts_with('-') && !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The name a process runs under, as **tmux** reads it: the basename of
 /// `argv[0]` from `/proc/<pid>/cmdline`.
 ///
@@ -555,6 +602,8 @@ pub fn prepare<'a>(adapters: &'a [Box<dyn AgentAdapter>]) -> Result<Vec<Prepared
 ///
 /// Evidence is additive per adapter and must reach [`CONFIDENCE_THRESHOLD`]:
 /// - the foreground command equals the adapter's binary name: **+0.4**
+/// - the pane's agent lineage names exactly one conversation, by holding its
+///   transcript open or by naming it in argv: **+0.5**
 /// - a process in the pane's **agent lineage** holds one (and only one) of
 ///   that adapter's *discovered* transcripts open: **+0.5**
 /// - that transcript's recorded project directory equals the pane's cwd:
@@ -597,14 +646,27 @@ pub fn bind(probe: &PaneProbe, prepared: &[Prepared]) -> Option<Binding> {
             score += 0.4;
         }
 
-        // Distinct conversations this adapter recognises among the
-        // transcripts its own lineage in this pane holds open.
+        // Distinct conversations this adapter's lineage in this pane names,
+        // whether by holding a transcript open or by saying so in its argv.
+        //
+        // Both are the process identifying itself, so both weigh the same and
+        // neither binds alone -- the foreground command must still agree.
+        // argv exists because open descriptors are not a signal Claude Code
+        // provides: it appends and closes.
         let mut owned_ids: Vec<String> = Vec::new();
         for path in agent_lineage_transcripts(probe.pane_pid, binary) {
             if let Some(id) = p.index.id_of(&path) {
                 if !owned_ids.iter().any(|seen| seen == id) {
                     owned_ids.push(id.to_string());
                 }
+            }
+        }
+        for id in argv_conversation_ids(probe.pane_pid, binary) {
+            // Only a conversation this adapter actually knows about. An id in
+            // argv that names nothing on disk is a typo or another tool's
+            // flag, not a conversation to bind to.
+            if p.sessions.iter().any(|s| s.native_id == id) && !owned_ids.contains(&id) {
+                owned_ids.push(id);
             }
         }
 
