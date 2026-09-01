@@ -94,6 +94,15 @@ pub struct RestoreOutcome {
     /// every pane exists and the captured layouts are applied — see that
     /// call site for why the ordering matters.
     pub agent_outcomes: Vec<(String, resume::Outcome)>,
+    /// `(session name, outcome)` for every session with a recorded terminal
+    /// window that this restore tried — or deliberately declined — to give
+    /// one back. Empty when the source snapshot recorded no placement at all,
+    /// which is every snapshot taken on a machine with no compositor.
+    ///
+    /// Populated by [`place_windows`], called from [`run_restore`] after the
+    /// resume pass and before the source's fate is decided — see that call
+    /// site.
+    pub window_outcomes: Vec<(String, crate::desktop::PlaceOutcome)>,
 }
 
 /// Watches the destination server's identity for the whole of a restore.
@@ -642,6 +651,34 @@ fn delivered_sessions(outcome: &RestoreOutcome) -> Vec<&str> {
         .chain(outcome.adopted.iter())
         .map(String::as_str)
         .filter(|name| !degraded.contains(name))
+        .collect()
+}
+
+/// One window this attempt reported as placed: the session it was opened for,
+/// and which window it is.
+struct PlacedClaim<'a> {
+    session: &'a str,
+    window: &'a crate::desktop::PlacedWindow,
+}
+
+/// The windows this attempt reported as placed.
+///
+/// The claim the publication is then held to: a window that was spawned,
+/// found, moved, and attached, and that the snapshot published afterwards
+/// must still hold — that window, holding that session, where it was put.
+/// Only `Placed` counts; every other outcome already says the work was not
+/// done.
+fn placed_windows(outcome: &RestoreOutcome) -> Vec<PlacedClaim<'_>> {
+    outcome
+        .window_outcomes
+        .iter()
+        .filter_map(|(session, o)| match o {
+            crate::desktop::PlaceOutcome::Placed(window) => Some(PlacedClaim {
+                session: session.as_str(),
+                window,
+            }),
+            _ => None,
+        })
         .collect()
 }
 
@@ -1788,6 +1825,28 @@ fn label_of(bw: &BoundWindow, idx: u32) -> String {
 /// only sound while we hold the lock (see
 /// [`snapshots::reclaim_orphaned_restores`]).
 pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<RestoreReport> {
+    run_restore_with(
+        conn,
+        tmux,
+        dry_run,
+        &crate::hypr::Live::new(),
+        &crate::desktop::RealSpawner::new(),
+    )
+}
+
+/// [`run_restore`] against a given compositor and terminal spawner.
+///
+/// The seam exists so a test can drive the whole command — selection, tmux
+/// rebuild, resume, placement, publication — without a compositor and without
+/// executing a terminal. Production has exactly one caller, [`run_restore`],
+/// and it passes the real pair.
+pub fn run_restore_with(
+    conn: &mut Connection,
+    tmux: &Tmux,
+    dry_run: bool,
+    h: &dyn crate::hypr::HyprCtl,
+    sp: &dyn crate::desktop::Spawner,
+) -> Result<RestoreReport> {
     let boot_id = boot::current_boot_id()?;
 
     // Before selecting anything: a restore that died between
@@ -1872,16 +1931,17 @@ pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<
     // the publication below has to find still there before it may retire the
     // snapshot that is the only other record of them.
     let mut resumed: Vec<ResumedConversation> = Vec::new();
+    // Read once, out here: the publication below needs `restore.place_windows`
+    // as much as the resume and placement passes do, and a restore must not
+    // decide the same question two different ways within one run.
+    let cfg = match crate::paths::config_path().and_then(|p| crate::config::load(&p)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("osm: {e:#}; using the default config for this restore");
+            Config::default()
+        }
+    };
     if state != "failed" {
-        let cfg = match crate::paths::config_path().and_then(|p| crate::config::load(&p)) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!(
-                    "osm: {e:#}; using the default agent config for this restore's resume pass"
-                );
-                Config::default()
-            }
-        };
         // Written down *before* anything is delivered, and regardless of
         // whether `auto_resume` is on: from here until the conversations are
         // back in their panes (or a human gives up on them), every pane this
@@ -1928,6 +1988,24 @@ pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<
             state = "partial".to_string();
         }
         outcome.agent_outcomes = agent_outcomes;
+
+        // Last, and before the source's fate is decided. Last because a
+        // terminal attaches to a session and resizes it, so every pane must
+        // already exist and every captured layout must already be applied;
+        // before the decision because a session whose window did not come
+        // back is work this restore did not do, and the snapshot that records
+        // where that window was is the only copy of it.
+        let window_outcomes =
+            place_windows(h, sp, tmux, conn, snapshot_id, &outcome, attempt_id, &cfg);
+        // Not written to `restore_objects`: that table's `kind` already means
+        // a *tmux* window and its `state` is a closed set of tmux-restore
+        // outcomes. Placement reports through `RestoreReport` and the JSON
+        // contract instead, rather than overloading a column whose CHECK
+        // constraint would have to be widened to admit it.
+        if state == "succeeded" && window_outcomes_are_degraded(&window_outcomes) {
+            state = "partial".to_string();
+        }
+        outcome.window_outcomes = window_outcomes;
     }
 
     // A verified success is the only path that retires the source, and it
@@ -1949,14 +2027,20 @@ pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<
         let published = publish_current_boot(
             conn,
             tmux,
+            h,
             attempt_id,
             snapshot_id,
             outcome.server.as_deref(),
             &delivered_sessions(&outcome),
             &resumed,
+            cfg.restore.place_windows,
+            &placed_windows(&outcome),
         );
         match published {
-            Ok(Published { unobserved }) if !unobserved.is_empty() => {
+            Ok(Published {
+                unobserved,
+                unplaced,
+            }) if !unobserved.is_empty() || !unplaced.is_empty() => {
                 // A conversation this restore confirmed is not in the topology
                 // it just wrote down. Its debt is paid — the resume really did
                 // happen — so nothing will carry it, and carrying it anyway
@@ -1966,7 +2050,11 @@ pub fn run_restore(conn: &mut Connection, tmux: &Tmux, dry_run: bool) -> Result<
                 // survives for a human to act on.
                 eprintln!(
                     "osm: {}; snapshot {snapshot_id} stays restorable",
-                    unobserved.join("; ")
+                    unobserved
+                        .into_iter()
+                        .chain(unplaced)
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 );
                 state = "partial".to_string();
             }
@@ -2079,16 +2167,33 @@ enum PublishFailure {
 /// `None` is a legitimate value and means "this restore saw no server at all",
 /// which must then still be true here: a server that has appeared since is as
 /// much a mismatch as a different one.
+#[allow(clippy::too_many_arguments)]
 fn publish_current_boot(
     conn: &mut Connection,
     tmux: &Tmux,
+    h: &dyn crate::hypr::HyprCtl,
     attempt_id: i64,
     snapshot_id: i64,
     expected: Option<&str>,
     delivered: &[&str],
     resumed: &[ResumedConversation],
+    place: bool,
+    placed: &[PlacedClaim<'_>],
 ) -> std::result::Result<Published, PublishFailure> {
-    let topo = match crate::capture::collect(tmux) {
+    // With the compositor, not without it. This snapshot replaces the source
+    // that is about to be retired, so if it carried no placement the windows
+    // this restore just put back would be recorded nowhere and the next
+    // reboot would have nothing to place.
+    //
+    // Unless placement is switched off, in which case there is no compositor
+    // to ask and nothing to record: the same single answer the rest of the
+    // run used.
+    let collected = if place {
+        crate::capture::collect_with_desktop(tmux, h)
+    } else {
+        crate::capture::collect(tmux)
+    };
+    let topo = match collected {
         Ok(topo) => topo,
         // A collection that fails because the destination is no longer the
         // server this restore built on is not a reporting problem — it is the
@@ -2131,6 +2236,16 @@ fn publish_current_boot(
         snapshots::resolve_sessions(&tx, snapshot_id, delivered)?;
         snapshots::refresh_unresolved(&tx, snapshot_id)?;
         let published_id = crate::capture::write_topology_in(&tx, &topo, "post_restore")?;
+        // In the same transaction as the topology it describes, and before
+        // the source is retired. `write_topology_in` writes the tmux half
+        // alone — the placement write lives in `write_topology`, which this
+        // path does not go through — so every successful restore used to
+        // publish a replacement snapshot with no `terminal_windows` at all,
+        // retire the source that held them, and leave the next reboot with no
+        // placement to restore. The feature undid itself once per boot.
+        if let Some(ps) = topo.placements.as_deref() {
+            crate::desktop::write_placements_in(&tx, published_id, ps)?;
+        }
         // Every conversation the resume pass confirmed has had its debt paid,
         // so nothing will carry it forward. If the topology just written does
         // not hold it either, this restore's work is not all there: the user
@@ -2138,7 +2253,13 @@ fn publish_current_boot(
         // here. Retiring the source on that would leave no record anywhere of
         // where it belonged.
         let unobserved = unobserved_conversations(&tx, published_id, resumed)?;
-        if unobserved.is_empty() {
+        // And the same question about windows. A session this restore reported
+        // `Placed` whose terminal the published snapshot does not hold is a
+        // window that is not there — the terminal exited, or its attach was
+        // lost between the placement pass and here. Retiring the source on
+        // that would leave no record anywhere of where that window belonged.
+        let unplaced = unplaced_windows(&tx, published_id, placed)?;
+        if unobserved.is_empty() && unplaced.is_empty() {
             tx.execute(
                 "UPDATE restore_attempts SET state = 'succeeded', finished_at = ?2 WHERE id = ?1",
                 rusqlite::params![attempt_id, boot::now_epoch()],
@@ -2153,7 +2274,10 @@ fn publish_current_boot(
             )?;
         }
         tx.commit()?;
-        Ok(Published { unobserved })
+        Ok(Published {
+            unobserved,
+            unplaced,
+        })
     })()
     .map_err(PublishFailure::Other)
 }
@@ -2169,6 +2293,135 @@ struct Published {
     /// and writes them on the ordinary non-success path, which keeps the
     /// source selectable.
     unobserved: Vec<String>,
+    /// Windows this restore reported `Placed` that the published topology does
+    /// not hold — gone, holding a different session, or somewhere else on the
+    /// desktop. Same rule, same consequence: the run is downgraded and the
+    /// source stays selectable, because the source is the only remaining
+    /// record of where that window was.
+    unplaced: Vec<String>,
+}
+
+/// One terminal window in the topology a publication wrote down.
+struct HeldWindow {
+    address: String,
+    session: String,
+    workspace_kind: String,
+    workspace_ref: String,
+    monitor_connector: String,
+}
+
+/// The windows in `placed` that snapshot `published_id` does not hold **as
+/// this restore left them**, each with what it says instead.
+///
+/// `Placed` is a statement about a moment: a window osm started had mapped,
+/// held a client attached to the session, and had been moved. The snapshot
+/// published afterwards is the durable claim, and it is the one the source is
+/// retired against. Anything that happened in between — the terminal exiting,
+/// the client detaching, the window being sent elsewhere — has to show up here
+/// rather than be assumed away.
+///
+/// # Why the address, and not the session name
+///
+/// A session can have more than one terminal attached to it. Suppose `dev`
+/// already has the user's own terminal open on another workspace; osm spawns
+/// and verifies its own, and that one exits before the publication. The
+/// snapshot then records the user's window for `dev`, a check that asks only
+/// "does `dev` have a window?" answers yes, and the source — the only record
+/// of where the window osm failed to deliver belonged — is retired against a
+/// window osm never placed, while the run reports success. The claim is about
+/// one window, so the check is too: that address, holding that session, on the
+/// workspace and monitor this restore sent it to.
+fn unplaced_windows(
+    tx: &rusqlite::Transaction,
+    published_id: i64,
+    placed: &[PlacedClaim<'_>],
+) -> Result<Vec<String>> {
+    if placed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT hypr_address, session_name, workspace_kind, workspace_ref, monitor_connector
+         FROM terminal_windows WHERE snapshot_id = ?1",
+    )?;
+    let held: Vec<HeldWindow> = stmt
+        .query_map([published_id], |r| {
+            Ok(HeldWindow {
+                address: r.get(0)?,
+                session: r.get(1)?,
+                workspace_kind: r.get(2)?,
+                workspace_ref: r.get(3)?,
+                monitor_connector: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut out = Vec::new();
+    for c in placed {
+        let want = c.window;
+        let Some(row) = held.iter().find(|h| h.address == want.address) else {
+            // What the snapshot holds for that session instead, when it holds
+            // anything: an operator reading this needs to know whether the
+            // session lost its terminal outright or is showing one osm never
+            // placed.
+            let instead: Vec<&str> = held
+                .iter()
+                .filter(|h| h.session == c.session)
+                .map(|h| h.address.as_str())
+                .collect();
+            out.push(if instead.is_empty() {
+                format!(
+                    "{}'s window {} was placed, but the topology this restore \
+                     published records no terminal window for it",
+                    c.session, want.address
+                )
+            } else {
+                format!(
+                    "{}'s window {} was placed, but the topology this restore \
+                     published does not hold it — only {}, which this restore \
+                     did not place",
+                    c.session,
+                    want.address,
+                    instead.join(", ")
+                )
+            });
+            continue;
+        };
+        if row.session != c.session {
+            out.push(format!(
+                "{}'s window {} was placed, but the topology this restore published \
+                 has it holding {} instead",
+                c.session, want.address, row.session
+            ));
+            continue;
+        }
+        if row.workspace_kind != want.workspace_kind || row.workspace_ref != want.workspace_ref {
+            out.push(format!(
+                "{}'s window {} was placed on {} workspace {}, but the topology this \
+                 restore published has it on {} workspace {}",
+                c.session,
+                want.address,
+                want.workspace_kind,
+                want.workspace_ref,
+                row.workspace_kind,
+                row.workspace_ref
+            ));
+            continue;
+        }
+        // Only when a monitor was actually dispatched. A compositor that
+        // listed no monitor to send the window to was not asked to move it,
+        // and holding the publication to a placement nobody made would fail
+        // every restore on a desktop osm could not read that far.
+        if let Some(sent_to) = want.monitor_connector.as_deref() {
+            if row.monitor_connector != sent_to {
+                out.push(format!(
+                    "{}'s window {} was moved to {sent_to}, but the topology this \
+                     restore published has it on {}",
+                    c.session, want.address, row.monitor_connector
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The conversations in `resumed` that snapshot `published_id` does not bind
@@ -2273,6 +2526,123 @@ fn disown_attempt(
     Ok(())
 }
 
+/// Whether any window outcome means the restore did not finish its work.
+///
+/// Exactly one outcome is a finished restore without a window:
+/// `PlacementDisabled`, which is the user having said so in
+/// `restore.place_windows`. Everything else is work still owed.
+///
+/// `NoCompositor` used to be on the finished side, on the reasoning that a
+/// headless machine is a legitimate outcome. It is — but it is
+/// indistinguishable, at that point, from a restore that ran a few seconds
+/// before Hyprland finished starting, or from a compositor that died. Both of
+/// those retired the source snapshot, which is the only record of where the
+/// user's terminals were, on the strength of work nobody did. The headless
+/// case now has its own explicit switch, and this one waits for the
+/// compositor first (see [`crate::hypr::wait_until_reachable`]).
+pub fn window_outcomes_are_degraded(outcomes: &[(String, crate::desktop::PlaceOutcome)]) -> bool {
+    use crate::desktop::PlaceOutcome::*;
+    outcomes.iter().any(|(_, o)| {
+        matches!(
+            o,
+            SpawnFailed(_)
+                | NeverMapped
+                | NeverAttached
+                | Skipped(_)
+                | NoCompositor
+                | LostCompositor(_)
+        )
+    })
+}
+
+/// Give each delivered session its terminal window back.
+///
+/// Runs after sessions exist and agents have been resumed, before the source
+/// snapshot is retired.
+///
+/// Only sessions in [`delivered_sessions`] are touched — the same rule the
+/// agent pass follows. A conflicted session is one the restore refused to
+/// adopt because it holds someone else's topology; spawning a window onto it
+/// would compound that, and a skipped or failed session has nothing to show.
+#[allow(clippy::too_many_arguments)]
+pub fn place_windows(
+    h: &dyn crate::hypr::HyprCtl,
+    sp: &dyn crate::desktop::Spawner,
+    tmux: &Tmux,
+    conn: &Connection,
+    snapshot_id: i64,
+    outcome: &RestoreOutcome,
+    attempt_id: i64,
+    cfg: &crate::config::Config,
+) -> Vec<(String, crate::desktop::PlaceOutcome)> {
+    use crate::desktop::PlaceOutcome;
+
+    let placements = match crate::desktop::placements_of(conn, snapshot_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![(
+                "*".to_string(),
+                PlaceOutcome::Skipped(format!("reading placement: {e:#}")),
+            )]
+        }
+    };
+    if placements.is_empty() {
+        return Vec::new();
+    }
+
+    let timeout = std::time::Duration::from_secs(cfg.restore.readiness_timeout_secs);
+
+    // The one way to a finished restore with no window: the user asked for
+    // it. Checked before the compositor is even contacted.
+    if !cfg.restore.place_windows {
+        return placements
+            .iter()
+            .map(|p| (p.session.clone(), PlaceOutcome::PlacementDisabled))
+            .collect();
+    }
+
+    // Ask once, before spawning anything, and *wait* — a restore at boot
+    // routinely beats Hyprland to the finish line, and treating those few
+    // seconds as "there is no compositor here" retired the snapshot that
+    // held the layout. A compositor that is not there must also not leave a
+    // trail of terminals with nowhere to put them, which is why this happens
+    // before the first spawn rather than per session.
+    if !crate::hypr::wait_until_reachable(h, timeout) {
+        return placements
+            .iter()
+            .map(|p| (p.session.clone(), PlaceOutcome::NoCompositor))
+            .collect();
+    }
+
+    let delivered: std::collections::HashSet<&str> =
+        delivered_sessions(outcome).into_iter().collect();
+    let marker = crate::terminal::marker_for(attempt_id);
+
+    let mut out = Vec::new();
+    for p in &placements {
+        if !delivered.contains(p.session.as_str()) {
+            out.push((
+                p.session.clone(),
+                PlaceOutcome::Skipped("this attempt did not deliver that session".into()),
+            ));
+            continue;
+        }
+        out.push((
+            p.session.clone(),
+            crate::desktop::spawn_and_place(
+                h,
+                sp,
+                tmux,
+                p,
+                &marker,
+                &cfg.restore.terminal,
+                timeout,
+            ),
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     //! The one property of a restore that no integration test can reach:
@@ -2291,6 +2661,24 @@ mod tests {
 
     use super::*;
     use crate::{capture, db};
+
+    /// No compositor at all, so publication records tmux and nothing else.
+    ///
+    /// These tests are about which *server* a publication belongs to; asking
+    /// a real Hyprland here would make them depend on the developer's
+    /// desktop, and dispatching from one is forbidden outright.
+    struct NoDesktop;
+    impl crate::hypr::HyprCtl for NoDesktop {
+        fn clients_json(&self) -> Result<String> {
+            anyhow::bail!("no compositor in this test")
+        }
+        fn monitors_json(&self) -> Result<String> {
+            anyhow::bail!("no compositor in this test")
+        }
+        fn dispatch(&self, _: &str) -> Result<String> {
+            panic!("no test here may dispatch: it would move a real window")
+        }
+    }
 
     struct Server(Tmux);
 
@@ -2425,10 +2813,16 @@ mod tests {
         let failure = publish_current_boot(
             &mut conn,
             dst.t(),
+            &NoDesktop,
             attempt,
             snap,
             outcome.server.as_deref(),
             &delivered,
+            &[],
+            // No compositor in these tests, and nothing was placed: the
+            // publication's window check is vacuous here, which is what lets
+            // them stay about the server-identity window they exist for.
+            false,
             &[],
         )
         .expect_err("a topology from another server is not this restore's work");
@@ -2512,10 +2906,13 @@ mod tests {
         publish_current_boot(
             &mut conn,
             dst.t(),
+            &NoDesktop,
             attempt,
             snap,
             outcome.server.as_deref(),
             &delivered,
+            &[],
+            false,
             &[],
         )
         .unwrap_or_else(|e| match e {
@@ -2537,6 +2934,99 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, "restored");
+    }
+
+    /// A window this restore reported `Placed` that the topology it then
+    /// wrote down records no terminal for.
+    ///
+    /// `Placed` is a statement about a moment — a window osm started had
+    /// mapped, held a client attached to the session, and had been moved. The
+    /// snapshot published afterwards is the durable claim, and it is the one
+    /// the source is retired against. Here the compositor stops answering
+    /// between the two, so the publication records no window for `alpha`
+    /// while the source that knows where `alpha`'s window belonged is about to
+    /// be retired. The only honest answer is to leave it selectable.
+    #[test]
+    fn a_placed_window_the_published_snapshot_does_not_hold_keeps_the_source() {
+        let src = Server::start("unplaced-src");
+        src.session("alpha");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+        let snap = capture::snapshot(&mut conn, src.t(), "test").unwrap();
+        conn.execute("UPDATE snapshots SET boot_id='boot-a' WHERE id=?1", [snap])
+            .unwrap();
+        src.kill();
+
+        let dst = Server::start("unplaced-dst");
+        let tree = model::load(&conn, snap).unwrap();
+        let outcome = restore_tree(dst.t(), &tree).unwrap();
+        assert_eq!(outcome.created, vec!["alpha".to_string()], "{outcome:?}");
+
+        conn.execute(
+            "INSERT INTO restore_attempts (snapshot_id, started_at, state) VALUES (?1, ?2, 'running')",
+            rusqlite::params![snap, boot::now_epoch()],
+        )
+        .unwrap();
+        let attempt = conn.last_insert_rowid();
+
+        let delivered = delivered_sessions(&outcome);
+        // The window the placement pass would have reported: an address it
+        // spawned, moved to workspace 3 of DP-1.
+        let window = crate::desktop::PlacedWindow {
+            address: "0x5eedf00d".to_string(),
+            workspace_kind: "numbered".to_string(),
+            workspace_ref: "3".to_string(),
+            monitor_connector: Some("DP-1".to_string()),
+        };
+        let published = publish_current_boot(
+            &mut conn,
+            dst.t(),
+            // Placement was on and a window was placed; by the time the
+            // publication reads the desktop the compositor has stopped
+            // answering, so the snapshot it writes holds no window at all.
+            &NoDesktop,
+            attempt,
+            snap,
+            outcome.server.as_deref(),
+            &delivered,
+            &[],
+            true,
+            &[PlacedClaim {
+                session: "alpha",
+                window: &window,
+            }],
+        )
+        .unwrap_or_else(|e| match e {
+            PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),
+            PublishFailure::Other(e) => panic!("publication failed: {e:#}"),
+        });
+
+        assert_eq!(
+            published.unplaced.len(),
+            1,
+            "a placed window absent from the published snapshot went unreported: {published:?}"
+        );
+        let state: String = conn
+            .query_row("SELECT state FROM snapshots WHERE id=?1", [snap], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_ne!(
+            state, "restored",
+            "the source is the only record of where alpha's window was; it must not be retired"
+        );
+        let attempt_state: String = conn
+            .query_row(
+                "SELECT state FROM restore_attempts WHERE id=?1",
+                [attempt],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            attempt_state, "succeeded",
+            "a restore whose window is not in the snapshot it published is not a success"
+        );
     }
 
     /// A conversation this restore confirmed back into a pane, and that the
@@ -2590,11 +3080,14 @@ mod tests {
         let published = publish_current_boot(
             &mut conn,
             dst.t(),
+            &NoDesktop,
             attempt,
             snap,
             outcome.server.as_deref(),
             &delivered,
             &resumed,
+            false,
+            &[],
         )
         .unwrap_or_else(|e| match e {
             PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),
@@ -2755,6 +3248,7 @@ mod tests {
         let published = publish_current_boot(
             &mut conn,
             dst.t(),
+            &NoDesktop,
             attempt,
             snap,
             outcome.server.as_deref(),
@@ -2765,6 +3259,8 @@ mod tests {
                 live_pane_id: built.clone(),
                 label: "alpha:0.0".to_string(),
             }],
+            false,
+            &[],
         )
         .unwrap_or_else(|e| match e {
             PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),
@@ -2838,6 +3334,7 @@ mod tests {
         let published = publish_current_boot(
             &mut conn,
             dst.t(),
+            &NoDesktop,
             attempt,
             snap,
             outcome.server.as_deref(),
@@ -2848,6 +3345,8 @@ mod tests {
                 live_pane_id: elsewhere.clone(),
                 label: "alpha:0.1".to_string(),
             }],
+            false,
+            &[],
         )
         .unwrap_or_else(|e| match e {
             PublishFailure::ServerMoved(why) => panic!("the server never moved: {why}"),

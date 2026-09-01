@@ -29,10 +29,14 @@ struct Env {
 
 impl Env {
     fn new(label: &str) -> Self {
-        Env {
+        let env = Env {
             dir: tempfile::tempdir().unwrap(),
             socket: format!("osm-locale-{}-{}", label, std::process::id()),
-        }
+        };
+        // This suite's subject is what tmux does to non-ASCII paths, and it
+        // runs where there is no compositor.
+        common::write_headless_config(&env.dir.path().join("config"));
+        env
     }
 
     fn tmux(&self) -> Tmux {

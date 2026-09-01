@@ -37,6 +37,7 @@ fn debounced_capture_immediately_after_another_is_skipped_and_writes_no_row() {
     let first = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,
@@ -51,6 +52,7 @@ fn debounced_capture_immediately_after_another_is_skipped_and_writes_no_row() {
     let second = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,
@@ -78,6 +80,7 @@ fn non_debounced_capture_is_never_skipped() {
     capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "manual",
         &lock_path,
         &last_capture_path,
@@ -90,6 +93,7 @@ fn non_debounced_capture_is_never_skipped() {
     let second = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "manual",
         &lock_path,
         &last_capture_path,
@@ -118,6 +122,7 @@ fn debounced_capture_fires_again_once_the_window_has_elapsed() {
     let outcome = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,
@@ -144,6 +149,7 @@ fn missing_or_corrupt_timestamp_file_captures_rather_than_skips_or_errors() {
         let outcome = capture::snapshot_maybe_debounced(
             &mut conn,
             &s.0,
+            None,
             "hook",
             &lock_path,
             &last_capture_path,
@@ -163,6 +169,7 @@ fn missing_or_corrupt_timestamp_file_captures_rather_than_skips_or_errors() {
         let outcome = capture::snapshot_maybe_debounced(
             &mut conn,
             &s.0,
+            None,
             "hook",
             &lock_path,
             &last_capture_path,
@@ -191,6 +198,7 @@ fn lock_held_takes_precedence_over_an_open_debounce_window() {
     let outcome = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,

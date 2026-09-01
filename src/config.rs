@@ -10,6 +10,16 @@ pub struct RestoreCfg {
     pub auto: bool,
     pub terminal: String,
     pub readiness_timeout_secs: u64,
+    /// Whether a restore gives each session its terminal window back.
+    ///
+    /// The **only** switch under which "there is no compositor" counts as a
+    /// finished restore rather than work still owed. Left on, a machine whose
+    /// Hyprland is merely slow to start gets waited for and, if it never
+    /// arrives, the snapshot stays restorable — because a restore that
+    /// silently dropped every window used to retire the only record of where
+    /// they were. Turn it off on a headless box, or to have tmux back without
+    /// terminals.
+    pub place_windows: bool,
 }
 
 impl Default for RestoreCfg {
@@ -18,6 +28,7 @@ impl Default for RestoreCfg {
             auto: true,
             terminal: "auto".to_string(),
             readiness_timeout_secs: 30,
+            place_windows: true,
         }
     }
 }

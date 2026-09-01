@@ -288,6 +288,12 @@ fn main() -> Result<()> {
                 osm::capture::snapshot_maybe_debounced(
                     &mut conn,
                     &tmux,
+                    // The compositor, every time. An ordinary capture is the
+                    // only thing that ever records where a session's terminal
+                    // window is, so a capture path that skips it leaves the
+                    // whole of workspace placement unreachable in production
+                    // while its unit tests stay green.
+                    Some(&osm::hypr::Live::new()),
                     &reason,
                     &lock_path,
                     &last_capture_path,
@@ -443,6 +449,7 @@ fn main() -> Result<()> {
                     osm::capture::snapshot_maybe_debounced(
                         &mut conn,
                         &tmux,
+                        Some(&osm::hypr::Live::new()),
                         "timer",
                         &lock_path,
                         &last_capture_path,

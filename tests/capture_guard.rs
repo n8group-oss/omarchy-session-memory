@@ -28,7 +28,7 @@ fn capture_is_refused_while_restore_holds_the_lock() {
 
     let _restore_guard = SingleInstance::acquire(&lock_path).unwrap().unwrap();
 
-    let result = capture::snapshot_guarded(&mut conn, &s.0, "hook", &lock_path).unwrap();
+    let result = capture::snapshot_guarded(&mut conn, &s.0, None, "hook", &lock_path).unwrap();
     assert!(result.is_none(), "capture must be refused during restore");
 
     let rows: i64 = conn
@@ -47,7 +47,7 @@ fn capture_proceeds_once_the_lock_is_free() {
     let guard = SingleInstance::acquire(&lock_path).unwrap().unwrap();
     drop(guard);
 
-    let result = capture::snapshot_guarded(&mut conn, &s.0, "hook", &lock_path).unwrap();
+    let result = capture::snapshot_guarded(&mut conn, &s.0, None, "hook", &lock_path).unwrap();
     assert!(result.is_some());
 }
 

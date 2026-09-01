@@ -569,7 +569,42 @@ impl Tmux {
         self.socket.as_deref()
     }
 
+    /// A tmux invocation that outlives this call, with `-u` and this handle's
+    /// `-L` already applied.
+    ///
+    /// [`Self::run`] waits for tmux to finish, which is right for every
+    /// command osm issues and wrong for the one thing a test needs: a client
+    /// that stays attached. Building that with `Command::new("tmux")` is
+    /// forbidden — see `tests/no_default_server.rs` — precisely because a
+    /// hand-built argv is where the `-L` goes missing and the developer's
+    /// real server answers instead. This is the seam that cannot forget it.
+    ///
+    /// The caller owns the [`Child`] and must kill and reap it.
+    pub fn spawn(&self, args: &[&str]) -> Result<std::process::Child> {
+        let mut cmd = self.command(args);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn().with_context(|| format!("spawn tmux {args:?}"))
+    }
+
     pub fn run(&self, args: &[&str]) -> Result<String> {
+        let out = self
+            .command(args)
+            .output()
+            .with_context(|| format!("spawn tmux {args:?}"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "tmux {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The one place a tmux command line is built, so `-u` and `-L` can never
+    /// be left off one of them.
+    fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new("tmux");
         // `-u` on **every** invocation, and it is as load-bearing as the
         // version floor.
@@ -596,16 +631,7 @@ impl Tmux {
             cmd.arg("-L").arg(sock);
         }
         cmd.args(args);
-        let out = cmd
-            .output()
-            .with_context(|| format!("spawn tmux {args:?}"))?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "tmux {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        cmd
     }
 
     /// Which **incarnation** of a tmux server this handle is talking to.

@@ -257,6 +257,8 @@ impl Drop for Server {
 #[test]
 fn a_successful_restore_emits_the_full_contract() {
     let env = Env::new("success");
+    // No compositor in this suite; its subject is the JSON contract.
+    env.write_config("[restore]\nplace_windows = false\n");
     let t = env.tmux();
     let _server = Server(t.clone());
 
@@ -299,6 +301,7 @@ fn a_successful_restore_emits_the_full_contract() {
 #[test]
 fn a_partial_restore_emits_the_full_contract_and_exits_non_zero() {
     let env = Env::new("partial");
+    env.write_config("[restore]\nplace_windows = false\n");
     let t = env.tmux();
     let _server = Server(t.clone());
 

@@ -52,6 +52,7 @@ fn work_flagged_as_pending_is_captured_even_inside_the_debounce_window() {
     let outcome = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,
@@ -91,6 +92,7 @@ fn losing_the_race_to_another_capture_defers_the_work_instead_of_dropping_it() {
     let outcome = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,
@@ -119,6 +121,7 @@ fn losing_the_race_to_another_capture_defers_the_work_instead_of_dropping_it() {
     let outcome = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,
@@ -171,6 +174,7 @@ fn a_capture_takes_another_pass_for_work_flagged_while_it_was_running() {
     let outcome = capture::snapshot_maybe_debounced(
         &mut conn,
         &s.0,
+        None,
         "hook",
         &lock_path,
         &last_capture_path,

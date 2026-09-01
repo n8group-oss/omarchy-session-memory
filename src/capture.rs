@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct Topology {
+    /// Where each session's terminal window is, when the compositor could
+    /// be trusted. `None` means it could not, and no placement is written.
+    pub placements: Option<Vec<crate::desktop::Placement>>,
     pub sessions: Vec<SessionRec>,
     pub windows: Vec<WindowRec>,
     pub panes: Vec<PaneRec>,
@@ -148,6 +151,10 @@ pub fn collect_once(tmux: &Tmux) -> Result<Topology> {
         sessions,
         windows,
         panes,
+        // Placement is collected separately, by the caller that has a
+        // compositor to ask. A topology gathered without one is not wrong,
+        // it simply carries no placement.
+        placements: None,
         server: before,
         server_at_end: after,
     })
@@ -188,6 +195,11 @@ pub fn collect(tmux: &Tmux) -> Result<Topology> {
     ))
 }
 
+/// Capture tmux alone, recording no window placement.
+///
+/// Every production capture goes through a `*_with_desktop` entry point
+/// instead — see [`snapshot_maybe_debounced`]. This one exists for callers
+/// with no compositor to ask, and for tests.
 pub fn snapshot(conn: &mut Connection, tmux: &Tmux, reason: &str) -> Result<i64> {
     snapshot_with_retention(conn, tmux, reason, 20)
 }
@@ -199,7 +211,7 @@ pub fn snapshot_with_retention(
     reason: &str,
     keep: usize,
 ) -> Result<i64> {
-    snapshot_inner(conn, tmux, reason, Some(keep))
+    snapshot_inner(conn, tmux, None, reason, Some(keep))
 }
 
 /// Capture and delete nothing.
@@ -210,16 +222,53 @@ pub fn snapshot_with_retention(
 /// snapshots to a default they never chose. Capturing is always safe;
 /// deleting on a guess is not.
 pub fn snapshot_without_pruning(conn: &mut Connection, tmux: &Tmux, reason: &str) -> Result<i64> {
-    snapshot_inner(conn, tmux, reason, None)
+    snapshot_inner(conn, tmux, None, reason, None)
+}
+
+/// Capture with the compositor, so the snapshot records where each session's
+/// terminal window is as well as what tmux holds.
+pub fn snapshot_with_desktop(
+    conn: &mut Connection,
+    tmux: &Tmux,
+    h: &dyn crate::hypr::HyprCtl,
+    reason: &str,
+    keep: Option<usize>,
+) -> Result<i64> {
+    snapshot_inner(conn, tmux, Some(h), reason, keep)
 }
 
 fn snapshot_inner(
     conn: &mut Connection,
     tmux: &Tmux,
+    desktop: Option<&dyn crate::hypr::HyprCtl>,
     reason: &str,
     keep: Option<usize>,
 ) -> Result<i64> {
-    let topo = collect(tmux)?;
+    let topo = match desktop {
+        Some(h) => {
+            let topo = collect_with_desktop(tmux, h)?;
+            // Placement was asked for and could not be read: a transient
+            // compositor failure, a `list-clients` that errored, a reply that
+            // did not parse, an identity that moved. `write_topology` would
+            // commit this as a `complete` snapshot anyway, report success,
+            // and prune the previous snapshot — the one that still held the
+            // layout — out of retention. A capture that cannot see where the
+            // windows are has not captured this machine's state, so it fails
+            // and is retried, by the next hook or the next daemon tick.
+            //
+            // The one way to a successful capture with no placement is the
+            // user saying so; see `snapshot_with_configured_retention`.
+            if topo.placements.is_none() {
+                anyhow::bail!(
+                    "the window placement for this capture could not be read; refusing \
+                     to record a snapshot that would claim there is none (set \
+                     restore.place_windows = false for a machine with no compositor)"
+                );
+            }
+            topo
+        }
+        None => collect(tmux)?,
+    };
     write_topology(conn, &topo, reason, keep)
 }
 
@@ -236,6 +285,13 @@ pub fn write_topology(
 ) -> Result<i64> {
     let tx = conn.transaction()?;
     let snapshot_id = write_topology_in(&tx, topo, reason)?;
+    // Placement belongs to the topology it describes, so it lands in the same
+    // transaction or not at all. `None` means the compositor could not be
+    // trusted; writing nothing is the honest outcome, and writing an empty
+    // layout over a good one is what destroyed the original mapping.
+    if let Some(ps) = topo.placements.as_deref() {
+        crate::desktop::write_placements_in(&tx, snapshot_id, ps)?;
+    }
     tx.commit()?;
     if let Some(keep) = keep {
         crate::snapshots::prune(conn, keep, &boot::current_boot_id()?)?;
@@ -1657,18 +1713,31 @@ fn clear_dirty(path: &Path) {
 fn snapshot_with_configured_retention(
     conn: &mut Connection,
     tmux: &Tmux,
+    desktop: Option<&dyn crate::hypr::HyprCtl>,
     reason: &str,
 ) -> Result<i64> {
     let config_path = crate::paths::config_path()?;
     match crate::config::load(&config_path) {
-        Ok(cfg) => snapshot_with_retention(conn, tmux, reason, cfg.capture.keep_snapshots),
+        Ok(cfg) => snapshot_inner(
+            conn,
+            tmux,
+            // `restore.place_windows = false` is the whole of how a machine
+            // with no compositor captures happily: the compositor is not
+            // asked, so an answer that never comes is not a failed capture.
+            // Anything else — including a config too broken to read, which
+            // cannot be taken as consent to stop recording placement — keeps
+            // the compositor in the capture and holds it to answering.
+            desktop.filter(|_| cfg.restore.place_windows),
+            reason,
+            Some(cfg.capture.keep_snapshots),
+        ),
         Err(e) => {
             eprintln!(
                 "osm: {}: {e:#}; capturing without pruning \
                  (retention stays off until the config is valid)",
                 config_path.display()
             );
-            snapshot_without_pruning(conn, tmux, reason)
+            snapshot_inner(conn, tmux, desktop, reason, None)
         }
     }
 }
@@ -1684,11 +1753,12 @@ fn snapshot_with_configured_retention(
 pub fn snapshot_guarded(
     conn: &mut Connection,
     tmux: &Tmux,
+    desktop: Option<&dyn crate::hypr::HyprCtl>,
     reason: &str,
     lock_path: &Path,
 ) -> Result<Option<i64>> {
     with_restore_lock(lock_path, || {
-        snapshot_with_configured_retention(conn, tmux, reason)
+        snapshot_with_configured_retention(conn, tmux, desktop, reason)
     })
 }
 
@@ -1774,6 +1844,7 @@ pub fn record_capture_time(last_capture_path: &Path, now: i64) -> Result<()> {
 pub fn snapshot_maybe_debounced(
     conn: &mut Connection,
     tmux: &Tmux,
+    desktop: Option<&dyn crate::hypr::HyprCtl>,
     reason: &str,
     lock_path: &Path,
     last_capture_path: &Path,
@@ -1809,7 +1880,9 @@ pub fn snapshot_maybe_debounced(
         // Clear before reading tmux, never after: a flag raised from here on
         // describes a change this pass' topology read may have missed.
         clear_dirty(&dirty);
-        last_id = Some(snapshot_with_configured_retention(conn, tmux, reason)?);
+        last_id = Some(snapshot_with_configured_retention(
+            conn, tmux, desktop, reason,
+        )?);
         let _ = record_capture_time(last_capture_path, now);
         if !is_dirty(&dirty) {
             break;
@@ -1822,4 +1895,49 @@ pub fn snapshot_maybe_debounced(
         Some(id) => Ok(CaptureOutcome::Captured(id)),
         None => Err(anyhow::anyhow!("capture loop ran zero passes")),
     }
+}
+
+/// [`collect`] plus the window placement the compositor reports.
+///
+/// Kept separate from `collect` so every existing caller — and every test —
+/// keeps working without a compositor, and so a machine with no Hyprland
+/// still captures tmux exactly as before.
+pub fn collect_with_desktop(tmux: &Tmux, h: &dyn crate::hypr::HyprCtl) -> Result<Topology> {
+    let mut topo = collect(tmux)?;
+    attach_placements(&mut topo, tmux, h)?;
+    Ok(topo)
+}
+
+/// Read the compositor's placement and attach it to `topo`, but **only** if it
+/// came from the same tmux server the topology did.
+///
+/// # Why the incarnation is compared again out here
+///
+/// [`crate::desktop::placements_with_incarnation`] already proves its own two
+/// reads describe one server. That is not enough. The topology was collected
+/// first, and a server that answered it can die before the placement pass
+/// begins: the replacement then satisfies both of the placement's internal
+/// checks, and its client list — whose sessions are *its* sessions — is
+/// stored beside the first server's sessions as though one machine state had
+/// produced both. Plan 1 established this rule for the three `list-*` reads
+/// inside `collect_once`; the tmux/compositor boundary is the one place it
+/// had never been applied.
+///
+/// A mismatch leaves `topo.placements` at `None`, which is the same
+/// "unreadable" the compositor half already produces — never an empty layout,
+/// which is the value that destroyed the maintainer's original mapping.
+///
+/// Taking the topology as an argument is also the only seam a test has for
+/// the failure this exists to catch: nothing can interpose between `collect`
+/// and the placement read from outside [`collect_with_desktop`].
+pub fn attach_placements(
+    topo: &mut Topology,
+    tmux: &Tmux,
+    h: &dyn crate::hypr::HyprCtl,
+) -> Result<()> {
+    topo.placements = match crate::desktop::placements_with_incarnation(h, tmux)? {
+        Some((incarnation, ps)) if topo.server.as_deref() == Some(incarnation.as_str()) => Some(ps),
+        _ => None,
+    };
+    Ok(())
 }

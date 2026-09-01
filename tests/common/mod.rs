@@ -209,3 +209,55 @@ pub fn tmux_conf_with_path(config_home: &Path, bin_dir: &Path) {
     )
     .unwrap();
 }
+
+/// Declare a test's machine as one with no compositor.
+///
+/// A capture that is asked for window placement and cannot read it now fails,
+/// rather than recording "no session has a terminal window" over the last good
+/// layout and pruning it out of retention. CI runs in a container with no
+/// Hyprland and no `hyprctl` at all, and so does any headless server, so the
+/// suites whose subject is tmux rather than the desktop say so the documented
+/// way: `restore.place_windows = false`.
+///
+/// `config_home` is the directory a test passes as `XDG_CONFIG_HOME`.
+pub fn write_headless_config(config_home: &Path) {
+    let dir = config_home.join("osm");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[restore]\nplace_windows = false\n",
+    )
+    .unwrap();
+}
+
+/// An `hyprctl` that answers like an ordinary desktop with one monitor and no
+/// windows open, written into `root/bin`; returns that directory, for a test
+/// to put at the front of its `PATH`.
+///
+/// For the suites that must exercise the *default* configuration — placement
+/// on — without a compositor to exercise it against. It is a shell script that
+/// echoes: it cannot reach a compositor, and it refuses to dispatch, because
+/// a dispatch would move a window on the developer's own desktop.
+pub fn stub_hyprctl(root: &Path) -> PathBuf {
+    let dir = root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("hyprctl");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+# Stand-in for hyprctl. See tests/common/mod.rs.
+if [ "$1" = "-j" ] && [ "$2" = "clients" ]; then echo "[]"; exit 0; fi
+if [ "$1" = "-j" ] && [ "$2" = "monitors" ]; then
+  echo '[{"id":0,"name":"DP-1","description":"stub","x":0,"y":0,"width":1920,"height":1080,"scale":1.0,"transform":0,"focused":true}]'
+  exit 0
+fi
+echo "this stub compositor does not dispatch: $*" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&path, perm).unwrap();
+    dir
+}

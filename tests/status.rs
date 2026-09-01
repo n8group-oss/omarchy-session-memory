@@ -85,6 +85,9 @@ impl Drop for Server {
 #[test]
 fn status_reports_capture_freshness_after_a_successful_capture() {
     let env = Env::new("fresh");
+    // No compositor here — this suite's subject is capture health, not the
+    // desktop. See `common::write_headless_config`.
+    env.write_config("[restore]\nplace_windows = false\n");
     let t = env.tmux();
     let _server = Server(t.clone());
     t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
@@ -171,6 +174,7 @@ fn status_surfaces_a_persistent_capture_failure() {
 #[test]
 fn a_successful_capture_clears_the_failure_streak() {
     let env = Env::new("recover");
+    env.write_config("[restore]\nplace_windows = false\n");
     let out = env.osm().arg("snapshot").output().unwrap();
     assert!(!out.status.success());
     assert_eq!(env.status()["capture"]["consecutive_failures"], 1);

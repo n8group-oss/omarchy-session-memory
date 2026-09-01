@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 /// rather than linking the wrong window. What matters is that the file is still there
 /// afterwards. [`preserved`] reports the situation and `osm status --json`
 /// prints it, so a preserved database is visible rather than silent.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -175,6 +175,14 @@ CREATE TABLE IF NOT EXISTS terminal_windows (
   window_class      TEXT    NOT NULL,
   terminal_kind     TEXT    NOT NULL,
   session_row_id    INTEGER REFERENCES session_rows(row_id) ON DELETE SET NULL,
+  -- The session this window was attached to, by name.
+  --
+  -- Kept alongside the row link rather than derived from it: a placement
+  -- whose session vanished between the tmux read and the compositor read is
+  -- still worth recording, and reading the name through the join loses it
+  -- exactly then -- leaving a row that cannot be restored, because there is
+  -- no name to attach to.
+  session_name      TEXT    NOT NULL DEFAULT '',
   workspace_kind    TEXT    NOT NULL,
   workspace_ref     TEXT    NOT NULL,
   monitor_connector TEXT    NOT NULL,
@@ -1104,6 +1112,48 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
                      CHECK (auto_named IN (0,1))",
                 )?;
                 version = 9;
+            }
+            // A placement carries its session's name.
+            //
+            // Reading the name through the row link loses it for exactly the
+            // rows that need it most: a placement whose session vanished
+            // between the tmux read and the compositor read is still worth
+            // keeping, and with no name there is nothing to attach to.
+            //
+            // Existing rows are backfilled from the link where it resolves; a
+            // row whose link is already gone keeps the empty default, which
+            // is honest — that name was never recorded and cannot be invented.
+            9 => {
+                // Only databases that already have the table need altering.
+                // A database migrating up from further back may not have
+                // reached it yet; the base schema creates it with the column
+                // already present, so there is nothing to add.
+                let has_table: bool = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='table' AND name='terminal_windows'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )? == 1;
+                if has_table {
+                    let has_column: bool = tx
+                        .prepare("SELECT * FROM terminal_windows LIMIT 0")?
+                        .column_names()
+                        .contains(&"session_name");
+                    if !has_column {
+                        tx.execute_batch(
+                            "ALTER TABLE terminal_windows
+                               ADD COLUMN session_name TEXT NOT NULL DEFAULT '';
+
+                             UPDATE terminal_windows
+                                SET session_name = COALESCE(
+                                      (SELECT name FROM session_rows
+                                        WHERE session_rows.row_id
+                                              = terminal_windows.session_row_id),
+                                      '');",
+                        )?;
+                    }
+                }
+                version = 10;
             }
             _ => return Ok(false),
         }

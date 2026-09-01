@@ -1,5 +1,14 @@
 name: ci
 
+# Runs on GitHub-hosted runners, deliberately.
+#
+# This repository is public. A pull request from a fork runs with the
+# permissions of whatever it contains, so self-hosted runners would put the
+# maintainer's own infrastructure behind an anonymous contributor's code.
+# GitHub-hosted runners are free for public repositories and disposable, and
+# nothing here needs hardware that only the maintainer has: every test uses a
+# private tmux socket, and the desktop tests skip without a compositor.
+
 on:
   push:
     branches: [main]
@@ -13,7 +22,7 @@ concurrency:
 jobs:
   lint:
     name: fmt + clippy
-    runs-on: [self-hosted, Linux, X64, docker]
+    runs-on: ubuntu-latest
     container:
       image: rust:1-bookworm
     steps:
@@ -37,7 +46,7 @@ jobs:
     # suite runs against it. The older versions get their own job below, which
     # asserts osm refuses rather than misbehaves.
     name: tests (tmux ${{ matrix.label }})
-    runs-on: [self-hosted, Linux, X64, docker]
+    runs-on: ubuntu-latest
     container:
       image: ${{ matrix.image }}
     strategy:
@@ -92,7 +101,7 @@ jobs:
     # supported: the contract is that osm stops with a message naming the
     # version, not that it quietly captures corrupted paths.
     name: refuses to run (tmux 3.3a bookworm)
-    runs-on: [self-hosted, Linux, X64, docker]
+    runs-on: ubuntu-latest
     container:
       image: rust:1-bookworm
     steps:
@@ -151,7 +160,7 @@ jobs:
     # dependency that declares edition 2024. The manifest previously claimed
     # 1.75, which never built.
     name: build (MSRV 1.85)
-    runs-on: [self-hosted, Linux, X64, docker]
+    runs-on: ubuntu-latest
     container:
       image: rust:1.85-bookworm
     steps:

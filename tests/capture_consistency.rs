@@ -79,6 +79,7 @@ fn pane(window_id: &str, id: &str) -> PaneRec {
 /// topology in exactly the one respect it is about.
 fn consistent() -> Topology {
     Topology {
+        placements: None,
         sessions: vec![session("$0", "alpha")],
         windows: vec![window("$0", "@0", 0, "main")],
         panes: vec![pane("@0", "%0")],
@@ -251,6 +252,7 @@ fn a_topology_attributed_to_no_server_is_refused() {
 #[test]
 fn an_empty_topology_needs_no_server_to_be_attributed_to() {
     let topo = Topology {
+        placements: None,
         sessions: vec![],
         windows: vec![],
         panes: vec![],

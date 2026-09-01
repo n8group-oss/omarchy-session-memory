@@ -2,8 +2,8 @@
 
 Restores tmux sessions and windows after a reboot, and puts the AI
 coding-agent conversations that were running in them back into the panes
-they were running in. Hyprland workspace placement is planned but not yet
-implemented — see "Current scope" below.
+they were running in, and gives each restored session its terminal window
+back on the workspace and monitor it was on.
 
 **Status: early development.** The engine is being built first; the Omarchy
 marketplace plugin follows.
@@ -281,10 +281,36 @@ thing under `agents.unsupported`:
 Leaving `opencode` in `agents.enabled` is harmless — discovery still runs for
 `osm agents` — but nothing automatic will happen for it.
 
-Hyprland workspace placement is not restored yet — that lands in a later
-milestone. Any *other* process that was running in a pane before the reboot
-(an editor, a REPL) is not relaunched; those panes come back as plain shells
-in their captured working directory.
+**Hyprland window placement**: every capture also records which terminal
+window each session was attached to, and which workspace and monitor that
+window was on, and a restore opens a terminal per delivered session and puts
+it back there. A session whose window did not come back makes the restore
+`partial`, so its snapshot stays retryable.
+
+Because that placement is part of the state osm promises to keep, a capture
+that is asked for it and **cannot read it** — Hyprland not answering,
+`hyprctl` printing something that is not a client list, the tmux server
+changing identity mid-read — fails and is retried, instead of recording "no
+session has a terminal window" over the last good layout and pruning that
+layout out of retention.
+
+On a machine with no compositor, say so once:
+
+```toml
+[restore]
+place_windows = false
+```
+
+Captures then record tmux alone and succeed, and restores report every
+session's window as `placement_disabled` — the one window outcome that counts
+as finished work rather than a shortfall. `restore.terminal` chooses which
+terminal a restore opens (`auto`, `ghostty`, `alacritty`, `kitty`, `foot`);
+`auto` prefers the terminal the session was captured in and falls back to the
+first one installed.
+
+Any *other* process that was running in a pane before the reboot (an editor, a
+REPL) is not relaunched; those panes come back as plain shells in their
+captured working directory.
 
 ## Design
 

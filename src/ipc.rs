@@ -206,6 +206,29 @@ pub struct AgentResumeFailure {
     pub reason: String,
 }
 
+/// What a restore did about one session's terminal window.
+///
+/// `outcome` is a stable token from [`crate::desktop::PlaceOutcome::as_str`]:
+/// `placed`, `never_mapped`, `never_attached`, `spawn_failed`,
+/// `no_compositor`, `lost_compositor`, `skipped`, `placement_disabled`.
+/// Everything except `placed` and `placement_disabled` means the restore is
+/// `partial` and the snapshot stays restorable.
+///
+/// `placed` is the durable claim, not a momentary one: a session only keeps it
+/// if the snapshot the restore publishes afterwards still records **that**
+/// window — the one this restore spawned, holding that session, on the
+/// workspace and monitor it was sent to. Another terminal the user has open
+/// on the same session does not stand in for it. A window that was placed and
+/// then went away, changed session, or was moved elsewhere downgrades the
+/// whole run to `partial`, because the source snapshot is the only remaining
+/// record of where it belonged.
+#[derive(Debug, Serialize)]
+pub struct RestoreWindow {
+    pub session: String,
+    pub outcome: String,
+    pub detail: Option<String>,
+}
+
 /// The `osm restore` wire contract.
 ///
 /// Every field is emitted on **every** exit path, including the ones that do
@@ -283,6 +306,11 @@ pub struct RestoreJson {
     /// decide `state`. A non-empty list here on a `partial` restore is why
     /// it is `partial` rather than `succeeded`.
     pub agents_failed: Vec<AgentResumeFailure>,
+    /// Every session with a recorded terminal window, and what this restore
+    /// did about it. Empty when the source snapshot recorded no placement —
+    /// which is every snapshot taken on a machine with no compositor, and was
+    /// every snapshot at all until capture started asking one.
+    pub windows: Vec<RestoreWindow>,
 }
 
 impl RestoreJson {
@@ -304,6 +332,7 @@ impl RestoreJson {
             retryable: true,
             agents_resumed: 0,
             agents_failed: Vec::new(),
+            windows: Vec::new(),
         }
     }
 
@@ -398,6 +427,16 @@ impl RestoreJson {
                     AgentOutcome::Resumed
                     | AgentOutcome::ActiveElsewhere
                     | AgentOutcome::Unsupported => None,
+                })
+                .collect(),
+            windows: report
+                .outcome
+                .window_outcomes
+                .iter()
+                .map(|(session, o)| RestoreWindow {
+                    session: session.clone(),
+                    outcome: o.as_str().to_string(),
+                    detail: o.detail().map(str::to_string),
                 })
                 .collect(),
         }

@@ -39,11 +39,16 @@ impl Env {
     fn new(label: &str) -> Self {
         let socket = format!("osm-hooks-{}-{}", label, std::process::id());
         let tmux = Tmux::with_socket(&socket);
-        Env {
+        let env = Env {
             dir: tempfile::tempdir().unwrap(),
             socket,
             tmux,
-        }
+        };
+        // The captures these hooks fire run where there is no compositor, and
+        // a capture asked for placement it cannot read now fails. This suite's
+        // subject is which tmux events reach the engine.
+        common::write_headless_config(&env.dir.path().join("config"));
+        env
     }
 
     fn t(&self) -> &Tmux {

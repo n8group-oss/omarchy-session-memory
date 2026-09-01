@@ -37,6 +37,7 @@ fn socket_flag_captures_from_the_named_server_not_the_default_one() {
         .expect("start private tmux server");
 
     let tmp = tempfile::tempdir().unwrap();
+    common::write_headless_config(&tmp.path().join("config"));
     let out = Command::new(env!("CARGO_BIN_EXE_osm"))
         .env("XDG_STATE_HOME", tmp.path().join("state"))
         .env("XDG_CONFIG_HOME", tmp.path().join("config"))

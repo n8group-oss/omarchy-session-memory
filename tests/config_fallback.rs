@@ -27,7 +27,20 @@ fn socket_name(label: &str) -> String {
 }
 
 fn env_cmd(root: &std::path::Path, socket: &str, args: &[&str]) -> std::process::Output {
+    // A stub compositor on the `PATH`, because the config under test is
+    // *invalid*: nothing in it can turn placement off, so the capture runs
+    // with the built-in default (placement on) and is held to reading a
+    // placement. Which is the point — a broken config must not be taken as
+    // consent to stop recording where the user's windows are. The stub
+    // answers as an empty desktop and cannot dispatch.
+    let bin = common::stub_hyprctl(root);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     Command::new(env!("CARGO_BIN_EXE_osm"))
+        .env("PATH", path)
         .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--socket")
