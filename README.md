@@ -243,6 +243,22 @@ widget and its menu — and nothing else. `omarchy plugin add` cannot place a
 binary, a systemd unit or a tmux hook, so the engine is installed separately.
 Until it is, the widget says so rather than showing an empty session list.
 
+## Installing the plugin
+
+```bash
+omarchy plugin add https://github.com/n8group-oss/omarchy-session-memory --enable
+```
+
+That puts the bar widget on your bar. It will report that the engine is not
+installed until you do the second half below — which is the honest state, not
+a failure.
+
+To remove it again:
+
+```bash
+omarchy plugin remove io.github.n8group-oss.sessionmemory
+```
+
 ## Installing from a release
 
 Each `v*` tag builds `osm` for `x86_64-unknown-linux-gnu` on a GitHub-hosted
