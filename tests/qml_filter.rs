@@ -229,7 +229,7 @@ fn a_real_sized_store() -> Vec<Value> {
     rows.push(json!({
         "kind": "claude",
         "native_id": "0198f2ac-1c4e-7a3b-9f11-2b6d8c4e5a17",
-        "project_dir": "/home/user/projects/proj-bar",
+        "project_dir": "/home/user/projects/widgets",
         "last_active": 1_600_000_000i64,
     }));
     // The one the search is for when the user remembers *what* they were
@@ -252,7 +252,7 @@ fn the_maintainers_sessions() -> Vec<Value> {
         "process",
         "osm-plan4",
         "notes",
-        "quattro",
+        "widgets",
         "ops",
         "scratch",
     ]
@@ -335,7 +335,7 @@ fn a_search_reaches_a_conversation_far_older_than_the_cap() {
         unfiltered.len()
     );
 
-    let (found, note) = conversations(&qml, &rows, "proj-bar");
+    let (found, note) = conversations(&qml, &rows, "widgets");
     assert_eq!(
         found,
         vec!["0198f2ac-1c4e-7a3b-9f11-2b6d8c4e5a17"],
@@ -370,7 +370,7 @@ fn the_count_line_tells_the_three_states_apart() {
 
     // Fewer matches than the cap: nothing is being withheld, so nothing may
     // claim to be.
-    let (ids, uncapped) = conversations(&qml, &rows, "proj-bar");
+    let (ids, uncapped) = conversations(&qml, &rows, "widgets");
     assert_eq!(ids.len(), 1);
     assert!(
         !uncapped.contains("showing"),
@@ -473,7 +473,7 @@ fn the_filter_matches_what_the_row_puts_on_screen() {
         "a search for the visible head of an id did not find it"
     );
 
-    let (upper, _) = conversations(&qml, &rows, "QUATTRO-BAR");
+    let (upper, _) = conversations(&qml, &rows, "WIDGETS");
     assert_eq!(
         upper,
         vec!["0198f2ac-1c4e-7a3b-9f11-2b6d8c4e5a17"],
