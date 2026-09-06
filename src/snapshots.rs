@@ -185,6 +185,32 @@ pub fn reclaim_orphaned_restores(conn: &mut Connection) -> Result<usize> {
 ///    deleting one destroys exactly what an interrupted restore was about to
 ///    rebuild.
 ///
+/// 5. **The newest snapshot that still knows where the windows were.** The
+///    same rule as (1), one field over. A capture whose placement could not
+///    be read now records the tmux topology anyway and marks its placement
+///    *unknown* (see [`crate::desktop::Placements`]) — which is a strict
+///    improvement, except that a run of them is still a run of snapshots, and
+///    under recency alone twenty of them evict the last row that records the
+///    user's workspace and monitor layout. Nothing else on the machine holds
+///    it: the compositor is asked afresh every capture and remembers nothing,
+///    so once that row is gone the layout is gone. The maintainer's original
+///    mapping was lost exactly this way, by a different route.
+///
+///    A `known` snapshot with no windows in it is not this row — it has
+///    nothing to protect — and neither is an `unknown` one, which is the
+///    whole point. Like (1) it is a *single* row rather than "every snapshot
+///    with placement": an older placed snapshot has been superseded by a
+///    newer one, and keeping them all would let a machine whose compositor
+///    stays broken grow without limit. The bound goes from `keep + 1` rows to
+///    `keep + 2`.
+///
+///    It is deliberately not conditioned on "and nothing newer answered".
+///    That refinement would release the row once a later capture reported a
+///    genuinely empty desktop, and it would cost a correlated subquery to
+///    express. One extra row on a machine that has really stopped having
+///    terminal windows is the cheaper mistake, and it is the one that errs
+///    towards keeping the user's data.
+///
 /// `current_boot` must be the caller's real boot id — passing something else
 /// silently changes which row is protected.
 pub fn prune(conn: &Connection, keep: usize, current_boot: &str) -> Result<usize> {
@@ -206,6 +232,19 @@ pub fn prune(conn: &Connection, keep: usize, current_boot: &str) -> Result<usize
            SELECT id FROM snapshots
            WHERE state = 'complete' AND boot_id <> ?2
            ORDER BY taken_at DESC, id DESC
+           LIMIT 1
+         )
+         -- The last snapshot that knows where the windows were. `IS NOT` for
+         -- the same reason as above: on a database that has never recorded a
+         -- placement the subquery is NULL, and `<>` would make the whole
+         -- WHERE never match.
+         AND id IS NOT (
+           SELECT s.id FROM snapshots s
+           WHERE s.state <> 'building'
+             AND s.placement_state = 'known'
+             AND EXISTS (SELECT 1 FROM terminal_windows w
+                         WHERE w.snapshot_id = s.id)
+           ORDER BY s.taken_at DESC, s.id DESC
            LIMIT 1
          )",
         rusqlite::params![keep as i64, current_boot],
