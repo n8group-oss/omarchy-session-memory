@@ -974,8 +974,8 @@ fn the_panel_asks_for_a_width_that_fits_the_row_it_draws() {
     }
 
     let conversation = lay_out(&qml, "id: conversationDelegate", Some(CONVERSATION), width);
-    let path = conversation
-        .carrying("/home/user/projects/n8group-oss/omarchy-session-memory/docs/plans");
+    let path =
+        conversation.carrying("/home/user/projects/n8group-oss/omarchy-session-memory/docs/plans");
     assert_eq!(
         path.truncated,
         Some(false),
