@@ -252,20 +252,30 @@ fn snapshot_inner(
             let topo = collect_with_desktop(tmux, h)?;
             // Placement was asked for and could not be read: a transient
             // compositor failure, a `list-clients` that errored, a reply that
-            // did not parse, an identity that moved. `write_topology` would
-            // commit this as a `complete` snapshot anyway, report success,
-            // and prune the previous snapshot — the one that still held the
-            // layout — out of retention. A capture that cannot see where the
-            // windows are has not captured this machine's state, so it fails
-            // and is retried, by the next hook or the next daemon tick.
+            // did not parse, an identity that moved.
             //
-            // The one way to a successful capture with no placement is the
-            // user saying so; see `snapshot_with_configured_retention`.
-            if topo.placements.is_unknown() {
-                anyhow::bail!(
-                    "the window placement for this capture could not be read; refusing \
-                     to record a snapshot that would claim there is none (set \
-                     restore.place_windows = false for a machine with no compositor)"
+            // This used to fail the whole capture. The hazard it guarded was
+            // real — a snapshot with no placement rows was indistinguishable
+            // from a machine with no windows, so retention would prune the
+            // last snapshot that knew the layout — but the price was the tmux
+            // topology as well, on a machine where the read failed 11 times
+            // against 19 successes within one hour. Losing sessions, panes,
+            // working directories and agent bindings to a compositor that
+            // stuttered is a far larger loss than the one being prevented.
+            //
+            // So the snapshot is recorded, `placement_state` says `unknown`,
+            // and the layout is protected where the hazard actually lives:
+            // `crate::snapshots::prune` holds back the newest snapshot that
+            // carries placement, whatever is recorded after it.
+            if let Some(why) = topo.placements.why() {
+                // The tmux hooks send output to /dev/null, but the daemon and
+                // the CLI do not, and `osm status --json` reports the same
+                // state off the snapshot itself. Silence here would make an
+                // hour of placement-blind snapshots look like an hour of
+                // ordinary ones.
+                eprintln!(
+                    "osm: recording this snapshot with its window placement marked \
+                     unknown: {why}"
                 );
             }
             topo
