@@ -17,13 +17,13 @@ struct Fake {
 }
 
 impl HyprCtl for Fake {
-    fn clients_json(&self) -> anyhow::Result<String> {
+    fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
         self.clients.clone().map_err(|e| anyhow::anyhow!(e))
     }
-    fn monitors_json(&self) -> anyhow::Result<String> {
+    fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
         self.monitors.clone().map_err(|e| anyhow::anyhow!(e))
     }
-    fn dispatch(&self, _lua: &str) -> anyhow::Result<String> {
+    fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
         panic!("no test here may dispatch: it would move a real window")
     }
 }
@@ -132,7 +132,7 @@ fn a_server_replaced_during_collection_yields_none() {
         socket: String,
     }
     impl HyprCtl for ReplacesTheServer {
-        fn clients_json(&self) -> anyhow::Result<String> {
+        fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
             let t = Tmux::with_socket(&self.socket);
             t.run(&["kill-server"]).expect("the first server dies");
             // Retried: for a moment after `kill-server` the socket is still
@@ -156,10 +156,10 @@ fn a_server_replaced_during_collection_yields_none() {
             }
             Ok(A_BROWSER.to_string())
         }
-        fn monitors_json(&self) -> anyhow::Result<String> {
+        fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
             Ok(MONITORS.to_string())
         }
-        fn dispatch(&self, _lua: &str) -> anyhow::Result<String> {
+        fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
             panic!("no test here may dispatch: it would move a real window")
         }
     }

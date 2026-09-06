@@ -224,30 +224,116 @@ pub fn clamp_to_usable(rel: (f32, f32, f32, f32), m: &Monitor) -> Option<(i32, i
     Some((x + m.x, y + m.y, w, h))
 }
 
-/// The Lua dispatches that place `address`, in the order they must run.
+/// What is still wrong about where `w` is, or `None` when it is exactly
+/// where `p` says it belongs.
+///
+/// This is the question `hyprctl dispatch` does not answer. Its `ok` means
+/// the compositor accepted the call; it says nothing about where the window
+/// ended up, and on Hyprland 0.56.2 a window can be sent to a workspace,
+/// acknowledged, and be somewhere else a moment later because the very next
+/// dispatch moved it again. Only reading the desktop back settles it.
+///
+/// # A monitor that cannot be resolved is a shortfall, not an exemption
+///
+/// [`resolve_monitor`] falls back to the focused monitor and then to the
+/// first, so it answers for any list with a monitor in it. It returns `None`
+/// for exactly one input: an **empty** list. This used to be read as "no
+/// monitor dispatch was made, so none is owed", and the window was then
+/// confirmed on its workspace alone — which is how a terminal could come back
+/// on the wrong panel with the run reporting `succeeded`. A desktop osm
+/// cannot read is not a desktop osm has satisfied, so it is reported.
+pub fn placement_gap(w: &Client, p: &Placement, monitors: &[Monitor]) -> Option<String> {
+    let mut wrong = Vec::new();
+    if w.workspace_name != p.workspace_ref {
+        wrong.push(format!(
+            "it is on workspace {:?}, not {:?}",
+            w.workspace_name, p.workspace_ref
+        ));
+    }
+    match resolve_monitor(p, monitors) {
+        Some(m) => {
+            let on = crate::hypr::connector_of(w.monitor_index, monitors);
+            if on.map(|c| c.id) != Some(m.id) {
+                wrong.push(format!(
+                    "it is on monitor {}, not {}",
+                    on.map(|c| c.name.as_str())
+                        .unwrap_or("(none this compositor lists)"),
+                    m.name
+                ));
+            }
+        }
+        None => wrong.push(format!(
+            "the compositor lists no monitor at all, so nothing can say whether it \
+             is on {}",
+            p.monitor_connector
+        )),
+    }
+    if wrong.is_empty() {
+        None
+    } else {
+        Some(wrong.join(", and "))
+    }
+}
+
+/// The Lua dispatches that still have to run for `w` to satisfy `p`, in the
+/// order they must run in.
 ///
 /// The shape is verified against a live compositor by `tests/desktop_live.rs`:
 /// Hyprland 0.56 dropped the shell-style `[workspace N silent]` rule syntax,
 /// which fails with `']' expected near '4'` while looking perfectly correct.
-pub fn place_lua(address: &str, p: &Placement, monitors: &[Monitor]) -> Vec<String> {
-    let win = lua_str(&format!("address:{address}"));
-    let mut out = vec![format!(
-        "hl.dsp.window.move({{window={win}, workspace={}, follow=false}})",
-        lua_str(&p.workspace_ref)
-    )];
+///
+/// # Why this takes the window rather than just its address
+///
+/// Because two of these dispatches contradict each other, so which of them to
+/// send depends on where the window already is.
+///
+/// `hl.dsp.window.move({window=…, monitor='M'})` does not mean "keep this
+/// window where it is and change its output". It means "put this window on
+/// M", and where on M is **M's active workspace** — measured against the live
+/// compositor, with the window's address and pid unchanged across the call:
+///
+/// ```text
+/// move({workspace='9'})   -> ok    +0.0s: ws 9   +0.3s: ws 9   +1s: ws 9
+/// move({monitor='HDMI-A-2'}) -> ok +0.0s: ws 2   +0.3s: ws 2   +2s: ws 2
+/// ```
+///
+/// Emitting both unconditionally, workspace first, therefore threw away the
+/// workspace on every restore: on a single-monitor machine the second call
+/// was pure loss, and both of the maintainer's restored terminals came back
+/// on whatever workspace happened to be active, with `ok` from every
+/// dispatch and `"outcome":"placed"` on every window.
+///
+/// So the monitor is corrected only as a step *towards* a workspace move that
+/// is going to follow it and overrule it. When the window is already on the
+/// workspace it belongs on and only the monitor is wrong — a workspace that
+/// currently lives on another output — nothing is emitted at all: the only
+/// dispatch available would take the window off its workspace to put it on
+/// the right panel, which is a worse answer than the honest report
+/// [`placement_gap`] produces. See
+/// `tests/desktop_confirm.rs::a_workspace_that_lives_on_the_wrong_monitor_is_reported_not_papered_over`.
+pub fn place_lua(w: &Client, p: &Placement, monitors: &[Monitor]) -> Vec<String> {
+    let win = lua_str(&format!("address:{}", w.address));
+    let mut out = Vec::new();
 
     let target = resolve_monitor(p, monitors);
-    // Unconditionally, never "only when the name changed". A workspace does
-    // not stay on the output it was captured from: with `DP-1` still present
-    // but workspace 3 currently living on `eDP-1`, the workspace move alone
-    // puts the terminal on the wrong panel, and the connector comparison
-    // then skipped the one dispatch that would have corrected it — so the
-    // common case, an unchanged monitor layout, was the case that never
-    // moved a window to its monitor.
-    if let Some(m) = target {
+    let on_monitor = match target {
+        Some(m) => crate::hypr::connector_of(w.monitor_index, monitors).map(|c| c.id) == Some(m.id),
+        // Nothing to move it to, and nothing owed.
+        None => true,
+    };
+
+    if w.workspace_name != p.workspace_ref {
+        // First, because the workspace move that follows is what decides
+        // where the window actually ends up.
+        if let (false, Some(m)) = (on_monitor, target) {
+            out.push(format!(
+                "hl.dsp.window.move({{window={win}, monitor={}}})",
+                lua_str(&m.name)
+            ));
+        }
         out.push(format!(
-            "hl.dsp.window.move({{window={win}, monitor={}}})",
-            lua_str(&m.name)
+            "hl.dsp.window.move({{window={win}, workspace={}, follow=false}})",
+            lua_str(&p.workspace_ref)
         ));
     }
 
@@ -348,11 +434,11 @@ pub fn placements_with_incarnation(
         _ => return Ok(None),
     };
 
-    let clients_json = match h.clients_json() {
+    let clients_json = match h.clients_json(crate::hypr::CALL_TIMEOUT) {
         Ok(j) => j,
         Err(_) => return Ok(None),
     };
-    let monitors_json = match h.monitors_json() {
+    let monitors_json = match h.monitors_json(crate::hypr::CALL_TIMEOUT) {
         Ok(j) => j,
         Err(_) => return Ok(None),
     };
@@ -545,8 +631,16 @@ pub struct PlacedWindow {
     /// The connector it was moved to, which is the monitor
     /// [`resolve_monitor`] settled on rather than the one the capture named:
     /// a cable that moved makes those two different, and the claim is about
-    /// where the window was actually sent. `None` when the compositor listed
-    /// no monitor to send it to and no monitor dispatch was made.
+    /// where the window was actually sent.
+    ///
+    /// [`spawn_and_place`] never leaves this `None`: a compositor that lists
+    /// no monitor to resolve against ends the placement as a lost compositor
+    /// rather than producing a claim whose monitor nothing can check. The
+    /// `Option` survives so that a claim reaching the publication without one
+    /// is *reported* rather than silently exempted from the monitor
+    /// comparison — see [`crate::restore`]'s `unplaced_windows`, which used to
+    /// skip exactly those and retire the user's snapshot against a window it
+    /// had never confirmed the panel of.
     pub monitor_connector: Option<String>,
 }
 
@@ -563,6 +657,23 @@ pub enum PlaceOutcome {
     /// It started, but no window this attempt owns appeared before the
     /// deadline.
     NeverMapped,
+    /// Its window appeared, every dispatch was acknowledged, and reading the
+    /// desktop back says it is not on the workspace or the monitor it was
+    /// captured on. Carries what is wrong, in the compositor's own terms.
+    ///
+    /// This is what `placed` used to say. On the maintainer's desktop two
+    /// terminals captured on workspaces 9 and 10 came back on workspace 2
+    /// with `ok` from every dispatch, and the restore reported both as
+    /// `placed` — a claim about what osm asked for rather than about what is
+    /// on the screen, which is the exact shape of failure this project exists
+    /// to refuse. A dispatch is a request; only a read is evidence.
+    ///
+    /// Unlike [`Self::NeverAttached`], the terminal is **not** taken back. It
+    /// is the user's restored terminal, holding their session, on the wrong
+    /// workspace; ending it would take away the thing this pass exists to
+    /// give back, to punish a fault of osm's. Degraded instead, so the source
+    /// snapshot stays restorable and the shortfall is visible.
+    Misplaced(String),
     /// Its window appeared and was moved, but no tmux client inside it ever
     /// attached to the session within the interval the attach was given.
     ///
@@ -606,6 +717,7 @@ impl PlaceOutcome {
             PlaceOutcome::Placed(_) => "placed",
             PlaceOutcome::SpawnFailed(_) => "spawn_failed",
             PlaceOutcome::NeverMapped => "never_mapped",
+            PlaceOutcome::Misplaced(_) => "misplaced",
             PlaceOutcome::NeverAttached => "never_attached",
             PlaceOutcome::NoCompositor => "no_compositor",
             PlaceOutcome::LostCompositor(_) => "lost_compositor",
@@ -619,6 +731,7 @@ impl PlaceOutcome {
         match self {
             PlaceOutcome::SpawnFailed(d)
             | PlaceOutcome::LostCompositor(d)
+            | PlaceOutcome::Misplaced(d)
             | PlaceOutcome::Skipped(d) => Some(d),
             _ => None,
         }
@@ -818,99 +931,422 @@ pub fn spawn_and_place(
         PlaceOutcome::LostCompositor(why)
     };
 
+    // ---- the window this attempt owns ------------------------------------
+    //
+    // A read that fails is "not yet", not "the compositor is gone". It used
+    // to end the placement and kill the terminal on the first failure, and a
+    // single `hyprctl -j clients` that ran out of time was enough — which is
+    // what happened on the maintainer's machine with two terminals starting
+    // at once. Several terminals mapping at the same moment is not an
+    // exceptional condition during a restore; it is what a restore *is*. So
+    // the deadline decides, and the last error is what it reports if nothing
+    // ever answered.
     let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let json = match h.clients_json() {
-            Ok(j) => j,
-            Err(e) => return lost(format!("the compositor stopped answering: {e:#}")),
-        };
-        let windows = match crate::hypr::parse_clients(&json) {
-            Ok(w) => w,
-            Err(e) => return lost(format!("the compositor stopped answering: {e:#}")),
-        };
-        // Ours because we started the process behind it. The marker is still
-        // passed to the terminal — some honour it, and it makes a stray
-        // window identifiable by hand — but nothing depends on it.
-        if let Some(w) = windows.iter().find(|w| owns_window(&spawned, w.pid)) {
-            let monitors = match h
-                .monitors_json()
-                .ok()
-                .and_then(|j| crate::hypr::parse_monitors(&j).ok())
-            {
-                Some(m) => m,
-                None => return lost("the compositor stopped listing its monitors".to_string()),
-            };
-            // The same monitor `place_lua` will address, read out here so the
-            // claim names where the window was actually sent rather than
-            // where the capture found it: the two differ whenever a connector
-            // was renamed and the panel was matched by description instead.
-            let sent_to = resolve_monitor(p, &monitors).map(|m| m.name.clone());
-            for lua in place_lua(&w.address, p, &monitors) {
-                match h.dispatch(&lua) {
-                    // `Ok` only means the call was made. A rejected dispatch
-                    // comes back as text on successful stdout, and taking
-                    // that for success recorded an unmoved window as placed.
-                    Ok(reply) if crate::hypr::dispatch_acknowledged(&reply) => {}
-                    Ok(reply) => {
-                        return lost(format!(
-                            "the compositor did not acknowledge {lua}: {}",
-                            reply.trim()
-                        ))
-                    }
-                    Err(e) => return lost(format!("dispatching {lua}: {e:#}")),
-                }
-            }
-            // Moved, but not yet the session's terminal. A window maps and
-            // takes dispatches before the shell inside it has run
-            // `tmux attach-session`, and one whose attach fails outright maps
-            // exactly the same way. Until a client of *this* terminal is
-            // attached to *this* session, the session has no terminal window
-            // — and saying otherwise published a snapshot with no placement
-            // in it and retired the one that had it.
-            //
-            // The attach gets an interval of its own, counted from the moment
-            // the window mapped. Sharing the spawn's deadline meant a
-            // terminal that was slow to map — the ordinary case on a cold
-            // boot, which is when this runs — was left whatever remained of
-            // the budget to attach in, sometimes nothing at all.
-            let attach_deadline = std::time::Instant::now() + timeout;
-            return match attached(tmux, &spawned, &p.session, attach_deadline) {
-                Attach::Yes => PlaceOutcome::Placed(PlacedWindow {
-                    address: w.address.clone(),
-                    workspace_kind: p.workspace_kind.clone(),
-                    workspace_ref: p.workspace_ref.clone(),
-                    monitor_connector: sent_to,
-                }),
-                // A terminal osm started that holds **no session at all** —
-                // not merely "not this one", which is a different answer and
-                // is reported as [`Attach::Unknown`] below. Left running it
-                // is an empty window on the user's desktop that no later
-                // attempt can adopt — each retry spawns another beside it —
-                // so it is taken back, the same way a lost compositor's is.
-                Attach::No => {
-                    sp.kill(&spawned);
-                    PlaceOutcome::NeverAttached
-                }
-                // Either the server never gave a readable answer, or a
-                // client of ours is attached to some other session. Both
-                // mean the same thing here: "this terminal holds nothing" is
-                // not something this pass knows, and the window may be
-                // showing the user their work. Killing it on a guess is the
-                // one mistake worse than leaving it.
-                Attach::Unknown => PlaceOutcome::NeverAttached,
-            };
+    let mut last_error: Option<String>;
+    let found = loop {
+        match owned_window(h, &spawned, call_budget(deadline)) {
+            // Ours because we started the process behind it. The marker is
+            // still passed to the terminal — some honour it, and it makes a
+            // stray window identifiable by hand — but nothing depends on it.
+            Ok(Some(w)) => break w,
+            Ok(None) => last_error = None,
+            Err(e) => last_error = Some(format!("{e:#}")),
         }
         if std::time::Instant::now() >= deadline {
-            // Deliberately *not* killed. "No window this attempt owns has
-            // appeared yet" is a statement about what osm can see, not about
-            // what exists: a terminal that is slow to map on a cold boot, or
-            // one that reparented its window out of our lineage, is the
-            // user's restored terminal and killing it would take away the
-            // very thing this pass exists to give back. Degraded, so the
-            // snapshot stays restorable and a human can see the shortfall.
-            return PlaceOutcome::NeverMapped;
+            return match last_error {
+                Some(e) => lost(format!("the compositor stopped answering: {e}")),
+                // Deliberately *not* killed. "No window this attempt owns has
+                // appeared yet" is a statement about what osm can see, not
+                // about what exists: a terminal that is slow to map on a cold
+                // boot, or one that reparented its window out of our lineage,
+                // is the user's restored terminal and killing it would take
+                // away the very thing this pass exists to give back.
+                // Degraded, so the snapshot stays restorable and a human can
+                // see the shortfall.
+                None => PlaceOutcome::NeverMapped,
+            };
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(MAP_POLL);
+    };
+
+    // An **empty** list is not a machine with no screens. Nothing gets this
+    // far without [`crate::hypr::wait_until_reachable`] having already
+    // watched this compositor report a monitor, and a terminal has just been
+    // spawned onto it; a valid, empty `hyprctl -j monitors` arriving after
+    // that is a compositor that cannot be read right now — a DPMS
+    // transition, a hotplug, a mode switch, a session switched away from.
+    //
+    // Accepting it cost the promise this pass exists to keep.
+    // `resolve_monitor` had nothing to resolve, so `placement_gap` asked
+    // about the workspace alone, the window was confirmed `placed` on
+    // whatever panel it happened to map on, and the claim carried no
+    // connector — which the publication then had nothing to check either. A
+    // restore that put the user's terminal on the wrong monitor reported
+    // `succeeded` and retired the snapshot that knew the right one.
+    //
+    // But refusing *once* is not the same decision. Every failure from here
+    // on takes the terminal back — that is what `lost` does — so a single
+    // blink was enough to destroy a window that had already mapped, already
+    // held the user's session, and would have been placed correctly a
+    // hundred milliseconds later. A mode switch on a one-monitor machine
+    // produces exactly one such blink, and one monitor is what the
+    // maintainer has: this read is on the path of every restore they do. So
+    // the list is asked for again, within a bounded budget, and only a
+    // compositor that never answers is called lost.
+    let monitors = match monitors_within(h, std::time::Instant::now() + MONITOR_READ_BUDGET) {
+        Ok(m) => m,
+        Err(why) => return lost(why),
+    };
+    // The same monitor `place_lua` will address, read out here so the claim
+    // names where the window was actually sent rather than where the capture
+    // found it: the two differ whenever a connector was renamed and the panel
+    // was matched by description instead.
+    //
+    // A `Placed` claim is never made without it. `resolve_monitor` falls back
+    // to the focused monitor and then to the first, so on a list with any
+    // monitor in it this always answers; the arm below is what keeps that a
+    // fact rather than an assumption, because the one outcome that retires
+    // the user's snapshot must not be reachable through a monitor nobody
+    // resolved.
+    let Some(sent_to) = resolve_monitor(p, &monitors).map(|m| m.name.clone()) else {
+        return lost(
+            "the compositor listed monitors that name no panel to send the window to".to_string(),
+        );
+    };
+
+    // ---- place it, and make the compositor say it is there ---------------
+    let placed = match confirm_placement(h, &spawned, found, p, &monitors, timeout) {
+        Confirmation::Placed(w) => w,
+        // Not killed: see [`PlaceOutcome::Misplaced`]. The window is the
+        // user's restored terminal, holding their session, in the wrong
+        // place.
+        Confirmation::Misplaced(why) => return PlaceOutcome::Misplaced(why),
+        Confirmation::Lost(why) => return lost(why),
+    };
+
+    // Moved, but not yet the session's terminal. A window maps and takes
+    // dispatches before the shell inside it has run `tmux attach-session`,
+    // and one whose attach fails outright maps exactly the same way. Until a
+    // client of *this* terminal is attached to *this* session, the session
+    // has no terminal window — and saying otherwise published a snapshot with
+    // no placement in it and retired the one that had it.
+    //
+    // The attach gets an interval of its own, counted from the moment the
+    // window mapped. Sharing the spawn's deadline meant a terminal that was
+    // slow to map — the ordinary case on a cold boot, which is when this runs
+    // — was left whatever remained of the budget to attach in, sometimes
+    // nothing at all.
+    //
+    // A window that drifts off its workspace *after* this point is not
+    // covered here and is not meant to be: the restore reads the whole
+    // desktop back before it publishes anything, and refuses to retire the
+    // source snapshot when what it finds disagrees with what it placed. That
+    // check is what caught this bug in the first place.
+    let attach_deadline = std::time::Instant::now() + timeout;
+    match attached(tmux, &spawned, &p.session, attach_deadline) {
+        Attach::Yes => PlaceOutcome::Placed(PlacedWindow {
+            address: placed.address,
+            workspace_kind: p.workspace_kind.clone(),
+            workspace_ref: p.workspace_ref.clone(),
+            monitor_connector: Some(sent_to),
+        }),
+        // A terminal osm started that holds **no session at all** — not
+        // merely "not this one", which is a different answer and is reported
+        // as [`Attach::Unknown`] below. Left running it is an empty window on
+        // the user's desktop that no later attempt can adopt — each retry
+        // spawns another beside it — so it is taken back, the same way a lost
+        // compositor's is.
+        Attach::No => {
+            sp.kill(&spawned);
+            PlaceOutcome::NeverAttached
+        }
+        // Either the server never gave a readable answer, or a client of ours
+        // is attached to some other session. Both mean the same thing here:
+        // "this terminal holds nothing" is not something this pass knows, and
+        // the window may be showing the user their work. Killing it on a
+        // guess is the one mistake worse than leaving it.
+        Attach::Unknown => PlaceOutcome::NeverAttached,
+    }
+}
+
+/// How often the compositor is asked whether this attempt's window has
+/// mapped yet.
+const MAP_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How often the window is read back while a placement is being confirmed.
+const CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long a placement is given to actually take effect, once every
+/// dispatch asking for it has been acknowledged.
+///
+/// Short, and deliberately not the readiness budget. Moving a window is
+/// synchronous on Hyprland — measured against the live compositor, the window
+/// is on its new workspace by the time the next `hyprctl -j clients` returns
+/// — so this is not a wait for slow work. It is headroom for a window that
+/// something else moves back, and a bound on how long a placement that is
+/// never going to succeed may hold up the rest of the restore: with the
+/// readiness budget (30s by default) instead, one window that cannot be
+/// placed would cost every session behind it half a minute each.
+const CONFIRM_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The least time a compositor call is ever started with.
+///
+/// A deadline bounds how long osm *waits*; it must not become a reason to cut
+/// a call off after a millisecond and report the placement as failed for
+/// nothing but arithmetic. So the last call before a deadline gets a whole
+/// second, and the worst case is one call's overrun — against the ninety
+/// seconds per window this replaced.
+const MIN_CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `deadline` has passed.
+fn expired(deadline: std::time::Instant) -> bool {
+    std::time::Instant::now() >= deadline
+}
+
+/// How long a single compositor call may take if it is started now: whatever
+/// is left before `deadline`, floored at [`MIN_CALL_BUDGET`].
+///
+/// `hypr::run_hyprctl` applies the ceiling, so nothing here can hand out more
+/// than [`crate::hypr::CALL_TIMEOUT`].
+fn call_budget(deadline: std::time::Instant) -> std::time::Duration {
+    deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(MIN_CALL_BUDGET)
+}
+
+/// How long the compositor is given to produce a monitor list it can be
+/// confirmed against, before the placement is called lost.
+///
+/// Deliberately its own budget rather than the per-window one. It bounds a
+/// *retry*, not a wait for slow work: a compositor that is there answers this
+/// on the first call, and the only thing being waited out is the instant in
+/// which it has no output to report. Three seconds is long enough to cross a
+/// mode switch or a DPMS blank and short enough that a compositor which
+/// really has gone away does not hold up the sessions behind this one.
+const MONITOR_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often the monitor list is re-asked for while [`MONITOR_READ_BUDGET`]
+/// lasts.
+const MONITOR_READ_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// The compositor's monitor list, re-asked for until it names a panel or
+/// `deadline` passes.
+///
+/// The error is the sentence [`spawn_and_place`] reports, and it describes
+/// the *last* thing that went wrong rather than the first, because that is
+/// the state the compositor was left in. The three are kept apart on purpose:
+/// "it answered, with nothing", "its answer could not be parsed" and "it did
+/// not answer" are different failures and a report that blurs them tells a
+/// human nothing about which machine they are looking at.
+///
+/// One attempt always happens, whatever `deadline` says: a budget is a bound
+/// on waiting, never a reason to skip the question. Every attempt *after* that
+/// one is checked against the clock twice — before the wait and again after it
+/// — and the wait itself is cut to whatever is left. Sleeping a flat
+/// [`MONITOR_READ_POLL`] and then asking again unchecked turned this three
+/// second bound into four and a bit: the sleep stepped over the deadline and
+/// [`call_budget`] handed the read that followed a whole second on top of a
+/// deadline that had already gone. Per restored session, on a boot that walks
+/// them one after another.
+fn monitors_within(
+    h: &dyn crate::hypr::HyprCtl,
+    deadline: std::time::Instant,
+) -> Result<Vec<Monitor>, String> {
+    let mut why;
+    loop {
+        match h.monitors_json(call_budget(deadline)) {
+            Ok(json) => match crate::hypr::parse_monitors(&json) {
+                Ok(monitors) if !monitors.is_empty() => return Ok(monitors),
+                Ok(_) => {
+                    why = "the compositor kept listing no monitors at all, after readiness \
+                           had already seen one: its window cannot be confirmed on the \
+                           monitor it was captured on"
+                        .to_string()
+                }
+                Err(e) => why = format!("the compositor's monitor list could not be read: {e:#}"),
+            },
+            Err(e) => why = format!("the compositor stopped listing its monitors: {e:#}"),
+        }
+        if expired(deadline) {
+            return Err(why);
+        }
+        // Never past the deadline, and never *up to* it and then one more
+        // read: the second check is what stops a call being started with
+        // nothing left, which `call_budget` would still grant a second.
+        std::thread::sleep(
+            MONITOR_READ_POLL.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+        if expired(deadline) {
+            return Err(why);
+        }
+    }
+}
+
+/// What [`confirm_placement`] established.
+enum Confirmation {
+    /// The compositor says the window is on its workspace and its monitor.
+    /// Carries the window as it was last read — which is not necessarily the
+    /// one that went in, see [`owned_window`].
+    Placed(Client),
+    /// It is not, and the budget for making it so has run out.
+    Misplaced(String),
+    /// The compositor stopped answering, or refused a dispatch.
+    Lost(String),
+}
+
+/// The window this attempt's process owns, as the compositor reports it now.
+///
+/// Ownership, never the address, is the identity. Hyprland reuses `CWindow`
+/// allocations, so a window that is destroyed and re-created can hand its
+/// address straight to something else — the same addresses recurred across
+/// independent runs on the maintainer's machine. A confirmation loop that
+/// looked its window up by address could therefore be satisfied by a stranger
+/// that happened to inherit it and happened to be on the target workspace,
+/// and would report a placement osm never made. Looking it up by the process
+/// tree instead follows *our* window when it is re-created, and never claims
+/// somebody else's.
+fn owned_window(
+    h: &dyn crate::hypr::HyprCtl,
+    spawned: &Spawned,
+    budget: std::time::Duration,
+) -> Result<Option<Client>> {
+    let json = h.clients_json(budget)?;
+    let windows = crate::hypr::parse_clients(&json)?;
+    Ok(windows.into_iter().find(|w| owns_window(spawned, w.pid)))
+}
+
+/// Dispatch what `p` still needs, then read the desktop back until it agrees
+/// — or until the budget runs out and it has to say that it does not.
+///
+/// # Why a dispatch is not evidence
+///
+/// `hyprctl dispatch` answers `ok` when the compositor **accepted** the call.
+/// That is not a claim about where the window is. Two terminals on the
+/// maintainer's desktop, captured on workspaces 9 and 10, came back on
+/// workspace 2 with `ok` from every dispatch and `"outcome":"placed"` on both
+/// — because the second dispatch osm made undid the first, which no amount of
+/// checking the *reply* could ever have revealed. The only thing that can is
+/// asking the compositor where the window is.
+///
+/// Bounded by `timeout` and by [`CONFIRM_BUDGET`], whichever is shorter, so a
+/// window that will never land cannot hold up the sessions behind it.
+fn confirm_placement(
+    h: &dyn crate::hypr::HyprCtl,
+    spawned: &Spawned,
+    found: Client,
+    p: &Placement,
+    monitors: &[Monitor],
+    timeout: std::time::Duration,
+) -> Confirmation {
+    let deadline = std::time::Instant::now() + timeout.min(CONFIRM_BUDGET);
+    let mut w = found;
+    loop {
+        for lua in place_lua(&w, p, monitors) {
+            // Before the dispatch, not only after the batch of them. Five
+            // dispatches were issued back to back and only then was the clock
+            // consulted, so a floating window could spend five full
+            // `hyprctl` timeouts past its deadline before anything noticed —
+            // and every session behind it waited.
+            if expired(deadline) {
+                return Confirmation::Misplaced(format!(
+                    "the budget for confirming the placement ran out with {lua} \
+                     still to dispatch"
+                ));
+            }
+            match h.dispatch(&lua, call_budget(deadline)) {
+                // `Ok` only means the call was made. A rejected dispatch
+                // comes back as text on successful stdout, and taking that
+                // for success recorded an unmoved window as placed.
+                Ok(reply) if crate::hypr::dispatch_acknowledged(&reply) => {}
+                Ok(reply) => {
+                    return Confirmation::Lost(format!(
+                        "the compositor did not acknowledge {lua}: {}",
+                        reply.trim()
+                    ))
+                }
+                // A call that failed *after* the deadline is this restore's
+                // own budget running out, not a compositor that has gone —
+                // and `Lost` takes the user's terminal away with it. Only a
+                // failure with time still on the clock is evidence about the
+                // compositor.
+                Err(e) if expired(deadline) => {
+                    return Confirmation::Misplaced(format!(
+                        "the budget for confirming the placement ran out while \
+                         dispatching {lua}: {e:#}"
+                    ))
+                }
+                Err(e) => return Confirmation::Lost(format!("dispatching {lua}: {e:#}")),
+            }
+        }
+
+        // Read it back. Nothing above this line is evidence of anything.
+        //
+        // `last` is what the most recent read in this pass established:
+        // `None` for a pass in which the budget ran out before one could be
+        // made at all, `Some(Ok(()))` for a compositor that answered and does
+        // not list our window, `Some(Err(_))` for one that gave no readable
+        // answer.
+        let mut last: Option<std::result::Result<(), String>> = None;
+        let now = loop {
+            // Same rule as the dispatches: the deadline is checked before the
+            // call, so a read cannot start after the budget has gone and then
+            // run for a further `hyprctl` timeout.
+            if expired(deadline) {
+                break None;
+            }
+            match owned_window(h, spawned, call_budget(deadline)) {
+                Ok(Some(w)) => break Some(w),
+                Ok(None) => last = Some(Ok(())),
+                Err(e) => last = Some(Err(format!("{e:#}"))),
+            }
+            if expired(deadline) {
+                break None;
+            }
+            std::thread::sleep(CONFIRM_POLL);
+        };
+        let Some(now) = now else {
+            // All three are `Misplaced`, and none of them kills the terminal.
+            // A read can only end this loop at the deadline, so a failed one
+            // is as likely to be this restore's own budget cutting a slow
+            // `hyprctl` short as it is to be a compositor that has gone — and
+            // the window on the screen is the user's restored terminal
+            // holding their session. `Lost`, which takes it back, is kept for
+            // a dispatch the compositor refused or failed while there was
+            // still time on the clock: that is evidence about the compositor
+            // rather than about the clock.
+            return Confirmation::Misplaced(match last {
+                Some(Err(e)) => format!(
+                    "the budget for confirming the placement ran out, and the last \
+                     read of the compositor failed: {e}"
+                ),
+                Some(Ok(())) => "its window was gone from the compositor before the \
+                     placement could be confirmed"
+                    .to_string(),
+                None => match placement_gap(&w, p, monitors) {
+                    Some(gap) => format!(
+                        "the budget for confirming the placement ran out with the \
+                         compositor last reporting the window at {}: {gap}",
+                        w.address
+                    ),
+                    None => "the budget for confirming the placement ran out before \
+                         the compositor could be read back"
+                        .to_string(),
+                },
+            });
+        };
+
+        let Some(gap) = placement_gap(&now, p, monitors) else {
+            return Confirmation::Placed(now);
+        };
+        if std::time::Instant::now() >= deadline {
+            return Confirmation::Misplaced(format!(
+                "the compositor acknowledged every dispatch, and then reported the \
+                 window at {}: {gap}",
+                now.address
+            ));
+        }
+        w = now;
+        std::thread::sleep(CONFIRM_POLL);
     }
 }
 

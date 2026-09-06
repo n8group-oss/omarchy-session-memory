@@ -264,8 +264,8 @@ CREATE TABLE agent_sessions (
   store_path    TEXT,                   -- jsonl path where applicable
   last_active   INTEGER,
   size_bytes    INTEGER,
-  summary       TEXT,                   -- opt-in only, off by default
-  alive         INTEGER NOT NULL DEFAULT 0 CHECK (alive IN (0,1)),
+  title         TEXT,                   -- one line; NULL when none could be derived
+  title_source  TEXT,                   -- agent|first_prompt; NULL exactly when title is
   UNIQUE (kind, native_id)
 );
 
@@ -295,8 +295,81 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 newest 20 complete generations plus any generation referenced by a
 non-terminal restore attempt; deletion cascades.
 
-Transcript contents are never stored. `agent_sessions.summary` is populated
-only when the user enables it in config.
+### Conversation titles: the one thing read out of a transcript
+
+A conversation carries a **title** — one short line saying what it is about —
+in `agent_sessions.title`, with `agent_sessions.title_source` saying where
+that line came from. It is written only for conversations a capture bound to a
+pane, which bounds the table by the panes that have ever run an agent rather
+than by the thousands of conversations on the machine, and it is derived
+outside every write transaction, from the agent stores a capture already reads
+before it takes the database's write lock.
+
+There are two sources and they are not the same claim:
+
+* **`agent`** — the agent's own name for the conversation. Claude Code writes
+  `{"type":"ai-title","aiTitle":…}` records into its transcript and revises
+  them as it goes; the last one is the current name. A title the agent wrote
+  about itself is not transcript content.
+
+* **`first_prompt`** — **one truncated line of the user's first message**.
+  This *is* transcript content, and it relaxes the original rule ("no
+  transcript content is ever displayed or stored — titles and ids only"). The
+  relaxation is deliberate and it is bounded:
+
+  * one line, whitespace collapsed, at most 120 characters, with an ellipsis
+    when it was cut, and stripped of everything that would make the panel draw
+    something other than what osm recorded: the control characters (C0, C1,
+    the ANSI escapes), and the Unicode format characters that reverse or
+    conceal text — the bidi overrides and isolates (U+202A–U+202E,
+    U+2066–U+2069), the zero-width and invisible ones (U+200B–U+200F,
+    U+2060–U+2064, U+FEFF, U+00AD), and the tag characters at U+E0000. The
+    emoji variation selectors (U+FE00–U+FE0F) are kept: they choose a
+    presentation for the visible character before them and can neither hide
+    nor reorder anything;
+  * from the user's *opening* message only — never a reply, a tool result, an
+    attachment, or anything the agent writes as a user-shaped record (Claude's
+    `isMeta` records and slash commands, the preamble Codex injects as a
+    role-`user` message);
+  * never from a conversation osm cannot attribute: a record naming a
+    different conversation is refused, not borrowed;
+  * off entirely with `privacy.prompt_titles = false`, which leaves Claude
+    conversations named by whatever their agent called them and every Codex
+    conversation untitled. Switching it off is a **revocation**, not merely a
+    rule for the next derivation: `osm status --json` stops reporting every
+    prompt-derived title the moment the key reads `false`, and the next
+    capture clears the stored `title`/`title_source` of every conversation
+    whose title came from a prompt — not only the ones a pane is still
+    running. Titles an agent wrote about its own conversation are untouched;
+    they were never what this key governed.
+
+  Why relax it at all, measured rather than assumed: of the 2497
+  conversations on the machine this was built for, 2386 are Codex's and carry
+  no title of their own, and 37 of the 111 Claude ones have no `ai-title`
+  either. Titles-only would have meant 2423 blank rows out of 2497, and a
+  blank goal reads as a session with no purpose. With the fallback, 2336 come
+  back named.
+
+Where neither source yields anything the answer is **no title** — rendered
+*untitled*, never fabricated and never blank. Nothing else from a transcript
+is read, stored or shown.
+
+Every read is bounded and stops at its answer: a 256 KiB suffix for Claude's
+title, a 128 KiB prefix for its first prompt, a 512 KiB prefix for a Codex
+rollout, each sized from measurements over a real 14 GB store and stated on
+the constant in `src/agent/title.rs`. A title beyond the bound is *no title*.
+
+### A session's goal
+
+`osm status --json` gives each session a `goal`: **the title of the most
+recently active conversation in the session that has one**, carrying the kind
+and id of the conversation it came from so it can never be read against
+another. Never a summary stitched out of several — osm does not write
+sentences nobody said — and never the busiest or the biggest conversation's,
+because after a reboot what is wanted back is what was being done last. Every
+conversation the session held is reported beside it, newest first, with its
+own title and the window and pane it was in, so the choice can be checked
+rather than trusted.
 
 ## Configuration
 
@@ -319,11 +392,23 @@ fallback_interval_secs = 120
 keep_snapshots = 20
 
 [privacy]
-store_summaries = false
+prompt_titles = true         # false: only titles an agent wrote itself, so
+                             # every Codex conversation reads "untitled".
+                             # Switching it off also revokes the prompt-derived
+                             # titles already on record.
 ```
 
 Missing file means defaults. Invalid values are reported through
 `osm status --json` and surfaced by the widget rather than failing silently.
+
+A config that fails to load falls back to the defaults for everything except
+`privacy.prompt_titles`, which is forced **off** (`Config::strict_fallback`).
+The defaults exist so that a typo does not quietly stop osm tracking panes;
+they must not be allowed to overrule something the user wrote down. A file
+saying `prompt_titles = false` with an unrelated misspelling in it used to
+fall all the way back to reading first prompts again — an explicit refusal
+reversed by a mistake that had nothing to do with it. Nobody consents by
+accident.
 
 ## Capture
 
@@ -444,7 +529,23 @@ it instead of recording a clean success.
 is migrated in place; anything else — an older shape, an unversioned file, a
 database from a newer build — is checkpointed and moved aside as
 `state.db.v<N>.bak`, never overwriting an earlier backup, and a fresh database
-takes its name. `osm status --json` reports it under `database.preserved`.
+takes its name. `osm status --json` reports it under `database.preserved`, and
+says what is *in* it: the file is opened read-only and its snapshots counted,
+so a backup holding work reads differently from one holding none, and one that
+could not be read at all is reported as unknown rather than as either. The
+notice used to assert that the snapshots in it were intact without ever
+opening it — which on a preserved file holding nothing told its owner, every
+time the panel polled, that he had lost work he never had. The count is
+reported as a count and nothing more: it says how many rows are in one table,
+not that anything is behind them, not that the newest is not a half-written
+`building` row, and not that the file is internally consistent. A backup whose
+`snapshots` table reads perfectly and holds nothing else answers the query and
+holds nothing anyone could restore, so the notice says *contains N snapshot
+records* rather than claiming they are intact. A file holding
+nothing says it can be deleted; osm does not delete it, because it is the
+user's file. The read uses `immutable=1` unless a non-empty `-wal` sits beside
+the backup, so counting it neither creates SQLite's sidecars in the user's
+state directory nor misses rows that are only in a WAL.
 
 The whole of `open` runs under an exclusive lock beside the database, and the
 classification is re-formed under that lock rather than trusted from before it.
@@ -472,6 +573,18 @@ are stored unbound, and the menu offers manual selection rather than the engine
 guessing the newest file. This matters because the binding recorded at the last
 snapshot is the only thing that survives reboot — after a restart there is no
 `/proc` to re-derive it from.
+
+Discovery only ever finds conversations **inside** the configured store. An
+entry must be a regular file by `lstat` — a symlink named after a UUID is not
+a transcript — and must resolve to somewhere under the resolved store root, so
+a project directory that is itself a symlink out of the store contributes
+nothing even though the files behind it are ordinary. The root is resolved
+once, which is what keeps `~/.claude -> /data/claude` working: an agent home
+that is itself a symlink is a normal arrangement, and the whole store is then
+reached through one. Every read of a conversation file repeats the regular-file
+check on the descriptor it actually obtained, because discovery is a check made
+at one moment and the file is opened later, by name — and what is read becomes
+a persisted title.
 
 ## Restore
 

@@ -54,7 +54,10 @@ fn osm(tmux: &Tmux, dir: &std::path::Path, home: &std::path::Path, args: &[&str]
         )
         .args(args)
         .env("OSM_CLAUDE_HOME", home)
-        .env("XDG_CONFIG_HOME", config_home(dir));
+        .env("XDG_CONFIG_HOME", config_home(dir))
+        // Without this the database is the developer's own
+        // `~/.local/state/osm`: these runs read and wrote live state.
+        .env("XDG_STATE_HOME", dir.join("state"));
     cmd
 }
 
@@ -82,6 +85,8 @@ const ID_RESUME: &str = "0cfebf91-81c0-43d5-af63-c9fe7e844c03";
 const ID_NOPANE: &str = "0cfebf91-81c0-43d5-af63-c9fe7e844c04";
 const ID_UNKNOWN_FIXTURE: &str = "0cfebf91-81c0-43d5-af63-c9fe7e844c05";
 const ID_BUSY: &str = "0cfebf91-81c0-43d5-af63-c9fe7e844c06";
+const ID_TITLED: &str = "0cfebf91-81c0-43d5-af63-c9fe7e844c07";
+const ID_UNTITLED: &str = "0cfebf91-81c0-43d5-af63-c9fe7e844c08";
 /// Deliberately absent from every fixture.
 const ID_ABSENT: &str = "b70babcd-65cf-4760-b99b-e8fe1d07d290";
 
@@ -278,4 +283,67 @@ fn resume_into_a_busy_pane_reports_pane_busy_and_exits_non_zero() {
         !out.status.success(),
         "a resume that did not happen must not exit 0: {out:?}"
     );
+}
+
+/// What a conversation is about travels with the conversation.
+///
+/// The menu draws 25 of 2494 rows and lets the user filter over all of them;
+/// a row that says only `claude 0cfebf91-81c0 · /home/u/app` is not something
+/// a person can choose from, which is the whole of the maintainer's
+/// complaint. So `osm agents --json` carries the title on every entry, in
+/// both lists, with the source it came from beside it — and `null` where
+/// there is nothing to say, never a stand-in.
+#[test]
+fn agents_says_what_each_conversation_is_about() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = common::claude_fixture(tmp.path(), ID_TITLED);
+    let titled = home
+        .join("projects/-tmp")
+        .join(format!("{ID_TITLED}.jsonl"));
+    std::fs::write(
+        &titled,
+        format!(
+            "{{\"cwd\":\"/tmp\",\"sessionId\":\"{ID_TITLED}\"}}\n\
+             {{\"type\":\"ai-title\",\"aiTitle\":\"Tmux memory management plugin\",\
+               \"sessionId\":\"{ID_TITLED}\"}}\n"
+        ),
+    )
+    .unwrap();
+    // A second conversation with nothing to say about itself, in the same
+    // store: "untitled" and "titled" must be able to sit side by side.
+    common::claude_fixture(tmp.path(), ID_UNTITLED);
+    let s = server("titled");
+
+    let v = json(
+        &osm(&s.0, tmp.path(), &home, &["agents", "--json"])
+            .output()
+            .expect("run osm"),
+    );
+    let rows = v["resumable"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{v}");
+    let titled_row = rows
+        .iter()
+        .find(|r| r["native_id"] == ID_TITLED)
+        .unwrap_or_else(|| panic!("the titled conversation is listed: {v}"));
+    assert_eq!(
+        titled_row["title"], "Tmux memory management plugin",
+        "the title the agent wrote for itself is what the row says: {v}"
+    );
+    assert_eq!(
+        titled_row["title_source"], "agent",
+        "a reader must be able to tell the agent's own words from a line of \
+         the user's first prompt: {v}"
+    );
+
+    let untitled_row = rows
+        .iter()
+        .find(|r| r["native_id"] == ID_UNTITLED)
+        .unwrap_or_else(|| panic!("the untitled conversation is listed: {v}"));
+    assert_eq!(
+        untitled_row["title"],
+        serde_json::Value::Null,
+        "a conversation with no title says so; inventing one would put words \
+         in the user's mouth: {v}"
+    );
+    assert_eq!(untitled_row["title_source"], serde_json::Value::Null, "{v}");
 }

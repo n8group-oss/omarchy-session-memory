@@ -53,6 +53,28 @@ fn win(monitor_index: i64, at: (i32, i32), size: (i32, i32)) -> Client {
     }
 }
 
+/// A window that has just mapped: at `address`, on workspace `ws` of the
+/// monitor with index `monitor_index`, and not yet where it belongs.
+///
+/// `place_lua` takes the window rather than its address because the two
+/// dispatches it can emit contradict each other — sending a window to a
+/// monitor puts it on that monitor's *active* workspace — so which of them
+/// is right depends on where the window already is.
+fn mapped(address: &str, ws: &str, monitor_index: i64) -> Client {
+    Client {
+        address: address.into(),
+        pid: 1,
+        class: "com.mitchellh.ghostty".into(),
+        title: "t".into(),
+        workspace_id: ws.parse().unwrap_or(0),
+        workspace_name: ws.into(),
+        monitor_index,
+        at: (0, 0),
+        size: (100, 100),
+        floating: false,
+    }
+}
+
 #[test]
 fn geometry_is_recorded_as_a_fraction_of_its_monitor() {
     let g =
@@ -144,7 +166,11 @@ fn geometry_is_clamped_inside_the_monitor() {
 
 #[test]
 fn a_tiled_window_is_moved_to_its_workspace_and_not_resized() {
-    let lua = desktop::place_lua("0xA", &place("DP-1", None), &[mon(0, "DP-1", "d", true)]);
+    let lua = desktop::place_lua(
+        &mapped("0xA", "2", 0),
+        &place("DP-1", None),
+        &[mon(0, "DP-1", "d", true)],
+    );
     let all = lua.join(" ");
     assert!(all.contains("workspace='3'"), "{lua:?}");
     assert!(
@@ -159,7 +185,7 @@ fn a_floating_window_gets_its_geometry_after_being_moved() {
     let mut p = place("DP-1", None);
     p.floating = true;
     p.rel = Some((0.1, 0.1, 0.5, 0.5));
-    let lua = desktop::place_lua("0xA", &p, &[mon(0, "DP-1", "d", true)]);
+    let lua = desktop::place_lua(&mapped("0xA", "2", 0), &p, &[mon(0, "DP-1", "d", true)]);
     let move_i = lua.iter().position(|s| s.contains("workspace=")).unwrap();
     let size_i = lua.iter().position(|s| s.contains("resize")).unwrap();
     assert!(
@@ -174,7 +200,8 @@ fn a_special_workspace_is_addressed_as_special_not_as_a_number() {
     let mut p = place("DP-1", None);
     p.workspace_kind = "special".into();
     p.workspace_ref = "special:magic".into();
-    let lua = desktop::place_lua("0xA", &p, &[mon(0, "DP-1", "d", true)]).join(" ");
+    let lua =
+        desktop::place_lua(&mapped("0xA", "2", 0), &p, &[mon(0, "DP-1", "d", true)]).join(" ");
     assert!(lua.contains("special:magic"), "{lua}");
 }
 
@@ -185,7 +212,7 @@ fn every_dispatch_addresses_the_window_by_address() {
     let mut p = place("DP-1", None);
     p.floating = true;
     p.rel = Some((0.1, 0.1, 0.5, 0.5));
-    for d in desktop::place_lua("0xABC", &p, &[mon(0, "DP-1", "d", true)]) {
+    for d in desktop::place_lua(&mapped("0xABC", "2", 0), &p, &[mon(0, "DP-1", "d", true)]) {
         assert!(d.contains("window='address:0xABC'"), "{d}");
     }
 }
@@ -285,20 +312,131 @@ fn a_monitor_with_no_usable_scale_yields_no_geometry() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_target_monitor_is_dispatched_even_when_its_connector_did_not_change() {
-    // The common case, and the one that never worked: `DP-1` is still there,
-    // so the connector matches and the monitor dispatch used to be skipped —
-    // but workspace 3 currently lives on `eDP-1`, so the workspace move alone
-    // puts the terminal on the wrong panel and nothing corrects it.
+fn a_window_on_the_wrong_monitor_is_sent_to_it_before_its_workspace_move() {
+    // The window mapped on `eDP-1` and belongs on workspace 3 of `DP-1`.
+    // Both dispatches are needed, and the order is the whole of it: sending a
+    // window to a monitor puts it on that monitor's *active* workspace, so
+    // the monitor move has to come first and the workspace move has to be the
+    // last word. Emitted the other way round — which is how this shipped —
+    // the second call threw away the first, and every restored terminal came
+    // back on whatever workspace was active.
     let ms = vec![
         mon(0, "DP-1", "d", false),
         mon(1, "eDP-1", "built-in", true),
     ];
-    let lua = desktop::place_lua("0xA", &place("DP-1", None), &ms);
+    let lua = desktop::place_lua(&mapped("0xA", "2", 1), &place("DP-1", None), &ms);
+    let monitor_i = lua
+        .iter()
+        .position(|d| d.contains("monitor='DP-1'"))
+        .unwrap_or_else(|| panic!("the window is never sent to its monitor: {lua:?}"));
+    let workspace_i = lua
+        .iter()
+        .position(|d| d.contains("workspace='3'"))
+        .unwrap_or_else(|| panic!("the window is never sent to its workspace: {lua:?}"));
     assert!(
-        lua.iter().any(|d| d.contains("monitor='DP-1'")),
-        "the window is never sent to its monitor: {lua:?}"
+        monitor_i < workspace_i,
+        "the monitor move comes after the workspace move and undoes it: {lua:?}"
     );
+}
+
+#[test]
+fn a_window_already_on_its_monitor_is_not_sent_to_it_again() {
+    // The dispatch that can only do harm. `DP-1` is where the window already
+    // is, so asking for it again changes no monitor — and costs the window
+    // the workspace it was just moved to, because that is what a move to a
+    // monitor does. Sending it "just in case" is what broke placement on the
+    // maintainer's single-monitor desktop.
+    let lua = desktop::place_lua(
+        &mapped("0xA", "2", 0),
+        &place("DP-1", None),
+        &[mon(0, "DP-1", "d", true)],
+    );
+    assert!(
+        !lua.iter().any(|d| d.contains("monitor=")),
+        "the window was sent to the monitor it is already on: {lua:?}"
+    );
+    assert!(
+        lua.iter().any(|d| d.contains("workspace='3'")),
+        "it still has to be moved to its workspace: {lua:?}"
+    );
+}
+
+#[test]
+fn a_window_already_where_it_belongs_is_not_dispatched_at() {
+    // Confirmation re-reads the desktop and asks again for whatever is still
+    // wrong. When nothing is, there is nothing to ask for — and a loop that
+    // kept dispatching anyway would move a settled window on every pass.
+    let lua = desktop::place_lua(
+        &mapped("0xA", "3", 0),
+        &place("DP-1", None),
+        &[mon(0, "DP-1", "d", true)],
+    );
+    assert!(lua.is_empty(), "{lua:?}");
+}
+
+#[test]
+fn a_window_only_on_the_wrong_monitor_is_left_on_its_workspace() {
+    // It is on workspace 3, which is what it was captured on, and workspace 3
+    // currently lives on `eDP-1` rather than `DP-1`. The one dispatch that
+    // would put it on `DP-1` would take it off workspace 3 to do it — so
+    // nothing is emitted, and `placement_gap` reports the shortfall instead.
+    // Trading the workspace for the monitor and calling the result `placed`
+    // is the failure this file exists to prevent.
+    let ms = vec![
+        mon(0, "DP-1", "d", false),
+        mon(1, "eDP-1", "built-in", true),
+    ];
+    let w = mapped("0xA", "3", 1);
+    assert!(
+        desktop::place_lua(&w, &place("DP-1", None), &ms).is_empty(),
+        "the window was taken off its workspace to satisfy the monitor"
+    );
+    let gap = desktop::placement_gap(&w, &place("DP-1", None), &ms)
+        .expect("a window on the wrong monitor is not placed");
+    assert!(gap.contains("DP-1"), "{gap}");
+    assert!(!gap.contains("workspace"), "the workspace is right: {gap}");
+}
+
+#[test]
+fn the_gap_names_the_workspace_the_window_is_actually_on() {
+    // What `misplaced` reports to whoever reads the restore's JSON. "It did
+    // not work" is not actionable; "it is on 2, not 9" is.
+    let ms = vec![mon(0, "DP-1", "d", true)];
+    let gap = desktop::placement_gap(&mapped("0xA", "2", 0), &place("DP-1", None), &ms).unwrap();
+    assert!(gap.contains("\"2\"") && gap.contains("\"3\""), "{gap}");
+    assert!(
+        desktop::placement_gap(&mapped("0xA", "3", 0), &place("DP-1", None), &ms).is_none(),
+        "a window that is exactly where it belongs has no gap"
+    );
+}
+
+#[test]
+fn a_compositor_that_lists_no_monitor_cannot_confirm_a_placement() {
+    // This test used to assert the opposite — that a compositor listing no
+    // monitor is *owed* no monitor, so a window on its recorded workspace is
+    // `placed`. That is the unsafe reading, and it is reachable: readiness
+    // proves a monitor exists, and a later `hyprctl -j monitors` that comes
+    // back as a valid, empty array then makes `resolve_monitor` return
+    // nothing. The window is confirmed on its workspace alone, the claim
+    // carries no connector, the publication skips the monitor check it cannot
+    // make — and a restore that put the user's terminal on the wrong panel
+    // reports `succeeded` and retires the snapshot that knew the right one.
+    //
+    // An empty monitor list is not "no monitor is owed". It is "this
+    // compositor cannot be asked where the window is", which is a shortfall,
+    // not a placement. `spawn_and_place` refuses to get this far at all
+    // (see `tests/desktop_confirm.rs`); the gap is reported here as well, so
+    // no caller can confirm a placement against a desktop it cannot read.
+    let w = mapped("0xA", "3", -1);
+    let gap = desktop::placement_gap(&w, &place("DP-1", None), &[])
+        .expect("a monitor that cannot be resolved is not a confirmed placement");
+    assert!(
+        gap.contains("DP-1"),
+        "the gap must name the monitor that could not be confirmed: {gap}"
+    );
+    // Still nothing to dispatch: there is no monitor to send it to, and
+    // inventing one would move the user's window somewhere nobody recorded.
+    assert!(desktop::place_lua(&w, &place("DP-1", None), &[]).is_empty());
 }
 
 #[test]
@@ -308,7 +446,7 @@ fn a_workspace_name_with_an_apostrophe_produces_a_valid_literal() {
     let mut p = place("DP-1", None);
     p.workspace_kind = "named".into();
     p.workspace_ref = "Bob's".into();
-    let lua = desktop::place_lua("0xA", &p, &[mon(0, "DP-1", "d", true)]);
+    let lua = desktop::place_lua(&mapped("0xA", "2", 0), &p, &[mon(0, "DP-1", "d", true)]);
     let ws = lua
         .iter()
         .find(|d| d.contains("workspace="))
@@ -369,7 +507,7 @@ fn a_workspace_name_cannot_inject_lua() {
     let mut p = place("DP-1", None);
     p.workspace_kind = "named".into();
     p.workspace_ref = name.into();
-    let lua = desktop::place_lua("0xA", &p, &[mon(0, "DP-1", "d", true)]);
+    let lua = desktop::place_lua(&mapped("0xA", "2", 0), &p, &[mon(0, "DP-1", "d", true)]);
     let ws = lua.iter().find(|d| d.contains("workspace=")).unwrap();
 
     let (decoded, after) = workspace_literal(ws);
@@ -385,7 +523,7 @@ fn a_backslash_in_a_name_is_escaped_rather_than_continued() {
     let mut p = place("DP-1", None);
     p.workspace_kind = "named".into();
     p.workspace_ref = r"back\slash".into();
-    let lua = desktop::place_lua("0xA", &p, &[mon(0, "DP-1", "d", true)]);
+    let lua = desktop::place_lua(&mapped("0xA", "2", 0), &p, &[mon(0, "DP-1", "d", true)]);
     let ws = lua.iter().find(|d| d.contains("workspace=")).unwrap();
     assert!(ws.contains(r"workspace='back\\slash'"), "{ws}");
 }

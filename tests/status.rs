@@ -347,3 +347,393 @@ fn status_names_the_agents_osm_will_not_capture_or_resume_by_itself() {
         "{v}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The database block, as one answer.
+//
+// Every field under `database`, plus `snapshot` and `sessions`, is read out of
+// the same database at the same instant. They used not to be: the count was an
+// autocommit query taken just before the read transaction that produced
+// everything else, so a capture committing in that gap put `"snapshots": 0`
+// beside a `"snapshot"` object with an id in it.
+//
+// The interleaving itself is pinned by `ipc::tests::
+// an_empty_archive_never_reports_a_snapshot_out_of_it`, which runs the other
+// process's commit at the exact instant that matters. What these two check is
+// the shape a consumer actually reads.
+// ---------------------------------------------------------------------------
+
+/// The count, the newest recorded time, and the snapshot agree with each
+/// other and with the sessions listed.
+#[test]
+fn the_database_block_and_the_snapshot_describe_one_moment() {
+    let env = Env::new("dbmoment");
+    env.write_config("[restore]\nplace_windows = false\n");
+    let server = Server(env.tmux());
+    server
+        .0
+        .run(&["new-session", "-d", "-s", "dev", "-c", "/tmp"])
+        .unwrap();
+
+    for _ in 0..3 {
+        let out = env
+            .osm()
+            .args(["snapshot", "--reason", "test"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let v = env.status();
+    let db = &v["database"];
+    assert_eq!(db["reachable"], true, "{v}");
+    let snapshots = db["snapshots"].as_i64().expect("a snapshot count");
+    assert_eq!(snapshots, 3, "three captures, three snapshots: {v}");
+
+    let snap = &v["snapshot"];
+    assert!(snap.is_object(), "a snapshot was recorded: {v}");
+    assert_eq!(
+        db["newest_snapshot_at"], snap["taken_at"],
+        "the newest recorded time belongs to the snapshot reported: {v}"
+    );
+    assert_eq!(
+        snap["sessions"].as_u64().unwrap() as usize,
+        v["sessions"].as_array().unwrap().len(),
+        "the snapshot's session count and the session list disagree: {v}"
+    );
+    assert!(
+        snapshots > 0,
+        "an archive of {snapshots} snapshots holding snapshot #{}: {v}",
+        snap["id"]
+    );
+}
+
+/// A count that could not be read is `null`, not `0`.
+///
+/// Reading it used to be `unwrap_or((0, None))`, so a failed query reported an
+/// empty archive — a widget shows "nothing recorded" over a database full of
+/// snapshots, which is the same lie as every other one this plugin is built
+/// not to tell. The database here opens (its `schema_version` is this build's)
+/// and cannot be read, which is the only way to reach that branch.
+#[test]
+fn a_database_that_opens_and_cannot_be_read_reports_null_rather_than_zero() {
+    let env = Env::new("dbunreadable");
+    env.write_config("[restore]\nplace_windows = false\n");
+    let server = Server(env.tmux());
+    server
+        .0
+        .run(&["new-session", "-d", "-s", "dev", "-c", "/tmp"])
+        .unwrap();
+    let out = env
+        .osm()
+        .args(["snapshot", "--reason", "test"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The schema version stays this build's, so `open` migrates nothing and
+    // preserves nothing — and its `CREATE TABLE IF NOT EXISTS` batch would put
+    // a dropped table straight back. A renamed *column* is the damage it does
+    // not repair, and it is what a summary query trips over.
+    {
+        let conn = rusqlite::Connection::open(env.state_dir().join("state.db")).unwrap();
+        conn.execute(
+            "ALTER TABLE terminal_windows RENAME COLUMN workspace_ref TO gone",
+            [],
+        )
+        .unwrap();
+    }
+
+    let v = env.status();
+    let db = &v["database"];
+    assert!(
+        db["snapshots"].is_null(),
+        "a count that could not be read is unknown, not zero: {v}"
+    );
+    assert!(db["newest_snapshot_at"].is_null(), "{v}");
+    assert!(v["snapshot"].is_null(), "{v}");
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 0, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("database"),
+        "the user has to be told the database could not be read: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What is *in* the preserved database.
+//
+// The notice used to end "its snapshots are intact but osm no longer reads
+// them" without ever opening the file. On a machine whose preserved database
+// held nothing — a backup taken from an already-empty state directory — the
+// panel therefore told its owner, every five seconds, that snapshots he had
+// never lost were sitting somewhere unreadable. Asserting a fact nobody
+// checked is the same class of defect as rendering unknown as no.
+//
+// So the file is opened, read-only, and counted. Three outcomes, and all
+// three read differently: it holds snapshots, it holds none, or it could not
+// be read at all and what it holds is unknown. A fourth is the ordinary end
+// of the story — the user took up the offer and deleted it — and must not be
+// reported as a file osm cannot read.
+// ---------------------------------------------------------------------------
+
+/// A database from an older schema, holding `snapshots` snapshot rows.
+/// Opening it makes this build preserve it beside itself.
+///
+/// WAL, like every database this engine writes: it is the journal mode that
+/// decides whether merely *reading* the preserved file creates files beside
+/// it, which one of the tests below is about.
+fn write_legacy_db(path: &std::path::Path, snapshots: usize) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE snapshots (
+           id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+           boot_id TEXT NOT NULL, reason TEXT NOT NULL, state TEXT NOT NULL);
+         INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+    )
+    .unwrap();
+    for i in 1..=snapshots {
+        conn.execute(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+             VALUES (?1, ?2, 'boot-a', 'manual', 'complete')",
+            rusqlite::params![i as i64, 100 + i as i64],
+        )
+        .unwrap();
+    }
+}
+
+/// The preserved file that does hold rows: counted, and reported as a count.
+///
+/// This test used to require the word "intact", which nothing had earned —
+/// see `a_preserved_database_is_never_called_intact_on_the_strength_of_a_row_count`
+/// below, and `preserved_notice` in `src/main.rs`. What is established here is
+/// that three rows are in the `snapshots` table of a file osm opened, and that
+/// is what the notice must say.
+#[test]
+fn a_preserved_database_reports_the_snapshots_it_actually_holds() {
+    let env = Env::new("preservedfull");
+    write_legacy_db(&env.state_dir().join("state.db"), 3);
+
+    let v = env.status();
+    let preserved = &v["database"]["preserved"];
+    assert_eq!(
+        preserved["snapshots"], 3,
+        "the count in the preserved file must be reported: {v}"
+    );
+    assert_eq!(preserved["present"], true, "{v}");
+    assert!(preserved["error"].is_null(), "{v}");
+    let msg = v["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("contains 3 snapshot records"),
+        "the notice must say how many snapshot records are in it: {msg}"
+    );
+    assert!(
+        !msg.contains("intact"),
+        "the file was counted, not checked; a row count does not establish \
+         that anything in it is intact: {msg}"
+    );
+
+    // Counting it must not write into the user's state directory. A plain
+    // read-only connection to a WAL database has SQLite build the
+    // shared-memory index it reads the WAL through, which means creating
+    // `state.db.v1.bak-shm` beside a backup osm's business with is over — on
+    // a status the panel runs every five seconds.
+    let path = std::path::PathBuf::from(preserved["path"].as_str().expect("a path"));
+    let shm = path.with_file_name(format!(
+        "{}-shm",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(
+        !shm.exists(),
+        "reading the preserved database created {} beside it",
+        shm.display()
+    );
+}
+
+/// The preserved file that holds nothing: not "your snapshots are intact",
+/// and an offer to delete it that osm does not act on itself.
+#[test]
+fn a_preserved_database_holding_nothing_is_never_called_intact() {
+    let env = Env::new("preservedempty");
+    write_legacy_db(&env.state_dir().join("state.db"), 0);
+
+    let v = env.status();
+    let preserved = &v["database"]["preserved"];
+    assert_eq!(
+        preserved["snapshots"], 0,
+        "an empty preserved file holds zero snapshots, and that is a fact: {v}"
+    );
+    assert_eq!(preserved["present"], true, "{v}");
+    let msg = v["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("holds no snapshots"),
+        "the notice must say the file holds nothing: {msg}"
+    );
+    assert!(
+        !msg.contains("intact"),
+        "a file with nothing in it must not be reported as holding intact \
+         snapshots: {msg}"
+    );
+    assert!(
+        msg.contains("delete"),
+        "a file holding nothing can simply be removed, and the notice must \
+         say so: {msg}"
+    );
+
+    // The offer is the user's to take. osm names the file; it does not
+    // remove it.
+    let path = preserved["path"].as_str().expect("a path");
+    assert!(
+        std::path::Path::new(path).exists(),
+        "osm deleted the user's preserved database at {path}"
+    );
+}
+
+/// The preserved file nothing could read: neither "intact" nor "empty".
+#[test]
+fn a_preserved_database_that_cannot_be_read_is_counted_neither_way() {
+    let env = Env::new("preservedjunk");
+    write_legacy_db(&env.state_dir().join("state.db"), 2);
+
+    let first = env.status();
+    let path = first["database"]["preserved"]["path"]
+        .as_str()
+        .expect("a path")
+        .to_string();
+    // Whatever the file is now, it is not a database this can count.
+    std::fs::write(&path, b"this is not a database").unwrap();
+
+    let v = env.status();
+    let preserved = &v["database"]["preserved"];
+    assert!(
+        preserved["snapshots"].is_null(),
+        "a preserved file that could not be read holds an unknown number of \
+         snapshots, not zero and not some: {v}"
+    );
+    assert_eq!(preserved["present"], true, "{v}");
+    assert!(
+        preserved["error"].as_str().is_some(),
+        "the reason it could not be read must be reported: {v}"
+    );
+    let msg = v["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("unknown"),
+        "the notice must say what is in it is unknown: {msg}"
+    );
+    assert!(
+        !msg.contains("intact") && !msg.contains("holds no snapshots"),
+        "an unreadable file must not be reported as either of the two files \
+         that could be read: {msg}"
+    );
+}
+
+/// And once the user takes the offer, the notice must not turn into an alarm
+/// about a file that is gone because they removed it.
+#[test]
+fn a_preserved_database_the_user_removed_is_not_called_unreadable() {
+    let env = Env::new("preservedgone");
+    write_legacy_db(&env.state_dir().join("state.db"), 0);
+
+    let first = env.status();
+    let path = first["database"]["preserved"]["path"]
+        .as_str()
+        .expect("a path")
+        .to_string();
+    std::fs::remove_file(&path).unwrap();
+
+    let v = env.status();
+    let preserved = &v["database"]["preserved"];
+    assert_eq!(
+        preserved["present"], false,
+        "nothing is at the recorded path any more: {v}"
+    );
+    assert!(preserved["snapshots"].is_null(), "{v}");
+    assert!(preserved["error"].is_null(), "{v}");
+    let msg = v["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("nothing is there now"),
+        "the notice must say the file is gone: {msg}"
+    );
+    assert!(
+        !msg.contains("could not read"),
+        "a file the user deleted is not one osm failed to read: {msg}"
+    );
+}
+
+/// A row in `snapshots` is not a snapshot, and counting rows is not an
+/// integrity check.
+///
+/// The notice used to end "which are intact but osm no longer reads them" for
+/// any file whose `COUNT(*) FROM snapshots` came back positive. That count is
+/// one query against one table. It says nothing about whether the sessions,
+/// windows and panes those snapshots are made of are still there, nothing
+/// about whether the file is internally consistent, and nothing about whether
+/// the newest row is a `building` one that describes a capture that never
+/// finished. A backup with a readable `snapshots` table and nothing behind it
+/// answers the query perfectly and holds nothing anyone could restore.
+///
+/// Telling someone their data is intact on the strength of a row count is the
+/// same defect as rendering unknown as no, pointed at the thing they would
+/// most want to be sure about. So the notice reports the count as a count.
+///
+/// The fixture is exactly that file: two rows in `snapshots`, one of them
+/// still `building`, and the tables they refer to empty.
+fn write_hollow_legacy_db(path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE snapshots (
+           id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+           boot_id TEXT NOT NULL, reason TEXT NOT NULL, state TEXT NOT NULL);
+         CREATE TABLE session_rows (
+           row_id INTEGER PRIMARY KEY, snapshot_id INTEGER NOT NULL,
+           name TEXT NOT NULL);
+         INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+         -- One finished snapshot with nothing behind it, and one that was
+         -- still being written when the machine went down.
+         INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+           VALUES (1, 101, 'boot-a', 'manual', 'complete'),
+                  (2, 102, 'boot-a', 'manual', 'building');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_preserved_database_is_never_called_intact_on_the_strength_of_a_row_count() {
+    let env = Env::new("preservedhollow");
+    write_hollow_legacy_db(&env.state_dir().join("state.db"));
+
+    let v = env.status();
+    let preserved = &v["database"]["preserved"];
+    assert_eq!(
+        preserved["snapshots"], 2,
+        "the rows really are there to be counted: {v}"
+    );
+    let msg = v["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("contains 2 snapshot records"),
+        "the notice must report what was actually established — a count of \
+         rows in one table: {msg}"
+    );
+    assert!(
+        !msg.contains("intact"),
+        "the file has two rows in `snapshots`, one of them a `building` row, \
+         and nothing at all behind either of them; nobody opened it far enough \
+         to call anything in it intact: {msg}"
+    );
+}

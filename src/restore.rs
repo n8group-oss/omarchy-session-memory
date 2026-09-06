@@ -2229,13 +2229,19 @@ fn publish_current_boot(
             topo.server.as_deref().unwrap_or("no server"),
         )));
     }
+    // Off disk before the transaction opens, for the reason
+    // [`crate::capture::Detection`] gives: it walks the agent stores, and
+    // holding the database's write lock across that starved every other osm
+    // process out of it.
+    let detection = crate::capture::Detection::of(&topo);
     (|| -> Result<Published> {
         let tx = conn.transaction()?;
         // Before `write_topology_in`, whose carry-forward asks the source what
         // it is still owed.
         snapshots::resolve_sessions(&tx, snapshot_id, delivered)?;
         snapshots::refresh_unresolved(&tx, snapshot_id)?;
-        let published_id = crate::capture::write_topology_in(&tx, &topo, "post_restore")?;
+        let published_id =
+            crate::capture::write_topology_in(&tx, &topo, "post_restore", &detection)?;
         // In the same transaction as the topology it describes, and before
         // the source is retired. `write_topology_in` writes the tmux half
         // alone — the placement write lives in `write_topology`, which this
@@ -2407,18 +2413,36 @@ fn unplaced_windows(
             ));
             continue;
         }
-        // Only when a monitor was actually dispatched. A compositor that
-        // listed no monitor to send the window to was not asked to move it,
-        // and holding the publication to a placement nobody made would fail
-        // every restore on a desktop osm could not read that far.
-        if let Some(sent_to) = want.monitor_connector.as_deref() {
-            if row.monitor_connector != sent_to {
-                out.push(format!(
-                    "{}'s window {} was moved to {sent_to}, but the topology this \
-                     restore published has it on {}",
-                    c.session, want.address, row.monitor_connector
-                ));
-            }
+        // The monitor, always. This used to be checked "only when a monitor
+        // was actually dispatched" — skipped for a claim that named none, on
+        // the reasoning that a compositor listing no monitor was never asked
+        // to move the window and so owes nothing.
+        //
+        // That exemption is what let a wrong-monitor restore report success.
+        // Readiness proves a monitor exists before anything is spawned; a
+        // later `hyprctl -j monitors` coming back as a valid, empty array
+        // left the placement with nothing to resolve, and the claim it
+        // produced then arrived here with no connector — so this check waved
+        // it through, the source snapshot that recorded the right panel was
+        // retired, and the user's terminal was left on whichever panel it
+        // happened to map on.
+        //
+        // `spawn_and_place` no longer makes such a claim. This is the second
+        // lock on the same door: a claim nothing can verify is a shortfall,
+        // whatever produced it.
+        match want.monitor_connector.as_deref() {
+            Some(sent_to) if row.monitor_connector == sent_to => {}
+            Some(sent_to) => out.push(format!(
+                "{}'s window {} was moved to {sent_to}, but the topology this \
+                 restore published has it on {}",
+                c.session, want.address, row.monitor_connector
+            )),
+            None => out.push(format!(
+                "{}'s window {} was reported placed without naming the monitor it \
+                 was sent to, so nothing can check it against the {} the topology \
+                 this restore published has it on",
+                c.session, want.address, row.monitor_connector
+            )),
         }
     }
     Ok(out)
@@ -2547,6 +2571,7 @@ pub fn window_outcomes_are_degraded(outcomes: &[(String, crate::desktop::PlaceOu
             o,
             SpawnFailed(_)
                 | NeverMapped
+                | Misplaced(_)
                 | NeverAttached
                 | Skipped(_)
                 | NoCompositor
@@ -2669,13 +2694,13 @@ mod tests {
     /// desktop, and dispatching from one is forbidden outright.
     struct NoDesktop;
     impl crate::hypr::HyprCtl for NoDesktop {
-        fn clients_json(&self) -> Result<String> {
+        fn clients_json(&self, _budget: std::time::Duration) -> Result<String> {
             anyhow::bail!("no compositor in this test")
         }
-        fn monitors_json(&self) -> Result<String> {
+        fn monitors_json(&self, _budget: std::time::Duration) -> Result<String> {
             anyhow::bail!("no compositor in this test")
         }
-        fn dispatch(&self, _: &str) -> Result<String> {
+        fn dispatch(&self, _: &str, _budget: std::time::Duration) -> Result<String> {
             panic!("no test here may dispatch: it would move a real window")
         }
     }
@@ -2727,6 +2752,141 @@ mod tests {
         fn drop(&mut self) {
             self.kill();
         }
+    }
+
+    /// A snapshot holding one terminal window, so [`unplaced_windows`] has a
+    /// published topology to check a claim against.
+    fn snapshot_holding_window(
+        conn: &Connection,
+        session: &str,
+        address: &str,
+        workspace: &str,
+        connector: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO snapshots (taken_at, boot_id, reason, state)
+             VALUES (?1, 'boot-a', 'test', 'complete')",
+            rusqlite::params![boot::now_epoch()],
+        )
+        .unwrap();
+        let snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO terminal_windows
+               (snapshot_id, hypr_address, window_class, terminal_kind, session_name,
+                workspace_kind, workspace_ref, monitor_connector)
+             VALUES (?1, ?2, 'com.mitchellh.ghostty', 'ghostty', ?3, 'numbered', ?4, ?5)",
+            rusqlite::params![snap, address, session, workspace, connector],
+        )
+        .unwrap();
+        snap
+    }
+
+    /// A `Placed` claim that names no monitor cannot be checked, so it must be
+    /// reported rather than waved through.
+    ///
+    /// This is the publication half of the empty-monitor-list hole. A
+    /// compositor that answered readiness and then returned a valid, empty
+    /// `hyprctl -j monitors` left `resolve_monitor` with nothing to resolve,
+    /// so the claim carried no connector — and this check skipped the monitor
+    /// comparison for exactly those claims, on the reasoning that no monitor
+    /// dispatch had been made. The window was then accepted on its workspace
+    /// alone, on whatever panel it happened to map on, and the source snapshot
+    /// — the only record of the panel it belonged on — was retired against it
+    /// while the run reported `succeeded`.
+    ///
+    /// `spawn_and_place` no longer produces such a claim. This is the second
+    /// lock on the same door: a claim nobody can verify is a shortfall here,
+    /// whatever produced it.
+    #[test]
+    fn a_placed_claim_that_names_no_monitor_is_reported_not_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+        let snap = snapshot_holding_window(&conn, "alpha", "0x5eedf00d", "3", "HDMI-A-1");
+
+        // Everything the check *can* compare agrees: same address, same
+        // session, same workspace. Only the monitor is unverifiable.
+        let window = crate::desktop::PlacedWindow {
+            address: "0x5eedf00d".to_string(),
+            workspace_kind: "numbered".to_string(),
+            workspace_ref: "3".to_string(),
+            monitor_connector: None,
+        };
+        let tx = conn.transaction().unwrap();
+        let unplaced = unplaced_windows(
+            &tx,
+            snap,
+            &[PlacedClaim {
+                session: "alpha",
+                window: &window,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            unplaced.len(),
+            1,
+            "a claim whose monitor nothing can check was accepted as a placement: \
+             {unplaced:?}"
+        );
+        assert!(
+            unplaced[0].contains("monitor"),
+            "the report must say what could not be checked: {unplaced:?}"
+        );
+    }
+
+    /// The control: a claim that names its monitor, and a published topology
+    /// that agrees with it, is a placement.
+    #[test]
+    fn a_placed_claim_the_published_topology_agrees_with_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+        let snap = snapshot_holding_window(&conn, "alpha", "0x5eedf00d", "3", "DP-1");
+
+        let window = crate::desktop::PlacedWindow {
+            address: "0x5eedf00d".to_string(),
+            workspace_kind: "numbered".to_string(),
+            workspace_ref: "3".to_string(),
+            monitor_connector: Some("DP-1".to_string()),
+        };
+        let tx = conn.transaction().unwrap();
+        assert!(unplaced_windows(
+            &tx,
+            snap,
+            &[PlacedClaim {
+                session: "alpha",
+                window: &window,
+            }],
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    /// And a claim the topology contradicts on the monitor alone is reported,
+    /// which is the check that was being skipped.
+    #[test]
+    fn a_placed_claim_on_a_monitor_the_topology_contradicts_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+        let snap = snapshot_holding_window(&conn, "alpha", "0x5eedf00d", "3", "HDMI-A-1");
+
+        let window = crate::desktop::PlacedWindow {
+            address: "0x5eedf00d".to_string(),
+            workspace_kind: "numbered".to_string(),
+            workspace_ref: "3".to_string(),
+            monitor_connector: Some("DP-1".to_string()),
+        };
+        let tx = conn.transaction().unwrap();
+        let unplaced = unplaced_windows(
+            &tx,
+            snap,
+            &[PlacedClaim {
+                session: "alpha",
+                window: &window,
+            }],
+        )
+        .unwrap();
+        assert_eq!(unplaced.len(), 1, "{unplaced:?}");
+        assert!(unplaced[0].contains("DP-1") && unplaced[0].contains("HDMI-A-1"));
     }
 
     fn owed(conn: &Connection, snap: i64) -> Vec<String> {

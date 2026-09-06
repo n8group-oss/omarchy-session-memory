@@ -73,10 +73,38 @@ impl Default for CaptureCfg {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// What osm may derive a conversation's title from.
+///
+/// The one place transcript content is read at all, and therefore the one
+/// thing there is a switch for.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivacyCfg {
-    pub store_summaries: bool,
+    /// Whether a conversation whose agent never named it may be titled from
+    /// one truncated line of the user's first message.
+    ///
+    /// On by default, and that is a decision rather than an oversight: Codex
+    /// writes no title of its own and accounts for 2383 of the 2494
+    /// conversations on the machine this was built for, so off by default
+    /// would mean a menu that says nothing about almost every row — and a
+    /// blank goal reads as a session with no purpose. Off, a Claude
+    /// conversation keeps whatever its agent called it and every Codex
+    /// conversation is *untitled*.
+    ///
+    /// It replaces `store_summaries`, which promised an opt-in paraphrase of
+    /// a conversation's contents and was never implemented. A config that
+    /// still sets it is rejected by name (`deny_unknown_fields`), which is
+    /// the right outcome: a key that silently does nothing is a promise the
+    /// user believes.
+    pub prompt_titles: bool,
+}
+
+impl Default for PrivacyCfg {
+    fn default() -> Self {
+        Self {
+            prompt_titles: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -86,6 +114,32 @@ pub struct Config {
     pub agents: AgentsCfg,
     pub capture: CaptureCfg,
     pub privacy: PrivacyCfg,
+}
+
+impl Config {
+    /// What to act on when the configuration could not be read at all.
+    ///
+    /// Not [`Config::default`], and the difference is one field. A config that
+    /// fails to load says nothing about anything, so every other key falls
+    /// back to its default — including `agents.enabled`, because a typo must
+    /// not read as "stop tracking which pane is running what". Privacy cannot
+    /// be treated that way. `privacy.prompt_titles` defaults to `true`, so a
+    /// user who wrote `prompt_titles = false` **and** misspelled an unrelated
+    /// key three sections away had their explicit refusal silently reversed:
+    /// osm went back to reading the first line of their messages, and wrote it
+    /// into SQLite.
+    ///
+    /// Nobody consents by accident. An unreadable config is not permission, so
+    /// this one field fails closed. The file's real error is reported by `osm
+    /// status --json` either way, which is where the user finds out.
+    pub fn strict_fallback() -> Config {
+        Config {
+            privacy: PrivacyCfg {
+                prompt_titles: false,
+            },
+            ..Config::default()
+        }
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config> {

@@ -99,21 +99,53 @@ impl Monitor {
 ///
 /// Substituted with a stub in every test that does not need a live
 /// compositor; only [`Live`] shells out.
+/// Every method takes the **budget** the caller can afford to wait, and
+/// [`Live`] holds the `hyprctl` process to it.
+///
+/// It is a parameter rather than a constant because the callers have
+/// deadlines and the calls have to fit inside them. A placement confirmation
+/// is bounded by [`crate::desktop`]'s confirmation budget, and a floating
+/// window issues five sequential dispatches and then a read: with a flat
+/// per-call timeout of [`CALL_TIMEOUT`] each, one window could hold the
+/// restore for a minute and a half *after* its deadline had passed, and every
+/// session behind it waited its turn. On a boot restoring seven sessions that
+/// is the difference between seconds and ten minutes.
 pub trait HyprCtl {
-    fn clients_json(&self) -> Result<String>;
-    fn monitors_json(&self) -> Result<String>;
+    fn clients_json(&self, budget: Duration) -> Result<String>;
+    fn monitors_json(&self, budget: Duration) -> Result<String>;
     /// Issue one dispatch and return the compositor's reply **verbatim**.
     ///
     /// `Ok` means the call was made, not that the compositor honoured it: a
     /// rejected dispatch is reported as text on successful stdout. Every
     /// caller must put the reply through [`dispatch_acknowledged`] before
     /// treating the window as moved.
-    fn dispatch(&self, lua: &str) -> Result<String>;
+    fn dispatch(&self, lua: &str, budget: Duration) -> Result<String>;
 }
 
-/// How long any single `hyprctl` invocation is allowed to run before it is
-/// killed and treated as a failure. A hung compositor must not hang osm.
-const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest any single `hyprctl` invocation may run, whatever budget it is
+/// given. A hung compositor must not hang osm.
+///
+/// # Why not five seconds
+///
+/// It was five, and a restore of two sessions on the maintainer's machine hit
+/// it: `hyprctl -j clients did not finish within 5s`, with two Ghostty
+/// windows starting at once. That is not a hung compositor — it is a busy
+/// one, doing exactly the work this restore asked it to do, at the one moment
+/// a restore ever runs. A boot restores every session the user had, so
+/// several terminals map within a few seconds of each other and every one of
+/// them competes with these reads.
+///
+/// The two mistakes are not symmetrical. Waiting longer than necessary costs
+/// seconds during a boot nobody is watching. Calling a slow reply a dead
+/// compositor costs the user their restored terminal: the placement pass
+/// kills the terminal it started when it decides the compositor is gone. So
+/// the budget is generous, and the loops that use it treat a single failed
+/// read as "not yet" rather than as an answer — see
+/// [`crate::desktop::spawn_and_place`].
+/// This is a **ceiling**, not the time every call gets: a caller working
+/// against a deadline passes what it can still afford and [`run_hyprctl`]
+/// takes the smaller of the two. See [`HyprCtl`].
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shells out to the real `hyprctl` binary.
 pub struct Live;
@@ -131,8 +163,13 @@ impl Default for Live {
 }
 
 /// Runs `hyprctl <args>`, killing it and returning an error if it does not
-/// finish within [`CALL_TIMEOUT`].
-fn run_hyprctl(args: &[&str]) -> Result<String> {
+/// finish within `budget` — or within [`CALL_TIMEOUT`], whichever is shorter.
+///
+/// The cap is applied here rather than trusted to callers, so no caller can
+/// leave one `hyprctl` running longer than the ceiling by passing a large
+/// budget.
+fn run_hyprctl(args: &[&str], budget: Duration) -> Result<String> {
+    let budget = budget.min(CALL_TIMEOUT);
     let mut child = Command::new("hyprctl")
         .args(args)
         .stdin(Stdio::null())
@@ -141,7 +178,7 @@ fn run_hyprctl(args: &[&str]) -> Result<String> {
         .spawn()
         .with_context(|| format!("spawn `hyprctl {}`", args.join(" ")))?;
 
-    let deadline = Instant::now() + CALL_TIMEOUT;
+    let deadline = Instant::now() + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -167,9 +204,8 @@ fn run_hyprctl(args: &[&str]) -> Result<String> {
                     let _ = child.kill();
                     let _ = child.wait();
                     bail!(
-                        "`hyprctl {}` did not finish within {:?}",
-                        args.join(" "),
-                        CALL_TIMEOUT
+                        "`hyprctl {}` did not finish within {budget:?}",
+                        args.join(" ")
                     );
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -183,16 +219,16 @@ fn run_hyprctl(args: &[&str]) -> Result<String> {
 }
 
 impl HyprCtl for Live {
-    fn clients_json(&self) -> Result<String> {
-        run_hyprctl(&["-j", "clients"])
+    fn clients_json(&self, budget: Duration) -> Result<String> {
+        run_hyprctl(&["-j", "clients"], budget)
     }
 
-    fn monitors_json(&self) -> Result<String> {
-        run_hyprctl(&["-j", "monitors"])
+    fn monitors_json(&self, budget: Duration) -> Result<String> {
+        run_hyprctl(&["-j", "monitors"], budget)
     }
 
-    fn dispatch(&self, lua: &str) -> Result<String> {
-        run_hyprctl(&["dispatch", lua])
+    fn dispatch(&self, lua: &str, budget: Duration) -> Result<String> {
+        run_hyprctl(&["dispatch", lua], budget)
     }
 }
 
@@ -200,7 +236,7 @@ impl HyprCtl for Live {
 /// list. Used to distinguish "no compositor" (legitimate, e.g. headless) from
 /// "compositor answered something we cannot trust".
 pub fn reachable(h: &dyn HyprCtl) -> bool {
-    match h.monitors_json() {
+    match h.monitors_json(CALL_TIMEOUT) {
         Ok(json) => matches!(parse_monitors(&json), Ok(ms) if !ms.is_empty()),
         Err(_) => false,
     }

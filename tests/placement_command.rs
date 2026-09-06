@@ -68,6 +68,10 @@ impl Env {
                 "transform":0,"focused":true}]"#,
         )
         .unwrap();
+        // The workspace `DP-1` is showing right now. A window that maps
+        // without being told otherwise appears here, and so does one that is
+        // moved to the monitor by name — see the dispatch half of the stub.
+        std::fs::write(env.desktop().join("active_ws"), "2").unwrap();
         env.write_stubs();
         env
     }
@@ -97,11 +101,12 @@ impl Env {
 
     /// The pids the stub compositor reports windows for, one per line.
     ///
-    /// A window is invented for each, all on workspace 3 of `DP-1`. That is
-    /// the whole of what placement reads from a window, and building them
-    /// from pids is what lets the same stub serve both halves of the test:
-    /// during capture the pid is a tmux client's, during restore it is the
-    /// terminal the restore itself started.
+    /// A window is invented for each, on `DP-1` and on workspace 3 unless
+    /// something has moved it since. That is the whole of what placement
+    /// reads from a window, and building them from pids is what lets the
+    /// same stub serve both halves of the test: during capture the pid is a
+    /// tmux client's, during restore it is the terminal the restore itself
+    /// started.
     fn set_window_pids(&self, pids: &[u32]) {
         let body: String = pids
             .iter()
@@ -109,6 +114,28 @@ impl Env {
             .collect::<Vec<_>>()
             .concat();
         std::fs::write(self.desktop().join("pids"), body).unwrap();
+    }
+
+    /// The workspace the stub compositor currently has the window for `pid`
+    /// on — the desktop's own answer, not a dispatch osm believes it made.
+    ///
+    /// The distinction is the whole subject of this file's placement tests:
+    /// `hyprctl dispatch` answers `ok` for a call it accepted, which is not
+    /// the same claim as "the window is there".
+    fn window_workspace(&self, pid: u32) -> String {
+        std::fs::read_to_string(self.desktop().join(format!("ws.{pid}")))
+            .unwrap_or_else(|_| "3".to_string())
+            .trim()
+            .to_string()
+    }
+
+    /// The pid of the terminal the restore's `ghostty` stub ran as, i.e. the
+    /// window osm placed.
+    fn restored_terminal_pid(&self) -> u32 {
+        read_lines(&self.desktop().join("terminals"))
+            .last()
+            .and_then(|l| l.trim().parse().ok())
+            .expect("the restore started a stub terminal")
     }
 
     /// Replace the compositor stub with one that fails every call, the way
@@ -148,22 +175,53 @@ impl Env {
         // `hyprctl`. Answers `-j clients` from the pid list, `-j monitors`
         // from a fixture, and records every dispatch, acknowledging it with
         // the `ok` a real Hyprland 0.56 prints.
+        //
+        // # It moves the window, because a stub that only says `ok` proves
+        // # nothing
+        //
+        // The earlier version of this stub logged each dispatch, answered
+        // `ok`, and went on reporting every window on workspace 3 whatever it
+        // had been asked to do. Every test in this file passed against it
+        // while, on the maintainer's real desktop, both restored terminals
+        // came back on the active workspace instead of the two they were
+        // captured on. A compositor fake that cannot disagree with osm is not
+        // a test of placement.
+        //
+        // So this one keeps each window's workspace and applies the two
+        // dispatches placement makes, with the semantics Hyprland 0.56.2
+        // really has (verified by hand against the live compositor):
+        //
+        //   * `window.move({window=…, workspace='N'})` puts the window on
+        //     workspace N.
+        //   * `window.move({window=…, monitor='M'})` puts the window on
+        //     **M's active workspace** — it does not keep the workspace it
+        //     was on. That is the whole bug: osm dispatched the workspace
+        //     move and then the monitor move, and the second undid the first.
         write_executable(
             &self.bin().join("hyprctl"),
             r#"#!/bin/bash
 # Stand-in for hyprctl. See tests/placement_command.rs.
 dir="$OSM_TEST_HYPR_DIR"
+ws_of() {  # the workspace window $1 is on; 3 unless something moved it
+  if [ -s "$dir/ws.$1" ]; then cat "$dir/ws.$1"; else echo 3; fi
+}
 if [ "$1" = "-j" ] && [ "$2" = "clients" ]; then
   # A test may need a window to be gone by the time the *publication* reads
-  # the desktop back. `vanish_after_dispatch` holds the pids to drop and is
-  # acted on once, on the first clients read after a dispatch — which is the
-  # publication's, since placement dispatches only after it has found its
-  # window and the attach check touches tmux alone. Inert for every other
-  # test, none of which writes the file.
+  # the desktop back. `vanish_after_dispatch` holds the pids to drop. It is
+  # acted on once, after the reads placement itself makes: `vanish_skip`
+  # counts those down, and holds 1 because placement re-reads the desktop
+  # once to confirm the window really moved before it reports `placed`.
+  # Inert for every other test, none of which writes either file.
   if [ -s "$dir/vanish_after_dispatch" ] && [ -s "$dir/dispatch.log" ]; then
-    grep -vxF -f "$dir/vanish_after_dispatch" "$dir/pids" > "$dir/pids.next" || true
-    mv "$dir/pids.next" "$dir/pids"
-    mv "$dir/vanish_after_dispatch" "$dir/vanished"
+    skip=0
+    [ -s "$dir/vanish_skip" ] && skip=$(cat "$dir/vanish_skip")
+    if [ "$skip" -gt 0 ]; then
+      echo $((skip - 1)) > "$dir/vanish_skip"
+    else
+      grep -vxF -f "$dir/vanish_after_dispatch" "$dir/pids" > "$dir/pids.next" || true
+      mv "$dir/pids.next" "$dir/pids"
+      mv "$dir/vanish_after_dispatch" "$dir/vanished"
+    fi
   fi
   out="["
   first=1
@@ -172,7 +230,8 @@ if [ "$1" = "-j" ] && [ "$2" = "clients" ]; then
       [ -n "$pid" ] || continue
       [ "$first" -eq 1 ] || out="$out,"
       first=0
-      out="$out{\"address\":\"0x$pid\",\"pid\":$pid,\"class\":\"com.mitchellh.ghostty\",\"title\":\"omarchy:lies\",\"workspace\":{\"id\":3,\"name\":\"3\"},\"monitor\":0,\"at\":[344,144],\"size\":[1720,720],\"floating\":false}"
+      ws="$(ws_of "$pid")"
+      out="$out{\"address\":\"0x$pid\",\"pid\":$pid,\"class\":\"com.mitchellh.ghostty\",\"title\":\"omarchy:lies\",\"workspace\":{\"id\":$ws,\"name\":\"$ws\"},\"monitor\":0,\"at\":[344,144],\"size\":[1720,720],\"floating\":false}"
     done < "$dir/pids"
   fi
   echo "$out]"
@@ -185,6 +244,18 @@ fi
 if [ "$1" = "dispatch" ]; then
   shift
   printf '%s\n' "$*" >> "$dir/dispatch.log"
+  arg="$*"
+  pid="$(printf '%s' "$arg" | sed -n "s/.*address:0x\([0-9][0-9]*\).*/\1/p")"
+  if [ -n "$pid" ]; then
+    want="$(printf '%s' "$arg" | sed -n "s/.*workspace='\([^']*\)'.*/\1/p")"
+    if [ -n "$want" ]; then
+      printf '%s' "$want" > "$dir/ws.$pid"
+    elif printf '%s' "$arg" | grep -q "monitor='"; then
+      # Hyprland 0.56.2: sending a window to a monitor lands it on that
+      # monitor's *active* workspace, wherever it was before.
+      printf '%s' "$(cat "$dir/active_ws")" > "$dir/ws.$pid"
+    fi
+  fi
   echo ok
   exit 0
 fi
@@ -215,6 +286,10 @@ exit 1
 dir="$OSM_TEST_HYPR_DIR"
 printf '%s\n' "$*" >> "$dir/spawn.log"
 echo "$$" >> "$dir/terminals"
+# A terminal maps on whatever workspace is showing, never on the one it is
+# eventually meant to live on. Announcing the window already on its target
+# workspace is what let a placement that never moved anything look correct.
+cat "$dir/active_ws" > "$dir/ws.$$"
 echo "$$" >> "$dir/pids"
 attach="${@: -1}"
 # A control-mode client reads its commands from stdin, and osm gives a
@@ -458,15 +533,26 @@ fn snapshot_records_placement_and_restore_puts_the_window_back() {
         "the terminal was not pointed at this restore's server: {spawned:?}"
     );
 
-    // And it was moved to the workspace and the monitor the capture recorded.
+    // And it really is on the workspace the capture recorded — asked of the
+    // desktop, not of the dispatch log.
+    //
+    // The log is what this used to assert on, and it is exactly the wrong
+    // question: `hyprctl dispatch` answers `ok` for a call it accepted, and
+    // on the maintainer's machine both restored terminals came back on the
+    // active workspace with every dispatch acknowledged. "osm asked" and
+    // "the window is there" are different claims, and only the second one is
+    // what `placed` may mean.
     let dispatched = env.dispatches();
     assert!(
         dispatched.iter().any(|d| d.contains("workspace='3'")),
         "the window was never moved to its workspace: {dispatched:?}"
     );
-    assert!(
-        dispatched.iter().any(|d| d.contains("monitor='DP-1'")),
-        "the window was never moved to its monitor: {dispatched:?}"
+    let terminal = env.restored_terminal_pid();
+    assert_eq!(
+        env.window_workspace(terminal),
+        "3",
+        "the window osm reported as placed is not on the workspace it was \
+         captured on; dispatches: {dispatched:?}"
     );
 
     // ---- and the next reboot has something to place ----------------------
@@ -767,10 +853,15 @@ fifo="$dir/attach.$$"
 mkfifo "$fifo"
 bash -c "${attach/ attach-session/ -C attach-session}" <"$fifo" >/dev/null 2>&1 &
 exec 3>"$fifo"
-# Ask to be dropped from the desktop on the first read after the placement
-# dispatch -- the publication's -- and announce the window only afterwards,
-# so the request can never arrive later than the read it is meant for.
+# Ask to be dropped from the desktop on the publication's read of it, and
+# announce the window only afterwards, so the request can never arrive later
+# than the read it is meant for. `vanish_skip` steps over the one read
+# placement makes for itself after dispatching -- the confirmation that the
+# window really moved -- so the window is still there for that and gone for
+# the publication, which is the scenario.
 echo "$$" > "$dir/vanish_after_dispatch"
+echo 1 > "$dir/vanish_skip"
+cat "$dir/active_ws" > "$dir/ws.$$"
 echo "$$" >> "$dir/pids"
 until [ -f "$dir/vanished" ]; do sleep 0.05; done
 "#,

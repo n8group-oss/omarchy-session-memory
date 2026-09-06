@@ -67,6 +67,34 @@ impl AgentAdapter for Claude {
     /// and that is an error. They used to be the same empty list, so a
     /// permissions problem reported "you have no conversations" and a restore
     /// could put back bare shells and call itself a success.
+    ///
+    /// # Nothing outside the configured store is a conversation
+    ///
+    /// This used to accept any entry whose stem was a UUID and whose extension
+    /// was `.jsonl`, without asking what the entry *was* or where it led. A
+    /// symlink named after a UUID — or a project directory that is a symlink —
+    /// therefore turned any JSONL-shaped file anywhere on the machine into a
+    /// conversation osm would list, bind a pane to, and read a title out of and
+    /// persist. Codex's walker refused symlinks from the day it was written;
+    /// this one did not.
+    ///
+    /// So two checks, and both are needed. An entry must be a **regular file**
+    /// by `lstat` (`DirEntry::file_type` does not follow), which refuses a
+    /// symlinked transcript; and it must **resolve inside the resolved root**,
+    /// which refuses a project directory that is a symlink out of the store —
+    /// the files behind one of those are perfectly ordinary regular files, so
+    /// the first check alone would let them all through.
+    ///
+    /// The root is resolved **once**, and that is what makes the legitimate
+    /// case survive: `~/.claude -> /data/claude` is an ordinary arrangement (a
+    /// home on a bigger filesystem, a dotfiles checkout), and the whole store
+    /// is then reached through a symlink. Comparing against the *resolved* root
+    /// accepts it while still refusing anything that leaves it. See
+    /// `tests/agent_symlinked_home.rs` and `tests/agent_hardening.rs`.
+    ///
+    /// What is *recorded* is still the path osm was told about, never the
+    /// resolved one: a `/proc/<pid>/fd` comparison and a restore both speak in
+    /// the path the user's agent opens.
     fn discover(&self) -> Result<Vec<AgentSession>> {
         let mut found = Vec::new();
         let projects_dir = self.home.join("projects");
@@ -76,6 +104,17 @@ impl AgentAdapter for Claude {
             Err(e) => {
                 return Err(
                     anyhow::Error::new(e).context(format!("read {}", projects_dir.display()))
+                )
+            }
+        };
+        let root = match fs::canonicalize(&projects_dir) {
+            Ok(root) => root,
+            // It was there a moment ago (`read_dir` succeeded), so this is a
+            // race with the agent itself, not a store to guess about.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("resolve {}", projects_dir.display()))
                 )
             }
         };
@@ -99,6 +138,20 @@ impl AgentAdapter for Claude {
                 let file_path = file_entry.path();
                 if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
+                }
+                // `lstat`, not `stat`: a symlink named like a transcript is
+                // not a transcript, however ordinary the file behind it looks.
+                match file_entry.file_type() {
+                    Ok(ft) if ft.is_file() => {}
+                    _ => continue,
+                }
+                // And the file this name reaches has to be inside the store.
+                // A project directory that is a symlink out of it holds
+                // perfectly ordinary regular files; only the resolved path
+                // says they are somebody else's.
+                match fs::canonicalize(&file_path) {
+                    Ok(resolved) if resolved.starts_with(&root) => {}
+                    _ => continue,
                 }
                 let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
@@ -151,6 +204,24 @@ impl AgentAdapter for Claude {
     /// made or a descriptor that could not be identified.
     fn is_active_elsewhere(&self, id: &str) -> Result<super::Liveness> {
         super::detect::live_process_ownership(self, id)
+    }
+
+    /// The last `ai-title` Claude wrote for this conversation, or one line of
+    /// the first thing the user typed when it wrote none.
+    ///
+    /// Both come out of bounded reads of the transcript — a suffix for the
+    /// title, a prefix for the prompt — and both refuse a record that names a
+    /// different conversation. See [`super::title`].
+    fn title_of(
+        &self,
+        session: &AgentSession,
+        policy: super::title::Policy,
+    ) -> Option<super::title::Title> {
+        super::title::claude(
+            Path::new(session.store_path.as_deref()?),
+            &session.native_id,
+            policy,
+        )
     }
 
     /// Supported: one `.jsonl` transcript per conversation makes both halves

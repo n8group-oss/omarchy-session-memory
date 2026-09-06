@@ -166,6 +166,25 @@ impl AgentAdapter for Codex {
         super::detect::live_process_ownership(self, id)
     }
 
+    /// One line of the first thing the user typed.
+    ///
+    /// Codex writes no title of its own, and the role-`user` messages at the
+    /// head of a rollout are its own preamble rather than the user's words —
+    /// see [`super::title::codex`], which reads the record that says a person
+    /// typed something and refuses a rollout whose metadata names another
+    /// conversation.
+    fn title_of(
+        &self,
+        session: &AgentSession,
+        policy: super::title::Policy,
+    ) -> Option<super::title::Title> {
+        super::title::codex(
+            Path::new(session.store_path.as_deref()?),
+            &session.native_id,
+            policy,
+        )
+    }
+
     /// Supported: one rollout file per conversation answers both halves.
     fn auto_unsupported_reason(&self) -> Option<&'static str> {
         None

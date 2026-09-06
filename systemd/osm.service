@@ -5,8 +5,8 @@ After=osm-restore.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/share/osm/bin/osm daemon
-ExecStop=%h/.local/share/osm/bin/osm snapshot --reason shutdown
+ExecStart=%h/.local/bin/osm daemon
+ExecStop=%h/.local/bin/osm snapshot --reason shutdown
 Restart=on-failure
 RestartSec=5
 

@@ -36,9 +36,10 @@ fn the_lua_dispatch_shape_is_accepted_by_this_compositor() {
     // rejects it as malformed. That difference is the whole test, and it
     // moves nothing either way.
     let h = hypr::Live::new();
-    let text = match h
-        .dispatch("hl.dsp.window.move({window='address:0xdeadbeef', workspace='1', follow=false})")
-    {
+    let text = match h.dispatch(
+        "hl.dsp.window.move({window='address:0xdeadbeef', workspace='1', follow=false})",
+        osm::hypr::CALL_TIMEOUT,
+    ) {
         Ok(s) => s,
         Err(e) => e.to_string(),
     };
@@ -56,8 +57,8 @@ fn clients_and_monitors_parse_against_this_compositor() {
         return;
     }
     let h = hypr::Live::new();
-    let ms = hypr::parse_monitors(&h.monitors_json().unwrap()).unwrap();
-    let cs = hypr::parse_clients(&h.clients_json().unwrap()).unwrap();
+    let ms = hypr::parse_monitors(&h.monitors_json(osm::hypr::CALL_TIMEOUT).unwrap()).unwrap();
+    let cs = hypr::parse_clients(&h.clients_json(osm::hypr::CALL_TIMEOUT).unwrap()).unwrap();
     assert!(!ms.is_empty(), "a live compositor has at least one monitor");
 
     // Every window must resolve to a monitor that exists. A client reports
@@ -88,11 +89,12 @@ fn a_spawned_terminal_is_found_by_lineage_and_placed() {
         .expect("private tmux server");
 
     let h = hypr::Live::new();
-    let before: Vec<String> = hypr::parse_clients(&h.clients_json().unwrap())
-        .unwrap()
-        .into_iter()
-        .map(|c| c.address)
-        .collect();
+    let before: Vec<String> =
+        hypr::parse_clients(&h.clients_json(osm::hypr::CALL_TIMEOUT).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|c| c.address)
+            .collect();
 
     let p = osm::desktop::Placement {
         session: "osmlive".into(),
@@ -139,23 +141,34 @@ fn a_spawned_terminal_is_found_by_lineage_and_placed() {
         std::time::Duration::from_secs(15),
     );
 
+    // Where the compositor says the window is, read back before anything is
+    // closed. This is the assertion the whole suite was missing: a stub can
+    // be made to acknowledge a dispatch and report the window wherever the
+    // fixture likes, and every one of them did, while on this very machine
+    // two restored terminals came back on the active workspace with
+    // `"outcome":"placed"` on both. Only the real thing can settle it.
+    let spawned = watcher.seen.get();
+    let after = hypr::parse_clients(&h.clients_json(osm::hypr::CALL_TIMEOUT).unwrap()).unwrap();
+    let landed = after
+        .iter()
+        .find(|c| spawned.is_some_and(|s| osm::desktop::owns_window(&s, c.pid)))
+        .map(|c| c.workspace_name.clone());
+
     // Close only what this test owns.
     //
     // "Anything that appeared since we started" is not ownership: the
     // developer may open a browser while this runs, and closing it would be
     // this project doing to them exactly what it exists to prevent. A window
     // is ours only if our own spawned process is in its ancestry.
-    let spawned = watcher.seen.get();
-    let after = hypr::parse_clients(&h.clients_json().unwrap()).unwrap();
     for c in after
         .iter()
         .filter(|c| !before.contains(&c.address))
         .filter(|c| spawned.is_some_and(|s| osm::desktop::owns_window(&s, c.pid)))
     {
-        let _ = h.dispatch(&format!(
-            "hl.dsp.window.close({{window='address:{}'}})",
-            c.address
-        ));
+        let _ = h.dispatch(
+            &format!("hl.dsp.window.close({{window='address:{}'}})", c.address),
+            osm::hypr::CALL_TIMEOUT,
+        );
     }
     let _ = t.run(&["kill-server"]);
     let _ = spawned;
@@ -163,5 +176,11 @@ fn a_spawned_terminal_is_found_by_lineage_and_placed() {
     assert!(
         matches!(outcome, osm::desktop::PlaceOutcome::Placed(_)),
         "a terminal this test started was not found and placed: {outcome:?}"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(p.workspace_ref.as_str()),
+        "the restore reported {outcome:?}, and this compositor had the window \
+         somewhere else"
     );
 }

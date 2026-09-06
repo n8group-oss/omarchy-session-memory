@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.n8group-oss.sessionmemory",
+  "name": "Session Memory",
+  "version": "0.1.0",
+  "author": "n8group-oss",
+  "license": "MIT",
+  "description": "Shows what osm has recorded of your tmux sessions, and says plainly when the engine is missing or unhealthy.",
+  "homepage": "https://github.com/n8group-oss/omarchy-session-memory",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Session Memory",
+    "description": "Recorded tmux sessions, the newest snapshot, and the conversations osm can resume.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "osmPath": "osm",
+      "pollIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "osmPath",
+        "type": "string",
+        "label": "osm binary",
+        "defaultValue": "osm"
+      },
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Poll interval (seconds)",
+        "min": 2,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}

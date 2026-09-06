@@ -1,5 +1,8 @@
+use crate::lock::SingleInstance;
 use crate::tmux::Tmux;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Appears inside every hook command this engine installs, so uninstall can
 /// identify its own entries without touching the user's hooks.
@@ -103,10 +106,178 @@ fn hook_command(osm_bin: &str, event: &str) -> String {
     format!("run-shell -b {}", tmux_double_quote(&shell))
 }
 
+/// The lock every hook mutation takes, keyed to the **tmux server** whose
+/// hooks it protects.
+///
+/// Hooks live in the tmux server, not on disk, so nothing about the lock file
+/// is the state being protected — it is only a name two processes can agree
+/// on. The question is therefore *which server*, and the answer has to be
+/// derived from the server.
+///
+/// # Why not the osm state directory
+///
+/// It was `$XDG_STATE_HOME/osm/hooks.lock`, on the reasoning that every
+/// engine mutating hooks is the same user with the same environment. That is
+/// not so, and it is not so in the ordinary case. `XDG_STATE_HOME` names
+/// where osm keeps *its* data; it has nothing to do with which tmux server a
+/// process is talking to, and the two are set independently. A daemon on the
+/// normal state directory and a `XDG_STATE_HOME=/tmp/scratch osm
+/// install-hooks` against the same server took two different locks and
+/// reproduced the unlocked remove-then-append race in full — both reporting
+/// `installed: 15`, the server left carrying thirty hooks, and every tmux
+/// event firing two captures from then on. The race tests could not see it
+/// because they gave every process the same state directory.
+///
+/// So the name is derived from the socket this handle addresses — the one
+/// thing every process talking to a given server necessarily agrees on — and
+/// it lives in a per-user runtime directory of osm's own, computed from the
+/// uid and from nothing a caller can point somewhere else.
+///
+/// A lock file left behind after a crash is harmless. `flock` ownership lives
+/// in the open file description and dies with the process holding it, so a
+/// stale file is an empty file nobody holds.
+pub fn lock_path(tmux: &Tmux) -> Result<PathBuf> {
+    Ok(lock_dir()?.join(format!("hooks-{}.lock", socket_key(tmux))))
+}
+
+/// This process's real user id, read from the kernel rather than from a
+/// crate or from the environment.
+///
+/// `/proc/self` is owned by the user the process runs as. `HOME`, `USER` and
+/// the rest are all settable by whoever starts the process, and a lock whose
+/// directory a caller can move is the defect this module is closing.
+fn uid() -> Result<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(std::fs::metadata("/proc/self")
+        .context("read /proc/self to find this process's user id")?
+        .uid())
+}
+
+/// The socket this handle addresses, as one filename component: the `-L` name
+/// it was built with, or `default` for the server with no name.
+///
+/// The name and not a resolved socket path. tmux's own socket directory can
+/// in principle be moved by an environment variable, and this project does
+/// not read it anywhere — it is ignored outright by the tmux on the
+/// maintainer's machine, so a path computed from it would be a guess about
+/// where the socket is rather than a fact. The consequence is bounded and it
+/// is bounded in the safe direction: two servers that somehow share a `-L`
+/// name in different directories would share this lock, which costs one of
+/// them a wait. Nothing is ever *under*-locked, which is the failure this
+/// exists to prevent.
+fn socket_key(tmux: &Tmux) -> String {
+    as_one_filename(tmux.socket().unwrap_or("default"))
+}
+
+/// osm's per-user runtime directory, created `0700` if it is not there.
+///
+/// `/run/user/<uid>` when the system provides one — per-user, private, and
+/// cleared when the user logs out, which is the right lifetime for a lock
+/// about a running server — and `/tmp/osm-<uid>` otherwise, for a container
+/// or a machine with no logind.
+///
+/// Neither is read from the environment. `XDG_RUNTIME_DIR` would be the
+/// idiomatic source and is deliberately not used: an overridable directory is
+/// exactly the defect this replaces, and swapping one environment variable
+/// for another would reproduce it under a different name.
+///
+/// `/tmp` is world-writable, so the directory is checked after it is created:
+/// a symlink, or a directory belonging to somebody else, is refused rather
+/// than locked in.
+fn lock_dir() -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let uid = uid()?;
+    let run = PathBuf::from(format!("/run/user/{uid}"));
+    let dir = if run.is_dir() {
+        run.join("osm")
+    } else {
+        PathBuf::from(format!("/tmp/osm-{uid}"))
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let meta = std::fs::symlink_metadata(&dir)
+        .with_context(|| format!("read {} back after creating it", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!(
+            "{} is not a directory; osm keeps the tmux hook lock there and will \
+             not follow whatever it points at",
+            dir.display()
+        );
+    }
+    if meta.uid() != uid {
+        anyhow::bail!(
+            "{} belongs to uid {}, not to this user ({uid}); osm will not take the \
+             tmux hook lock inside somebody else's directory",
+            dir.display(),
+            meta.uid()
+        );
+    }
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .with_context(|| format!("restrict {} to this user", dir.display()))?;
+    Ok(dir)
+}
+
+/// `name` as a single filename component.
+///
+/// A `-L` name is the user's own text and may contain a `/` or worse. Every
+/// byte that is not plainly a filename character becomes `%XX`, so two
+/// different socket names can never collide on one lock file — and cannot
+/// escape the runtime directory either — while the name stays legible to
+/// whoever finds it there.
+fn as_one_filename(name: &str) -> String {
+    let mut out = String::new();
+    for b in name.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => out.push(*b as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// How long a hook mutation waits for another one to finish.
+///
+/// A registration is fifteen `set-hook` round trips plus however many
+/// `show-hooks` reads the removal needs — tens of milliseconds. This is
+/// generous by two orders of magnitude on purpose: the cost of waiting is a
+/// pause, and the cost of giving up early is the duplicate-hook state this
+/// lock exists to prevent.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Hold the hook lock for the duration of one mutation.
+fn hold(lock: &Path) -> Result<SingleInstance> {
+    SingleInstance::acquire_blocking(lock, LOCK_WAIT)?.with_context(|| {
+        format!(
+            "another osm is changing the tmux hooks; the lock at {} was still \
+             held after {}s",
+            lock.display(),
+            LOCK_WAIT.as_secs()
+        )
+    })
+}
+
 /// Install one marked hook per event, removing any previous marked entry for
 /// that event first so repeated installs never accumulate.
+///
+/// # Why this takes a lock
+///
+/// Removing and appending are two steps, and between them the server has no
+/// marked hooks at all. Unlocked, two engines each read that state and each
+/// appended their own fifteen: twelve concurrent `osm install-hooks` against
+/// one server left **180** marked hooks, each of them reporting `installed:
+/// 15`. Every duplicate then fires its own `osm snapshot --debounced` on
+/// every tmux event, and the debounce check runs before the capture lock, so
+/// they do not collapse into one — a single `select-pane` became twelve
+/// captures.
+///
+/// It is not a rare interleaving. `osm.service` re-registers whenever it sees
+/// a tmux server it has not hooked (`ensure_hooks`, every five seconds) and
+/// `osm install` registers whenever a user runs it; a user installing while
+/// the daemon is running is the documented way to install.
+///
+/// See `tests/hook_races.rs`.
 pub fn install(tmux: &Tmux, osm_bin: &str) -> Result<usize> {
-    uninstall(tmux)?;
+    let _guard = hold(&lock_path(tmux)?)?;
+    remove_marked(tmux)?;
     for event in HOOKED_EVENTS {
         let cmd = hook_command(osm_bin, event);
         tmux.run(&["set-hook", "-g", "-a", event, &cmd])?;
@@ -121,6 +292,17 @@ pub fn install(tmux: &Tmux, osm_bin: &str) -> Result<usize> {
 /// can no longer be trusted after the first removal. This re-reads the
 /// listing before every removal and stops once no marked hook remains.
 pub fn uninstall(tmux: &Tmux) -> Result<usize> {
+    let _guard = hold(&lock_path(tmux)?)?;
+    remove_marked(tmux)
+}
+
+/// The removal itself, with the lock already held.
+///
+/// Separate from [`uninstall`] because [`install`] does this as its first
+/// step and already holds the lock: taking it again would open a second file
+/// description on the same file, and `flock` would refuse it — a deadlock in
+/// everything but name.
+fn remove_marked(tmux: &Tmux) -> Result<usize> {
     let mut removed = 0;
     loop {
         let shown = tmux.run(&["show-hooks", "-g"]).unwrap_or_default();

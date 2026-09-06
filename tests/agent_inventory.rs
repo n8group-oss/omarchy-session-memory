@@ -74,6 +74,11 @@ impl Drop for Holder {
     }
 }
 
+/// The default policy: the agent's own title where there is one, and one
+/// line of the user's first prompt where there is not. These suites are
+/// about which conversation a pane is running, not about what it is called.
+const TITLES: osm::agent::title::Policy = osm::agent::title::Policy::AgentOrFirstPrompt;
+
 #[test]
 fn a_conversation_a_live_pane_holds_open_is_live_and_not_also_resumable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -106,7 +111,7 @@ fn a_conversation_a_live_pane_holds_open_is_live_and_not_also_resumable() {
         },
     ];
 
-    let inv = osm::agent::inventory(&probes, &claude(root)).unwrap();
+    let inv = osm::agent::inventory(&probes, &claude(root), TITLES).unwrap();
 
     assert_eq!(
         inv.live.len(),
@@ -137,7 +142,7 @@ fn with_no_panes_at_all_every_conversation_is_resumable() {
     fixture(root, LIVE_ID);
     fixture(root, IDLE_ID);
 
-    let inv = osm::agent::inventory(&[], &claude(root)).unwrap();
+    let inv = osm::agent::inventory(&[], &claude(root), TITLES).unwrap();
 
     assert!(inv.live.is_empty(), "{:?}", inv.live);
     let mut ids: Vec<&str> = inv.resumable.iter().map(|s| s.native_id.as_str()).collect();
@@ -149,7 +154,7 @@ fn with_no_panes_at_all_every_conversation_is_resumable() {
 
 #[test]
 fn no_adapters_means_no_inventory_rather_than_an_error() {
-    let inv = osm::agent::inventory(&[], &[]).unwrap();
+    let inv = osm::agent::inventory(&[], &[], TITLES).unwrap();
     assert!(inv.live.is_empty());
     assert!(inv.resumable.is_empty());
 }
@@ -165,7 +170,7 @@ fn resumable_is_newest_first_so_the_menu_can_take_the_head() {
     filetime_set(&older, 1_000_000);
     filetime_set(&newer, 2_000_000);
 
-    let inv = osm::agent::inventory(&[], &claude(root)).unwrap();
+    let inv = osm::agent::inventory(&[], &claude(root), TITLES).unwrap();
     let ids: Vec<&str> = inv.resumable.iter().map(|s| s.native_id.as_str()).collect();
     assert_eq!(ids, vec![IDLE_ID, LIVE_ID], "newest last_active first");
 }

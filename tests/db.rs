@@ -814,3 +814,121 @@ fn a_v8_database_gains_the_name_ownership_column_without_claiming_an_answer() {
         .unwrap();
     assert_eq!(version, osm::db::SCHEMA_VERSION);
 }
+
+/// v10 recorded a `summary` column on `agent_sessions` that nothing ever
+/// wrote — the design's "opt-in only, off by default" paraphrase of a
+/// conversation, which was never built. v11 replaces it with what is actually
+/// recorded: a one-line `title` and the `title_source` that says whether the
+/// agent wrote it or it came from the user's first prompt.
+///
+/// The rename is deliberate rather than a reuse. `summary` promised a
+/// paraphrase of a conversation's contents; a title is not that, and a column
+/// whose name says otherwise is how the next reader concludes osm stores
+/// transcript summaries.
+#[test]
+fn a_v10_database_gains_the_conversation_title_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+               state TEXT NOT NULL
+                     CHECK (state IN ('building','complete','restore_in_progress',
+                                      'restored','failed')),
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+               server TEXT);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE agent_sessions (
+               row_id      INTEGER PRIMARY KEY,
+               kind        TEXT    NOT NULL,
+               native_id   TEXT    NOT NULL,
+               project_dir TEXT,
+               store_path  TEXT,
+               last_active INTEGER,
+               size_bytes  INTEGER,
+               summary     TEXT,
+               alive       INTEGER NOT NULL DEFAULT 0 CHECK (alive IN (0,1)),
+               UNIQUE (kind, native_id));
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');
+             INSERT INTO agent_sessions (kind, native_id, project_dir)
+               VALUES ('claude', 'c1', '/home/u/app');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '10');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v10 database must open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "a migratable database must not be moved aside: the snapshots in it \
+         are the user's only record of where their sessions were"
+    );
+
+    let (project, title, source): (String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT project_dir, title, title_source FROM agent_sessions WHERE native_id = 'c1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("the row survives the migration with the new columns");
+    assert_eq!(project, "/home/u/app", "the migration keeps what was there");
+    assert_eq!(
+        title, None,
+        "a row written before titles existed has none, and must not claim one"
+    );
+    assert_eq!(source, None);
+
+    let version: u32 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0).map(|v| v.parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(version, osm::db::SCHEMA_VERSION);
+}
+
+/// A preserved database whose most recent transactions are still in its
+/// `-wal` is counted **with** them.
+///
+/// `osm status` reads the preserved file to say what is in it, and reads it
+/// with `immutable=1` so that a panel polling every five seconds does not
+/// create SQLite's shared-memory index beside a backup it has no other
+/// business with. `immutable=1` also ignores a `-wal` — so a file whose rows
+/// are all in one would be reported as holding nothing, which is the same
+/// untruth as the claim this replaced, pointing the other way. Preservation
+/// checkpoints before it moves a database, but the one that could not
+/// (see `preserve_aside`) carries its `-wal` along with it.
+#[test]
+fn a_preserved_database_holding_its_rows_in_a_wal_is_counted_with_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db.v1.bak");
+    // Held open for the whole test: the last connection to close checkpoints
+    // the WAL back into the file, which is exactly the state this is not
+    // about.
+    let held = rusqlite::Connection::open(&path).unwrap();
+    held.pragma_update(None, "journal_mode", "WAL").unwrap();
+    held.execute_batch(
+        "CREATE TABLE snapshots (
+           id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+           boot_id TEXT NOT NULL, reason TEXT NOT NULL, state TEXT NOT NULL);
+         INSERT INTO snapshots VALUES (1, 100, 'boot-a', 'manual', 'complete');
+         INSERT INTO snapshots VALUES (2, 200, 'boot-a', 'manual', 'complete');",
+    )
+    .unwrap();
+
+    let wal = dir.path().join("state.db.v1.bak-wal");
+    assert!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0,
+        "the fixture checkpointed itself, so this proves nothing"
+    );
+    assert_eq!(
+        osm::db::preserved_contents(&path),
+        osm::db::PreservedContents::Snapshots(2),
+        "the rows in the -wal were not counted"
+    );
+}

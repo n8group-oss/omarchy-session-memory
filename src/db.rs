@@ -40,9 +40,22 @@ use std::path::{Path, PathBuf};
 /// | 6       | migrated in place (two added columns, both nullable: the server identities) |
 /// | 7       | migrated in place (adds `agent_resume_debt`) |
 /// | 8       | migrated in place (one added column, nullable: `window_rows.auto_named`) |
-/// | 9       | opened in place |
+/// | 9       | migrated in place (adds `terminal_windows.session_name`, backfilled from the link) |
+/// | 10      | migrated in place (replaces the never-written `agent_sessions.summary` with `title` and `title_source`, and drops its `alive`) |
+/// | 11      | opened in place |
 /// | unversioned (osm tables, no `schema_version`) | preserved as `state.db.unversioned.bak` |
 /// | newer than this build | preserved as `state.db.v<N>.bak` |
+///
+/// 10 is migrated by renaming a column nothing ever wrote. `summary` promised
+/// an opt-in paraphrase of a conversation's contents, which was never built;
+/// what is recorded now is a *title* — one line the agent wrote about itself,
+/// or one truncated line of the user's first prompt, with `title_source`
+/// saying which. Keeping the old name would tell the next reader that osm
+/// stores summaries. `alive` goes with it: whether a conversation is open
+/// right now is a fact about this moment, and this table is a registry keyed
+/// by conversation with no moment in it, so the column could only ever be
+/// stale. Every row keeps everything else it had, and gains no title it did
+/// not have.
 ///
 /// 8 is migrated too, and the added column is nullable on purpose: a row
 /// written before it existed cannot say whether the user chose the window's
@@ -62,7 +75,7 @@ use std::path::{Path, PathBuf};
 /// rather than linking the wrong window. What matters is that the file is still there
 /// afterwards. [`preserved`] reports the situation and `osm status --json`
 /// prints it, so a preserved database is visible rather than silent.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -194,16 +207,30 @@ CREATE TABLE IF NOT EXISTS terminal_windows (
   UNIQUE (snapshot_id, hypr_address)
 );
 
+-- What osm knows about a conversation, keyed by the conversation and not by
+-- any one snapshot: the same conversation runs in a pane, is captured a
+-- hundred times, and is still one conversation.
+--
+-- Written only for conversations a capture actually bound to a pane, which
+-- bounds this table by the panes that have ever run an agent rather than by
+-- the 2494 conversations on the machine.
 CREATE TABLE IF NOT EXISTS agent_sessions (
-  row_id      INTEGER PRIMARY KEY,
-  kind        TEXT    NOT NULL,
-  native_id   TEXT    NOT NULL,
-  project_dir TEXT,
-  store_path  TEXT,
-  last_active INTEGER,
-  size_bytes  INTEGER,
-  summary     TEXT,
-  alive       INTEGER NOT NULL DEFAULT 0 CHECK (alive IN (0,1)),
+  row_id       INTEGER PRIMARY KEY,
+  kind         TEXT    NOT NULL,
+  native_id    TEXT    NOT NULL,
+  project_dir  TEXT,
+  store_path   TEXT,
+  last_active  INTEGER,
+  size_bytes   INTEGER,
+  -- One line saying what the conversation is about, NULL when osm could
+  -- derive none. Never a summary of what was said: see `crate::agent::title`
+  -- and the design's privacy note.
+  title        TEXT,
+  -- Where `title` came from: `agent` (the agent's own name for it) or
+  -- `first_prompt` (one truncated line of the user's opening message). NULL
+  -- exactly when `title` is. Stored rather than inferred, because a reader
+  -- must be able to tell the agent's words from the user's without guessing.
+  title_source TEXT,
   UNIQUE (kind, native_id)
 );
 
@@ -365,6 +392,122 @@ pub fn preserved(conn: &Connection) -> Option<Preserved> {
         schema_version: read("preserved_db_version").and_then(|v| v.parse().ok()),
         preserved_at: read("preserved_db_at").and_then(|v| v.parse().ok()),
     })
+}
+
+/// What a preserved database turned out to hold.
+///
+/// Three answers rather than a claim. `osm status` used to tell its reader
+/// that the snapshots in a preserved file "are intact" without ever opening
+/// it, which on a machine whose backup held nothing frightened its owner
+/// about data he had never lost. A file with snapshots in it and a file with
+/// none are different facts; a file nothing could read is a third, and must
+/// not be reported as either of the first two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreservedContents {
+    /// It opened, and holds this many snapshots. Zero is an answer: there is
+    /// nothing in the file to lose.
+    Snapshots(i64),
+    /// Nothing is at the path any more — the ordinary end of the story, since
+    /// a preserved file holding nothing is the user's to delete.
+    Gone,
+    /// It is there, and what it holds could not be established.
+    Unreadable(String),
+}
+
+/// How long the count below may wait on a lock before it is called unknown.
+///
+/// Nothing writes to a preserved database — it is a backup no code opens for
+/// writing — so this is only reached by a file some other process happens to
+/// be holding. `osm status` is polled by the panel every few seconds and must
+/// never be the thing that blocks it.
+const PRESERVED_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Count the snapshots in the preserved database at `path`, read-only.
+///
+/// **A count, and only a count.** [`PreservedContents::Snapshots`] means this
+/// many rows are in that one table, and nothing more was looked at: not
+/// whether anything is behind them, not whether the newest is a `building` row
+/// describing a capture that never finished, not whether the file is
+/// internally consistent. Any caller that turns this number into a claim about
+/// the state of the user's data is asserting something nobody checked — see
+/// `preserved_notice` in `src/main.rs`, which used to call a positive count
+/// *intact*.
+///
+/// Cheap and bounded on purpose: one open, one `COUNT(*)` over an index-free
+/// table of at most a retention window's rows, on every `osm status`. The
+/// connection is opened **read only**, without `SQLITE_OPEN_CREATE`: this is
+/// the user's file, osm's business with it ended when it was moved aside, and
+/// a missing one must read as missing rather than be conjured back as an
+/// empty database.
+pub fn preserved_contents(path: &Path) -> PreservedContents {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PreservedContents::Gone,
+        // Anything else — a permission error on the directory, say — is a
+        // question that was not answered, not a file that is not there.
+        Err(e) => return PreservedContents::Unreadable(e.to_string()),
+        Ok(_) => {}
+    }
+    match count_preserved_snapshots(path) {
+        Ok(n) => PreservedContents::Snapshots(n),
+        Err(e) => PreservedContents::Unreadable(e.to_string()),
+    }
+}
+
+/// Count the rows, touching the user's directory as little as the file
+/// allows.
+///
+/// A plain read-only connection to a WAL database makes SQLite build the
+/// shared-memory index it reads the WAL through, which means **creating**
+/// `<backup>-shm` and `<backup>-wal` beside the user's backup — on a status
+/// the panel runs every five seconds. `immutable=1` creates nothing, locks
+/// nothing and reads only the file itself, but it also ignores a `-wal`, and
+/// a preserved database whose checkpoint failed carries its most recent
+/// transactions in exactly that file. Reporting those snapshots as absent is
+/// the untruth this whole function exists to stop.
+///
+/// So: `immutable=1` when there is no WAL content to miss, which is the
+/// ordinary case (preservation checkpoints the database before moving it),
+/// and an ordinary read-only open when there is — where the sidecars are the
+/// price of counting the file correctly.
+fn count_preserved_snapshots(path: &Path) -> rusqlite::Result<i64> {
+    let hot_wal = fs::metadata(sidecar(path, "-wal")).is_ok_and(|m| m.len() > 0);
+    let conn = match immutable_uri(path).filter(|_| !hot_wal) {
+        Some(uri) => Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        ),
+        None => Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
+    }?;
+    conn.busy_timeout(PRESERVED_READ_TIMEOUT)?;
+    conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+}
+
+/// `path` as a SQLite `file:` URI opening it immutably, or `None` for a path
+/// SQLite's URI parser cannot be handed safely.
+///
+/// Everything outside an unreserved set is percent-encoded, because `?`, `#`
+/// and `%` are all legal in a filename and all mean something else in a URI:
+/// a state directory called `what?` would otherwise open a database called
+/// `what` with a query string. A path that is not UTF-8 has no URI form at
+/// all, so it takes the ordinary open.
+fn immutable_uri(path: &Path) -> Option<String> {
+    let raw = path.to_str()?;
+    let mut uri = String::from("file:");
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Some(uri)
 }
 
 /// The lock **every** [`open`] is taken under.
@@ -1154,6 +1297,42 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
                     }
                 }
                 version = 10;
+            }
+            // Conversation titles. `summary` is renamed rather than kept
+            // beside them: nothing ever wrote it, and a column promising a
+            // paraphrase of a transcript next to one holding a title is how a
+            // reader concludes osm stores the former.
+            10 => {
+                let has_table: bool = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='table' AND name='agent_sessions'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )? == 1;
+                if has_table {
+                    let columns = tx
+                        .prepare("SELECT * FROM agent_sessions LIMIT 0")?
+                        .column_names()
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>();
+                    if columns.iter().any(|c| c == "summary") {
+                        tx.execute_batch(
+                            "ALTER TABLE agent_sessions RENAME COLUMN summary TO title",
+                        )?;
+                    } else if !columns.iter().any(|c| c == "title") {
+                        tx.execute_batch("ALTER TABLE agent_sessions ADD COLUMN title TEXT")?;
+                    }
+                    if !columns.iter().any(|c| c == "title_source") {
+                        tx.execute_batch(
+                            "ALTER TABLE agent_sessions ADD COLUMN title_source TEXT",
+                        )?;
+                    }
+                    if columns.iter().any(|c| c == "alive") {
+                        tx.execute_batch("ALTER TABLE agent_sessions DROP COLUMN alive")?;
+                    }
+                }
+                version = 11;
             }
             _ => return Ok(false),
         }

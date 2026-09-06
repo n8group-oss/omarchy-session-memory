@@ -1,4 +1,4 @@
-use crate::agent::{self, detect::PaneProbe, AgentAdapter, AgentKind};
+use crate::agent::{self, detect::PaneProbe, AgentKind, AgentSession};
 use crate::boot;
 use crate::lock::SingleInstance;
 use crate::tmux::{PaneRec, SessionRec, Tmux, WindowRec};
@@ -283,8 +283,13 @@ pub fn write_topology(
     reason: &str,
     keep: Option<usize>,
 ) -> Result<i64> {
+    // Off disk first, and outside the transaction. This walks every enabled
+    // agent's conversation store, which is filesystem work of unbounded
+    // length; done inside the transaction it held the database's write lock
+    // for the whole of it. See [`Detection`].
+    let detection = Detection::of(topo);
     let tx = conn.transaction()?;
-    let snapshot_id = write_topology_in(&tx, topo, reason)?;
+    let snapshot_id = write_topology_in(&tx, topo, reason, &detection)?;
     // Placement belongs to the topology it describes, so it lands in the same
     // transaction or not at all. `None` means the compositor could not be
     // trusted; writing nothing is the honest outcome, and writing an empty
@@ -299,6 +304,149 @@ pub fn write_topology(
     Ok(snapshot_id)
 }
 
+/// Which pane is running which agent conversation, read off disk.
+///
+/// # Why this is a value, and not something the writer does
+///
+/// Building it walks every enabled agent's conversation store: a directory
+/// per project, a transcript per conversation, and the head of each transcript
+/// read to find the directory it belongs to. That is filesystem work of
+/// unbounded length — 1.2 to 1.9 seconds on the maintainer's machine, which
+/// has 2448 of them — and it used to happen *inside* the transaction that
+/// writes the snapshot.
+///
+/// SQLite has one writer. A capture therefore held the database's write lock
+/// for the whole scan, and everything else queued behind it: tmux fires hooks
+/// in parallel, each hook is its own `osm` process, and a capture takes a
+/// second pass for work flagged while it ran, so those holds arrive back to
+/// back. The busy handler is not a queue — a waiter that keeps losing to a
+/// freshly-arrived writer simply runs out of budget — so `osm` processes
+/// failed outright with "database is locked" despite a five-second
+/// `busy_timeout`. A hook that fails that way captures nothing, and a
+/// snapshot nobody took is one the user does not have. A new user's first
+/// minutes are exactly this shape.
+///
+/// Reading it before the transaction costs nothing in accuracy. It is a
+/// picture of the machine taken a moment earlier, which is all it ever was:
+/// panes come and go while the scan itself runs.
+pub struct Detection {
+    /// Whether the stores could be read at all.
+    ///
+    /// Not the same as "no pane holds a conversation", and the difference is
+    /// load-bearing: a scan that could not run is a recorded reason to carry
+    /// the previous snapshot's bindings forward rather than to record that
+    /// there are none. See `carry_owed_bindings`.
+    ran: bool,
+    /// Pane id → the conversation it was found to be running.
+    bound: HashMap<String, (AgentKind, String, f32)>,
+    /// Panes the scan looked at and could not answer for. See
+    /// [`agent::detect::lineage_ownership_unknown`].
+    unknown: HashSet<String>,
+    /// The conversations those panes were found to be running, as their
+    /// adapters describe them, each with the one line saying what it is
+    /// about.
+    ///
+    /// Derived here — off disk, before the transaction, with the stores this
+    /// scan has already read — and for the bound conversations only. That
+    /// bounds the work by the number of panes running an agent (twenty on the
+    /// maintainer's machine) rather than by the number of conversations on it
+    /// (2494), and keeps every byte of it outside the database's write lock,
+    /// which is the whole reason [`Detection`] is a value.
+    conversations: Vec<(AgentSession, Option<agent::title::Title>)>,
+    /// What the user's `privacy.prompt_titles` allowed this scan to read.
+    ///
+    /// Kept on the value rather than recomputed at the write, because the two
+    /// have to be the same answer: the titles below were derived under this
+    /// policy, and the revocation the writer performs is the other half of the
+    /// same decision.
+    titles: agent::title::Policy,
+}
+
+impl Detection {
+    /// Read the enabled agents' conversation stores and match them against
+    /// `topo`'s panes.
+    pub fn of(topo: &Topology) -> Self {
+        let cfg = config_for_capture();
+        let adapters = agent::adapters(&cfg.agents.enabled);
+        let titles = agent::title::Policy::of(&cfg.privacy);
+        // Each adapter's conversations are read once for the whole capture.
+        //
+        // A failure here is not "no pane holds a conversation", and it is not
+        // a reason to abandon the capture either: the tmux topology is the
+        // thing this snapshot exists for, and refusing to record it because an
+        // agent's home directory became unreadable would cost the user their
+        // sessions over an unrelated problem.
+        let prepared = match agent::detect::prepare(&adapters) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                eprintln!(
+                    "osm: could not read the enabled agents' conversations ({e:#}); this \
+                     capture cannot tell which pane is running what, so it carries the \
+                     previous snapshot's bindings rather than recording that there are none"
+                );
+                None
+            }
+        };
+        let mut bound: HashMap<String, (AgentKind, String, f32)> = HashMap::new();
+        let mut unknown: HashSet<String> = HashSet::new();
+        if let Some(prepared) = &prepared {
+            for p in &topo.panes {
+                if bound.contains_key(&p.id) {
+                    continue; // same pane, seen through another link
+                }
+                let probe = PaneProbe {
+                    pane_id: p.id.clone(),
+                    pane_pid: p.pid,
+                    cwd: p.cwd.clone(),
+                    foreground_cmd: p.cmd.clone(),
+                };
+                if let Some(binding) = agent::detect::bind(&probe, prepared) {
+                    bound.insert(
+                        p.id.clone(),
+                        (binding.kind, binding.native_id, binding.confidence),
+                    );
+                } else if agent::detect::lineage_ownership_unknown(&probe, prepared) {
+                    // Not "this pane holds no conversation": this pane holds a
+                    // transcript whose file has been unlinked out from under
+                    // its agent, so nothing can be matched by device and
+                    // inode. The pane's previous binding is the best evidence
+                    // anyone has and is kept until ownership can be
+                    // established again.
+                    unknown.insert(p.id.clone());
+                }
+            }
+        }
+        // One title per bound conversation, not per pane: two panes on the
+        // same conversation are one thing to record.
+        let mut conversations = Vec::new();
+        if let Some(prepared) = &prepared {
+            let mut seen: HashSet<(AgentKind, String)> = HashSet::new();
+            for (kind, native_id, _) in bound.values() {
+                if !seen.insert((*kind, native_id.clone())) {
+                    continue;
+                }
+                for p in prepared {
+                    if p.adapter.kind() != *kind {
+                        continue;
+                    }
+                    if let Some(session) = p.sessions.iter().find(|s| &s.native_id == native_id) {
+                        let title = p.adapter.title_of(session, titles);
+                        conversations.push((session.clone(), title));
+                    }
+                }
+            }
+        }
+
+        Self {
+            ran: prepared.is_some(),
+            bound,
+            unknown,
+            conversations,
+            titles,
+        }
+    }
+}
+
 /// The adapters to probe panes against during capture: whichever agents
 /// `agents.enabled` names.
 ///
@@ -307,15 +455,24 @@ pub fn write_topology(
 /// moment a config file typo appeared, which is a worse silent failure than
 /// falling back to the built-in default list. `status --json` already
 /// reports the same config as invalid, so the user has somewhere to see it.
-fn agent_adapters_for_capture() -> Vec<Box<dyn AgentAdapter>> {
-    let enabled = match crate::paths::config_path().and_then(|p| crate::config::load(&p)) {
-        Ok(cfg) => cfg.agents.enabled,
+///
+/// **Privacy is the exception**, and it is why this returns
+/// [`crate::config::Config::strict_fallback`] rather than the plain default:
+/// `privacy.prompt_titles` defaults to `true`, so a config saying `false` with
+/// an unrelated typo in it used to fall all the way back to reading the user's
+/// first prompt again. A fallback may guess at what someone would have wanted;
+/// it may not overrule what they wrote down.
+fn config_for_capture() -> crate::config::Config {
+    match crate::paths::config_path().and_then(|p| crate::config::load(&p)) {
+        Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("osm: {e:#}; using the default enabled agent adapters for this capture");
-            crate::config::AgentsCfg::default().enabled
+            eprintln!(
+                "osm: {e:#}; using the default enabled agent adapters for this capture, and \
+                 deriving no title from anyone's first prompt until the config loads"
+            );
+            crate::config::Config::strict_fallback()
         }
-    };
-    agent::adapters(&enabled)
+    }
 }
 
 /// One conversation the previous snapshot recorded as bound to a pane,
@@ -631,7 +788,12 @@ fn carry_owed_bindings(
 /// steps leaves a window in which the only `complete` snapshot on the machine
 /// has been retired and its replacement has not been written yet — a power
 /// loss there costs the user everything.
-pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &str) -> Result<i64> {
+pub fn write_topology_in(
+    tx: &rusqlite::Transaction,
+    topo: &Topology,
+    reason: &str,
+    detection: &Detection,
+) -> Result<i64> {
     if let Some(why) = topo.inconsistency() {
         anyhow::bail!("refusing to record an inconsistent tmux topology: {why}");
     }
@@ -743,60 +905,11 @@ pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &s
         )?;
     }
 
-    // Which conversation, if any, each live pane is bound to. Detected fresh
-    // for this capture; a binding it could not see is only ever *added* to,
-    // never allowed to displace one it could — see `carry_owed_bindings`.
-    let adapters = agent_adapters_for_capture();
-    // Each adapter's conversations are read once for the whole capture.
-    //
-    // A failure here is not "no pane holds a conversation", and it is not a
-    // reason to abandon the capture either: the tmux topology is the thing
-    // this snapshot exists for, and refusing to record it because an agent's
-    // home directory became unreadable would cost the user their sessions over
-    // an unrelated problem. What it *is* is a specific, recorded cause for
-    // carrying the previous bindings forward — detection did not run.
-    let prepared = match agent::detect::prepare(&adapters) {
-        Ok(prepared) => Some(prepared),
-        Err(e) => {
-            eprintln!(
-                "osm: could not read the enabled agents' conversations ({e:#}); this \
-                 capture cannot tell which pane is running what, so it carries the \
-                 previous snapshot's bindings rather than recording that there are none"
-            );
-            None
-        }
-    };
-    let detection_ran = prepared.is_some();
-    let mut detected: HashMap<String, (AgentKind, String, f32)> = HashMap::new();
-    // Panes detection looked at and could not answer for. See
-    // `agent::detect::lineage_ownership_unknown`.
-    let mut unknown_panes: HashSet<String> = HashSet::new();
-    if let Some(prepared) = &prepared {
-        for p in &topo.panes {
-            if detected.contains_key(&p.id) {
-                continue; // same pane, seen through another link
-            }
-            let probe = PaneProbe {
-                pane_id: p.id.clone(),
-                pane_pid: p.pid,
-                cwd: p.cwd.clone(),
-                foreground_cmd: p.cmd.clone(),
-            };
-            if let Some(binding) = agent::detect::bind(&probe, prepared) {
-                detected.insert(
-                    p.id.clone(),
-                    (binding.kind, binding.native_id, binding.confidence),
-                );
-            } else if agent::detect::lineage_ownership_unknown(&probe, prepared) {
-                // Not "this pane holds no conversation": this pane holds a
-                // transcript whose file has been unlinked out from under its
-                // agent, so nothing can be matched by device and inode. The
-                // pane's previous binding is the best evidence anyone has and
-                // is kept until ownership can be established again.
-                unknown_panes.insert(p.id.clone());
-            }
-        }
-    }
+    // Which conversation, if any, each live pane is bound to — read off disk
+    // by the caller, before this transaction opened. See [`Detection`].
+    let detection_ran = detection.ran;
+    let detected = detection.bound.clone();
+    let unknown_panes = &detection.unknown;
 
     // What this capture can *see* running, which is the only thing that is
     // ever written down as a fresh binding. A conversation observed live owes
@@ -815,7 +928,7 @@ pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &s
         &live_now,
         snapshot_id,
         detection_ran,
-        &unknown_panes,
+        unknown_panes,
     )?;
 
     // `list-panes -a` likewise repeats a linked window's panes once per
@@ -864,6 +977,66 @@ pub fn write_topology_in(tx: &rusqlite::Transaction, topo: &Topology, reason: &s
                 agent_session_id,
                 agent_confidence
             ],
+        )?;
+    }
+
+    // What the bound conversations are, recorded once per conversation rather
+    // than once per snapshot: the same conversation runs through a hundred
+    // captures and is still one conversation, and `osm status --json` reads
+    // this to say what a session is about.
+    //
+    // A title already on record survives a capture that could not derive one
+    // — an agent home that went unreadable for a moment must not blank a
+    // session's goal — but everything else is replaced, because it describes
+    // the file as it is now.
+    for (session, title) in &detection.conversations {
+        tx.execute(
+            "INSERT INTO agent_sessions
+               (kind, native_id, project_dir, store_path, last_active, size_bytes,
+                title, title_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (kind, native_id) DO UPDATE SET
+               project_dir  = excluded.project_dir,
+               store_path   = excluded.store_path,
+               last_active  = excluded.last_active,
+               size_bytes   = excluded.size_bytes,
+               title        = COALESCE(excluded.title, agent_sessions.title),
+               title_source = CASE WHEN excluded.title IS NULL
+                                   THEN agent_sessions.title_source
+                                   ELSE excluded.title_source END",
+            rusqlite::params![
+                session.kind.as_str(),
+                session.native_id,
+                session.project_dir,
+                session.store_path,
+                session.last_active,
+                session.size_bytes,
+                title.as_ref().map(|t| t.text.clone()),
+                title.as_ref().map(|t| t.source.as_str()),
+            ],
+        )?;
+    }
+
+    // `privacy.prompt_titles = false` is a revocation, not merely a rule for
+    // the next derivation.
+    //
+    // Without this the upsert above *preserves* a prompt-derived title under
+    // the strict policy — extraction returns nothing, `COALESCE` keeps what is
+    // on record — so a user who switched the key off kept every sentence osm
+    // had already taken from their messages, for as long as the database
+    // lived. Every row is cleared and not only the ones this snapshot bound:
+    // a conversation nothing is running any more is exactly the one nobody
+    // would think to go and revoke.
+    //
+    // Titles the agent wrote about its own conversations are untouched. They
+    // are not transcript content and were never what this key governed;
+    // clearing them would take away the labels Claude itself wrote from the
+    // person who asked osm to read less.
+    if detection.titles == crate::agent::title::Policy::AgentOnly {
+        tx.execute(
+            "UPDATE agent_sessions SET title = NULL, title_source = NULL
+              WHERE title_source = ?1",
+            rusqlite::params![crate::agent::title::Source::FirstPrompt.as_str()],
         )?;
     }
 
@@ -1668,7 +1841,7 @@ const CAPTURE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const MAX_CAPTURE_PASSES: u32 = 2;
 
 /// Captures serialise against each other here, not on the restore lock.
-fn capture_lock_path(restore_lock: &Path) -> PathBuf {
+pub fn capture_lock_path(restore_lock: &Path) -> PathBuf {
     restore_lock.with_file_name("capture.lock")
 }
 

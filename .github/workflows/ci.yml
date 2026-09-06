@@ -20,16 +20,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  hosted-runners-only:
+    # The comment at the top of this file is a promise. This job is the part
+    # that keeps it: `runs-on` is one line in one file away from handing a
+    # fork's pull request — which can contain anything, and which runs before
+    # any human has read it — a shell on the maintainer's own machine.
+    #
+    # It checks every workflow in the repository, including release.yml, which
+    # is the worst one to get wrong because it is the job that holds a token
+    # that can publish.
+    #
+    # It looks at `runs-on:` **keys** and nothing else. The first version of
+    # this job also grepped the whole file for the string `self-hosted`, which
+    # matched the paragraph above and the grep pattern itself, so it failed on
+    # a repository that was entirely correct — a check that can never pass is
+    # a check nobody keeps.
+    name: every runner is GitHub-hosted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Every runs-on is ubuntu-latest
+        shell: bash --noprofile --norc {0}
+        run: |
+          set -uo pipefail
+          fail=0
+          found=0
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -e "$f" ] || continue
+            # Key position only: a line whose first non-blank token is
+            # `runs-on:`. A list form (`runs-on:` followed by items, or an
+            # inline `[…]`) leaves a value that is not the literal
+            # `ubuntu-latest`, and so fails here too.
+            while IFS= read -r line; do
+              found=$((found + 1))
+              value="${line#*runs-on:}"
+              value="${value// /}"
+              value="${value//$'\r'/}"
+              if [ "$value" != "ubuntu-latest" ]; then
+                echo "FAIL: $f has a runner that is not ubuntu-latest: '$value'"
+                fail=1
+              fi
+            done < <(grep -E '^[[:space:]]*runs-on:' "$f")
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "FAIL: found no runs-on: at all — this check is not looking at anything"
+            fail=1
+          fi
+          echo "checked $found runners"
+          exit "$fail"
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
     container:
-      image: rust:1-bookworm
+      image: rust:1-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain components
         run: rustup component add clippy rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: lint
       - run: cargo fmt --all --check
@@ -56,10 +105,10 @@ jobs:
           # The supported floor, built from source: no Debian release ships a
           # tmux this new yet.
           - label: "3.7c (source)"
-            image: rust:1-trixie
+            image: rust:1-trixie@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959
             source: "3.7c"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Build tmux ${{ matrix.source }} from source
         run: |
@@ -76,7 +125,7 @@ jobs:
           make install
           tmux -V
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-${{ matrix.image }}-${{ matrix.source }}
 
@@ -103,15 +152,15 @@ jobs:
     name: refuses to run (tmux 3.3a bookworm)
     runs-on: ubuntu-latest
     container:
-      image: rust:1-bookworm
+      image: rust:1-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install tmux (distribution package)
         run: |
           apt-get update -qq
           apt-get install -y -qq tmux
           tmux -V
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: refuses-old-tmux
       - run: cargo build --no-default-features --bin osm
@@ -162,10 +211,10 @@ jobs:
     name: build (MSRV 1.85)
     runs-on: ubuntu-latest
     container:
-      image: rust:1.85-bookworm
+      image: rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: msrv
       # Build only: the declared rust-version is a consumer promise, and

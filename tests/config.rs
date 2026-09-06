@@ -13,7 +13,13 @@ fn missing_file_yields_defaults() {
     assert_eq!(cfg.capture.debounce_max_latency_secs, 5);
     assert_eq!(cfg.capture.fallback_interval_secs, 120);
     assert_eq!(cfg.capture.keep_snapshots, 20);
-    assert!(!cfg.privacy.store_summaries);
+    assert!(
+        cfg.privacy.prompt_titles,
+        "deriving a title from the user's first prompt is on by default: \
+         Codex writes no title of its own and is 95% of a real store, so off \
+         by default would mean a menu that says nothing about almost every \
+         conversation"
+    );
 }
 
 #[test]
@@ -87,4 +93,47 @@ fn zero_valued_intervals_are_rejected() {
             "error for {key}=0 should name the offending key, got: {err}"
         );
     }
+}
+
+/// The switch that turns the one relaxation off.
+///
+/// `privacy.prompt_titles = false` leaves a conversation named only by what
+/// its agent called it — which for Codex is nothing at all, so every Codex
+/// conversation reads *untitled*. That is a supported answer, and it is the
+/// only way to have it.
+#[test]
+fn prompt_titles_can_be_switched_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, "[privacy]\nprompt_titles = false\n").unwrap();
+
+    let cfg = config::load(&path).unwrap();
+    assert!(!cfg.privacy.prompt_titles);
+    assert_eq!(
+        osm::agent::title::Policy::of(&cfg.privacy),
+        osm::agent::title::Policy::AgentOnly,
+        "the config key and the policy the extractor obeys must be one \
+         decision, not two that can disagree"
+    );
+}
+
+/// The key that never did anything is gone, and a config that still sets it
+/// says so rather than being quietly ignored.
+///
+/// `privacy.store_summaries` promised an opt-in paraphrase of a conversation's
+/// contents. Nothing ever wrote one. Leaving it in place beside a feature that
+/// stores *titles* would tell the next reader that osm stores summaries when
+/// it is switched on, which is not true and never was.
+#[test]
+fn the_summary_key_that_never_did_anything_is_rejected_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, "[privacy]\nstore_summaries = true\n").unwrap();
+
+    let err = format!("{:#}", config::load(&path).unwrap_err());
+    assert!(
+        err.contains("store_summaries") && err.contains("prompt_titles"),
+        "the error must name the key that is gone and the one that replaced \
+         it: {err}"
+    );
 }

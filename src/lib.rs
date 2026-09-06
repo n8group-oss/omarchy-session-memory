@@ -9,6 +9,7 @@ pub mod equiv;
 pub mod health;
 pub mod hooks;
 pub mod hypr;
+pub mod install;
 pub mod ipc;
 pub mod layout;
 pub mod lock;

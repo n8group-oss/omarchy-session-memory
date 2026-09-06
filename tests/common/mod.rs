@@ -261,3 +261,239 @@ exit 1
     std::fs::set_permissions(&path, perm).unwrap();
     dir
 }
+
+/// One test's private world: its own state directory, its own configuration,
+/// and its own tmux server.
+///
+/// Every suite here had grown its own copy of this — a `TempDir`, a socket
+/// name built from a label and this process's id, `XDG_STATE_HOME` and
+/// `XDG_CONFIG_HOME` pointed inside it, and a `Drop` that kills the server.
+/// The copies are left where they are; this is the one new suites use.
+///
+/// Two invariants it exists to make unforgettable:
+///
+/// * **every** `osm` it runs is given `--socket`, and every `tmux` it runs is
+///   this handle's `-L` server, so nothing a test does can reach the
+///   developer's real tmux server. The environment variable that moves tmux's
+///   socket directory is not used and must not be: it does not isolate tmux
+///   on every version, and `tests/no_default_server.rs` rejects it by name.
+/// * the configuration it writes declares the machine headless
+///   (`restore.place_windows = false`), because a capture that is asked for
+///   window placement and cannot read it fails — which is every CI container
+///   and any headless server. A suite whose subject *is* the desktop writes
+///   its own config over this one.
+pub struct Env {
+    pub dir: tempfile::TempDir,
+    pub socket: String,
+}
+
+impl Env {
+    pub fn new(label: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        write_headless_config(&dir.path().join("config"));
+        Env {
+            socket: format!("osm-{}-{}", label, std::process::id()),
+            dir,
+        }
+    }
+
+    /// The tmux handle for this test's own server.
+    pub fn server(&self) -> Tmux {
+        Tmux::with_socket(&self.socket)
+    }
+
+    /// Run one tmux command against this test's server and return its
+    /// stdout. Panics with tmux's own stderr on failure, so a broken
+    /// fixture says what tmux objected to.
+    pub fn tmux(&self, args: &[&str]) -> String {
+        self.server()
+            .run(args)
+            .unwrap_or_else(|e| panic!("tmux {args:?}: {e:#}"))
+    }
+
+    /// Run `osm` — always with `--socket`, never against the default
+    /// server — and return its output. A non-zero exit panics here rather
+    /// than surfacing later as unparseable JSON.
+    pub fn osm(&self, args: &[&str]) -> std::process::Output {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_osm"))
+            .env("XDG_STATE_HOME", self.dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .arg("--socket")
+            .arg(&self.socket)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn osm {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "osm {args:?} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        shutdown(&self.server());
+    }
+}
+
+/// Run a command, and stop waiting for it after `timeout`.
+///
+/// `Command::output()` waits forever. A helper process that is *supposed* to
+/// print a result and exit — the QML harnesses in `qml_shell_quoting.rs` and
+/// `qml_status_shape.rs` are the ones here — does neither if it throws before
+/// its `Qt.exit`, and the suite then hangs rather than fails. A test that can
+/// hang is a test that stops the whole run on the machine least able to say
+/// why.
+///
+/// Returns whatever the process produced, and its status; a killed process is
+/// reported through that status, so a caller that cannot parse the output
+/// fails with the output it did get.
+pub fn run_bounded(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> std::process::Output {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the helper process");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("wait on the helper process") {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    child
+        .wait_with_output()
+        .expect("collect the helper process output")
+}
+
+/// A `systemctl` that acts on nothing, written into `dir`; returns that
+/// directory, for a test to put at the **front** of a child's `PATH`.
+///
+/// `osm install` and `osm uninstall` are the only commands in this project
+/// that run `systemctl --user`, and the units they name are the developer's
+/// to keep: this machine has a live `tmux.service` and a live `herdr.service`
+/// next to them. So the tests for those two commands do not run the real
+/// thing at all. They run this, which records what it was asked to do and
+/// exits with a status the test chooses.
+///
+/// It reads three variables from its environment:
+///
+/// * `OSM_TEST_LOG` — the file it appends one line per invocation to;
+/// * `OSM_TEST_BINARY` — a file whose first three bytes it records alongside
+///   that line, which is how a test tells whether the daemon was stopped
+///   *before* or *after* its binary was replaced. The two orders produce the
+///   same argument lists and only one of them is safe;
+/// * `OSM_TEST_IS_ACTIVE`, `OSM_TEST_STOP_RC`, `OSM_TEST_DISABLE_RC` — the
+///   exit status to report for `is-active`, `stop` and `disable`, each
+///   defaulting to 0;
+/// * `OSM_TEST_IS_ACTIVE_STATE` — the state word `is-active` prints on
+///   stdout when it exits non-zero, defaulting to `inactive`. The empty
+///   string is what a manager that could not be reached looks like: real
+///   `systemctl` prints the state and exits 3 when a unit is simply not
+///   running, and prints nothing at all when it never got to ask;
+/// * `OSM_TEST_SHOW_SLEEP`, `OSM_TEST_IS_ACTIVE_SLEEP` — seconds to hang for
+///   instead of answering `show` / `is-active`, which is what an
+///   unresponsive user manager does to both questions;
+/// * `OSM_TEST_RELOAD_SLEEP`, `OSM_TEST_ENABLE_SLEEP`, `OSM_TEST_STOP_SLEEP`,
+///   `OSM_TEST_DISABLE_SLEEP` — the same for the four *actions*. A manager
+///   that answers a question and then wedges on the command that follows it
+///   is the case a successful probe says nothing about, and it is what hung
+///   an install after its files were written and an uninstall before it
+///   removed anything;
+/// * `OSM_TEST_STAYS_ACTIVE` — when set, `is-active` keeps saying `active`
+///   even after a `stop` or a `disable --now` was accepted. `--no-block`
+///   returns as soon as the job is *queued*, so a command that succeeded is
+///   not a unit that stopped, and only the state says which.
+///
+/// The stand-in is stateful about exactly one thing: it records that it
+/// accepted a `stop` or a `disable` (in `$OSM_TEST_LOG.stopped`) and, unless
+/// `OSM_TEST_STAYS_ACTIVE` says otherwise, reports the units inactive
+/// afterwards. Without that a caller which confirms a stop by asking would
+/// wait out its whole budget in every test that stops anything.
+///
+/// A test that expects systemd work must assert the log is non-empty. An
+/// empty log means this stand-in never ran — and therefore that the real
+/// `systemctl` may have been called instead.
+pub fn stub_systemctl(dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("systemctl");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+# Stand-in for systemctl. See tests/common/mod.rs::stub_systemctl.
+#
+# `show` is a question, not an action. It is answered from OSM_TEST_UNIT_PATH
+# and deliberately kept out of the log, so a test can still assert that an
+# install did or did not *act* on systemd.
+#
+# OSM_TEST_SHOW_SLEEP makes the question never come back. `exec` rather than a
+# plain `sleep`, so the process the engine kills when its budget runs out is
+# the sleeping one itself: a grandchild would outlive the kill and go on
+# holding the pipe the engine reads.
+for arg in "$@"; do
+  case "$arg" in
+    show)
+      if [ -n "${OSM_TEST_SHOW_SLEEP:-}" ]; then exec sleep "$OSM_TEST_SHOW_SLEEP"; fi
+      printf '%s\n' "${OSM_TEST_UNIT_PATH:-}"; exit "${OSM_TEST_SHOW_RC:-0}" ;;
+  esac
+done
+seen="ABSENT"
+if [ -f "$OSM_TEST_BINARY" ]; then
+  seen="$(head -c 3 "$OSM_TEST_BINARY" | tr -dc '[:print:]')"
+fi
+echo "$* | binary=$seen" >> "$OSM_TEST_LOG"
+stopped="$OSM_TEST_LOG.stopped"
+for arg in "$@"; do
+  case "$arg" in
+    is-active)
+      if [ -n "${OSM_TEST_IS_ACTIVE_SLEEP:-}" ]; then exec sleep "$OSM_TEST_IS_ACTIVE_SLEEP"; fi
+      # A manager that answers, slowly. OSM_TEST_IS_ACTIVE_SLEEP never comes
+      # back at all; this one takes its time and then says what it would have
+      # said, which is what a confirmation loop with a deadline has to survive.
+      if [ -n "${OSM_TEST_IS_ACTIVE_DELAY:-}" ]; then sleep "$OSM_TEST_IS_ACTIVE_DELAY"; fi
+      # A stop this stand-in accepted has taken effect, unless the test is
+      # about a unit that will not go away.
+      if [ -f "$stopped" ] && [ -z "${OSM_TEST_STAYS_ACTIVE:-}" ]; then
+        printf 'inactive\n'; exit 3
+      fi
+      rc="${OSM_TEST_IS_ACTIVE:-0}"
+      if [ "$rc" = 0 ]; then printf 'active\n'
+      else printf '%s\n' "${OSM_TEST_IS_ACTIVE_STATE-inactive}"; fi
+      exit "$rc" ;;
+    daemon-reload)
+      if [ -n "${OSM_TEST_RELOAD_SLEEP:-}" ]; then exec sleep "$OSM_TEST_RELOAD_SLEEP"; fi
+      exit "${OSM_TEST_RELOAD_RC:-0}" ;;
+    enable)
+      if [ -n "${OSM_TEST_ENABLE_SLEEP:-}" ]; then exec sleep "$OSM_TEST_ENABLE_SLEEP"; fi
+      exit "${OSM_TEST_ENABLE_RC:-0}" ;;
+    stop)
+      if [ -n "${OSM_TEST_STOP_SLEEP:-}" ]; then exec sleep "$OSM_TEST_STOP_SLEEP"; fi
+      rc="${OSM_TEST_STOP_RC:-0}"
+      if [ "$rc" = 0 ]; then : > "$stopped"; fi
+      exit "$rc" ;;
+    disable)
+      if [ -n "${OSM_TEST_DISABLE_SLEEP:-}" ]; then exec sleep "$OSM_TEST_DISABLE_SLEEP"; fi
+      rc="${OSM_TEST_DISABLE_RC:-0}"
+      if [ "$rc" = 0 ]; then : > "$stopped"; fi
+      exit "$rc" ;;
+  esac
+done
+exit 0
+"#,
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&path, perm).unwrap();
+    dir.to_path_buf()
+}

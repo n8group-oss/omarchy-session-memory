@@ -16,6 +16,7 @@ pub mod codex;
 pub mod detect;
 pub mod opencode;
 pub mod resume;
+pub mod title;
 
 /// Resolves an adapter's home directory: an env override first, else
 /// `$HOME/<default_sub>`. Never errors — a missing `HOME` just means the
@@ -77,6 +78,62 @@ pub(crate) fn extract_uuid(s: &str) -> Option<String> {
 /// found".
 const PREFIX_SCAN_CAP_BYTES: usize = 64 * 1024;
 
+/// Open a conversation file for reading, refusing anything that is not a
+/// plain regular file under the name it was asked for.
+///
+/// # Why every read of a store goes through this
+///
+/// Discovery already refuses a store entry that is a symlink, and refuses one
+/// that resolves outside the configured root ([`claude::Claude::discover`]).
+/// That is a check made at one moment, and the file is opened later, by name.
+/// Between the two the name can come to mean something else: a transcript
+/// deleted and replaced is an ordinary race with a running agent, and a
+/// deliberate replacement is a swap. What is read here becomes a *persisted*
+/// title, so one successful read of the wrong file is permanent.
+///
+/// # What it does, and why not `O_NOFOLLOW`
+///
+/// `O_NOFOLLOW` is the kernel flag for exactly this and would need a `libc`
+/// dependency this crate does not have, for a constant whose value differs
+/// between Linux architectures. The same guarantee is available from `std`:
+///
+/// 1. `symlink_metadata` — an `lstat`, which does not follow — must say the
+///    name is a *regular file*. That refuses a symlink, and it also refuses a
+///    FIFO before anything is opened, which matters because opening a FIFO
+///    blocks until a writer appears: a hang, not merely a wrong read.
+/// 2. the file is opened;
+/// 3. `File::metadata` — an `fstat` on the descriptor actually obtained —
+///    must describe a regular file with the same device and inode. If the name
+///    changed under us between (1) and (2), this is what sees it.
+///
+/// So a final-component symlink is never *read*, whatever the timing. The only
+/// difference from `O_NOFOLLOW` is that a deliberate swap in that window is
+/// caught after the open rather than refused by it — and reaching that window
+/// requires write access to the store, which is already enough to write a
+/// transcript directly.
+pub(crate) fn open_conversation_file(path: &Path) -> std::io::Result<fs::File> {
+    let refuse = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: {why}", path.display()),
+        )
+    };
+    let named = fs::symlink_metadata(path)?;
+    if !named.is_file() {
+        return Err(refuse(
+            "not a regular file (a symlink, directory or special file is not a conversation)",
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(refuse(
+            "the name stopped describing the same regular file while it was being opened",
+        ));
+    }
+    Ok(file)
+}
+
 /// The `cwd` field from the first line of the transcript at `path`, read as
 /// at most [`PREFIX_SCAN_CAP_BYTES`] bytes regardless of the file's real
 /// size or whether it contains a newline at all. Anything that doesn't
@@ -97,7 +154,9 @@ pub(crate) fn project_dir_from_transcript(path: &Path) -> Option<String> {
     //
     // Scan a bounded prefix for the first record that has one. Still bounded:
     // a transcript can be hundreds of megabytes.
-    let mut file = fs::File::open(path).ok()?;
+    // Never through a symlink, and never a special file: see
+    // [`open_conversation_file`].
+    let mut file = open_conversation_file(path).ok()?;
     let mut buf = vec![0u8; PREFIX_SCAN_CAP_BYTES];
     let n = file.read(&mut buf).ok()?;
     buf.truncate(n);
@@ -340,6 +399,19 @@ pub trait AgentAdapter {
         Ok(TranscriptIndex::of(&self.discover()?))
     }
 
+    /// What this conversation is about, in one short line, or `None` when
+    /// nothing can be derived for it.
+    ///
+    /// The default is `None`, which is the honest answer for an adapter that
+    /// does not read its agent's store at all: it has no way to tell what a
+    /// conversation is for, and *untitled* is what the menu shows. See
+    /// [`title`] for the two sources a title may have, the bounds every read
+    /// of one obeys, and what `policy` — the user's `privacy.prompt_titles` —
+    /// allows a title to be derived from.
+    fn title_of(&self, _session: &AgentSession, _policy: title::Policy) -> Option<title::Title> {
+        None
+    }
+
     /// Why osm will not capture or resume this agent's conversations by
     /// itself, or `None` when it will.
     ///
@@ -434,6 +506,16 @@ pub struct Inventory {
     /// empty list. An installed-but-unusable OpenCode used to be
     /// indistinguishable from having no OpenCode conversations at all.
     pub problems: Vec<(AgentKind, String)>,
+    /// What each conversation is about, keyed by the conversation.
+    ///
+    /// Kept beside the two lists rather than inside [`AgentSession`] on
+    /// purpose. `discover` runs on every capture, over every conversation on
+    /// the machine, and it must stay a walk of directory entries; deriving a
+    /// title reads a bounded window of a file. That cost is paid here — on a
+    /// command a person ran, asking what their conversations are — and
+    /// nowhere else. A conversation with no entry is one osm could derive no
+    /// title for, which is *untitled* and never a blank.
+    pub titles: HashMap<(AgentKind, String), title::Title>,
 }
 
 /// Build the inventory: discover every conversation each adapter knows,
@@ -452,6 +534,7 @@ pub struct Inventory {
 pub fn inventory(
     probes: &[detect::PaneProbe],
     adapters: &[Box<dyn AgentAdapter>],
+    titles: title::Policy,
 ) -> Result<Inventory> {
     // Read each adapter's conversations once, propagating a failure rather
     // than reporting an empty inventory for a store osm could not look in.
@@ -516,9 +599,33 @@ pub fn inventory(
             .then_with(|| a.native_id.cmp(&b.native_id))
     });
 
+    // Titles last, over exactly the conversations being reported and each
+    // from one bounded read. See [`title`] for the bounds, and for what
+    // `titles` — the user's `privacy.prompt_titles` — allows one to be
+    // derived from.
+    let mut derived = HashMap::new();
+    for adapter in adapters {
+        let kind = adapter.kind();
+        let of_this_kind = live
+            .iter()
+            .filter_map(|l| l.session.as_ref())
+            .chain(resumable.iter())
+            .filter(|s| s.kind == kind);
+        for session in of_this_kind {
+            let key = (kind, session.native_id.clone());
+            if derived.contains_key(&key) {
+                continue;
+            }
+            if let Some(t) = adapter.title_of(session, titles) {
+                derived.insert(key, t);
+            }
+        }
+    }
+
     Ok(Inventory {
         live,
         resumable,
         problems,
+        titles: derived,
     })
 }

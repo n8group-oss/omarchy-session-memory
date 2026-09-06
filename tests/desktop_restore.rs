@@ -45,6 +45,20 @@ fn a_skipped_session_is_degraded() {
 }
 
 #[test]
+fn a_window_that_did_not_end_up_where_it_belongs_is_degraded() {
+    // The outcome the maintainer's restore should have reported and did not.
+    // If this ever stops degrading the run, a restore that left two terminals
+    // on the wrong workspace retires the only record of the right one.
+    assert!(degraded(&[
+        o("dev", placed()),
+        o(
+            "notes",
+            PlaceOutcome::Misplaced("it is on workspace \"2\", not \"9\"".into())
+        ),
+    ]));
+}
+
+#[test]
 fn all_placed_is_not_degraded() {
     assert!(!degraded(&[o("dev", placed()), o("notes", placed())]));
 }
@@ -89,6 +103,12 @@ fn nothing_to_place_is_not_degraded() {
 fn outcomes_have_stable_machine_readable_names() {
     assert_eq!(placed().as_str(), "placed");
     assert_eq!(PlaceOutcome::NeverMapped.as_str(), "never_mapped");
+    assert_eq!(PlaceOutcome::Misplaced("x".into()).as_str(), "misplaced");
+    assert_eq!(
+        PlaceOutcome::Misplaced("on 2, not 9".into()).detail(),
+        Some("on 2, not 9"),
+        "a misplaced window has to say where it actually is"
+    );
     assert_eq!(PlaceOutcome::NoCompositor.as_str(), "no_compositor");
     assert_eq!(
         PlaceOutcome::SpawnFailed("x".into()).as_str(),
@@ -122,15 +142,15 @@ struct Recording {
 }
 
 impl HyprCtl for Recording {
-    fn clients_json(&self) -> anyhow::Result<String> {
+    fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
         Ok("[]".to_string())
     }
-    fn monitors_json(&self) -> anyhow::Result<String> {
+    fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
         Ok(r#"[{"id":0,"name":"DP-1","description":"d","x":0,"y":0,
             "width":1920,"height":1080,"scale":1.0,"transform":0,"focused":true}]"#
             .to_string())
     }
-    fn dispatch(&self, lua: &str) -> anyhow::Result<String> {
+    fn dispatch(&self, lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
         self.dispatched.borrow_mut().push(lua.to_string());
         Ok(String::new())
     }
@@ -164,13 +184,13 @@ impl osm::desktop::Spawner for NoSpawn {
 /// A compositor that is not there.
 struct Absent;
 impl HyprCtl for Absent {
-    fn clients_json(&self) -> anyhow::Result<String> {
+    fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
         anyhow::bail!("no compositor")
     }
-    fn monitors_json(&self) -> anyhow::Result<String> {
+    fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
         anyhow::bail!("no compositor")
     }
-    fn dispatch(&self, _: &str) -> anyhow::Result<String> {
+    fn dispatch(&self, _: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
         panic!("dispatch attempted with no compositor")
     }
 }
@@ -460,22 +480,25 @@ fn a_compositor_that_refuses_a_dispatch_does_not_report_a_placed_window() {
     // and then retired the snapshot that said where it belonged.
     struct Refuses;
     impl HyprCtl for Refuses {
-        fn clients_json(&self) -> anyhow::Result<String> {
+        fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
             // One window, owned by this process, so placement gets as far as
-            // dispatching.
+            // dispatching — and on workspace 2 rather than the 3 it belongs
+            // on, so there is something to dispatch. A window that already
+            // satisfies its placement is asked for nothing, which is correct
+            // and would make this fixture prove nothing about a refusal.
             Ok(format!(
                 r#"[{{"address":"0xA","pid":{},"class":"com.mitchellh.ghostty",
-                   "title":"t","workspace":{{"id":3,"name":"3"}},"monitor":0,
+                   "title":"t","workspace":{{"id":2,"name":"2"}},"monitor":0,
                    "at":[0,0],"size":[10,10],"floating":false}}]"#,
                 std::process::id()
             ))
         }
-        fn monitors_json(&self) -> anyhow::Result<String> {
+        fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
             Ok(r#"[{"id":0,"name":"DP-1","description":"d","x":0,"y":0,
                 "width":1920,"height":1080,"scale":1.0,"transform":0,"focused":true}]"#
                 .to_string())
         }
-        fn dispatch(&self, _lua: &str) -> anyhow::Result<String> {
+        fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
             Ok("error: attempt to call a nil value".to_string())
         }
     }
@@ -531,14 +554,14 @@ fn a_compositor_that_disappears_after_the_spawn_takes_the_terminal_back() {
         calls: std::cell::Cell<u32>,
     }
     impl HyprCtl for AnswersOnce {
-        fn clients_json(&self) -> anyhow::Result<String> {
+        fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
             self.calls.set(self.calls.get() + 1);
             anyhow::bail!("compositor gone")
         }
-        fn monitors_json(&self) -> anyhow::Result<String> {
+        fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
             anyhow::bail!("compositor gone")
         }
-        fn dispatch(&self, _lua: &str) -> anyhow::Result<String> {
+        fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
             panic!("nothing may be dispatched to a compositor that is not there")
         }
     }
