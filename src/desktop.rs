@@ -511,12 +511,99 @@ pub fn terminal_kind_of(class: &str) -> String {
     class.to_string()
 }
 
+/// What a capture found out about window placement.
+///
+/// Three answers, and the third is the whole reason this type exists.
+/// `Option<Vec<Placement>>` could only say "here it is" or "here it is not",
+/// so a compositor that hiccupped for one capture and a machine that has no
+/// windows produced the same value — and the only safe thing to do with an
+/// ambiguity like that was to refuse the capture outright, which cost the
+/// user the tmux topology as well. Naming the third state instead lets the
+/// snapshot be recorded and lets everything downstream — retention, restore,
+/// `osm status` — treat *unknown* as the different fact it is.
+///
+/// The project's own rule, one level up: unknown placement is not absent
+/// placement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Placements {
+    /// The compositor answered, the tmux server answered, and both described
+    /// the same server incarnation. This is every terminal window that had a
+    /// session in it — and an **empty** vector is a fact, not an absence:
+    /// there were none.
+    Known(Vec<Placement>),
+    /// One of them could not be read, or the two described different tmux
+    /// servers. Carries the last thing that went wrong, for the operator who
+    /// has to work out which.
+    ///
+    /// Emphatically not `Known(vec![])`. Writing this down as an empty layout
+    /// is what destroyed the maintainer's original mapping.
+    Unknown(String),
+    /// The compositor was never asked: `restore.place_windows` is off, or
+    /// this capture path has no compositor to ask (a tmux-only capture, a
+    /// test). Not a failure, and nothing is owed.
+    Off,
+}
+
+/// `snapshots.placement_state` for [`Placements::Known`].
+pub const PLACEMENT_KNOWN: &str = "known";
+/// `snapshots.placement_state` for [`Placements::Unknown`].
+pub const PLACEMENT_UNKNOWN: &str = "unknown";
+/// `snapshots.placement_state` for [`Placements::Off`].
+pub const PLACEMENT_DISABLED: &str = "disabled";
+
+impl Placements {
+    /// The token this is stored as in `snapshots.placement_state`.
+    pub fn state(&self) -> &'static str {
+        match self {
+            Placements::Known(_) => PLACEMENT_KNOWN,
+            Placements::Unknown(_) => PLACEMENT_UNKNOWN,
+            Placements::Off => PLACEMENT_DISABLED,
+        }
+    }
+
+    /// The windows, when they are known. `None` is *not* "there were none" —
+    /// callers that write rows must use this rather than an empty slice, so
+    /// that "unknown" can never be flattened into "empty" by accident.
+    pub fn known(&self) -> Option<&[Placement]> {
+        match self {
+            Placements::Known(ps) => Some(ps),
+            _ => None,
+        }
+    }
+
+    /// Why the placement could not be read, or `None` when it could be or was
+    /// never asked for.
+    pub fn why(&self) -> Option<&str> {
+        match self {
+            Placements::Unknown(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Placements::Unknown(_))
+    }
+}
+
+/// What snapshot `snapshot_id` knows about its window placement.
+///
+/// The raw token, not a rendering of it, and an error rather than a guess for
+/// a snapshot that is not there: every caller of this decides something about
+/// retention or restore, and a default would decide it wrongly and silently.
+pub fn placement_state_of(conn: &rusqlite::Connection, snapshot_id: i64) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT placement_state FROM snapshots WHERE id = ?1",
+        [snapshot_id],
+        |r| r.get(0),
+    )?)
+}
+
 /// Write a snapshot's window placement.
 ///
 /// Called inside the snapshot's own transaction so placement lands with the
-/// topology it describes or not at all. `None` means the compositor could
-/// not be trusted and nothing is written — the rows already present belong
-/// to earlier snapshots and are left alone.
+/// topology it describes or not at all. Only ever reached for
+/// [`Placements::Known`]: an unknown placement writes nothing, and the rows
+/// already present belong to earlier snapshots and are left alone.
 pub fn write_placements_in(
     tx: &rusqlite::Transaction,
     snapshot_id: i64,

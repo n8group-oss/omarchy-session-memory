@@ -932,3 +932,66 @@ fn a_preserved_database_holding_its_rows_in_a_wal_is_counted_with_them() {
         "the rows in the -wal were not counted"
     );
 }
+
+/// A v11 database gains `snapshots.placement_state`, and every row already in
+/// it is called `known`.
+///
+/// Not `unknown`, which would be the cautious-looking answer and is the wrong
+/// one. Under v11 a capture that could not read placement was **refused**, so
+/// no v11 row can be an unknown-placement snapshot: every one of them either
+/// carries the placement the compositor reported or was taken with the
+/// compositor deliberately not asked. Stamping them `unknown` would hand
+/// retention a fleet of rows to protect and would make a restore of any of
+/// them go looking for placement somewhere else — inventing a doubt the old
+/// build never had.
+#[test]
+fn a_v11_database_gains_the_placement_state_column_as_known() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+               state TEXT NOT NULL
+                     CHECK (state IN ('building','complete','restore_in_progress',
+                                      'restored','failed')),
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+               server TEXT);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '11');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v11 database must open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "a migratable database must not be moved aside"
+    );
+
+    let state: String = conn
+        .query_row(
+            "SELECT placement_state FROM snapshots WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the column exists after the migration");
+    assert_eq!(
+        state, "known",
+        "a row written by a build that refused to record unknown placement \
+         cannot be an unknown-placement row"
+    );
+
+    let version: u32 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0).map(|v| v.parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(version, osm::db::SCHEMA_VERSION);
+}

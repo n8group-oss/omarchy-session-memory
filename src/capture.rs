@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct Topology {
-    /// Where each session's terminal window is, when the compositor could
-    /// be trusted. `None` means it could not, and no placement is written.
-    pub placements: Option<Vec<crate::desktop::Placement>>,
+    /// Where each session's terminal window is — or that it could not be
+    /// read, or that it was never asked for. See [`crate::desktop::Placements`]:
+    /// the three are different facts and collapsing the last two into "no
+    /// rows" is what made a compositor hiccup cost a whole capture.
+    pub placements: crate::desktop::Placements,
     pub sessions: Vec<SessionRec>,
     pub windows: Vec<WindowRec>,
     pub panes: Vec<PaneRec>,
@@ -153,8 +155,9 @@ pub fn collect_once(tmux: &Tmux) -> Result<Topology> {
         panes,
         // Placement is collected separately, by the caller that has a
         // compositor to ask. A topology gathered without one is not wrong,
-        // it simply carries no placement.
-        placements: None,
+        // and it is not *unknown* either: nothing was asked, so nothing is
+        // owed.
+        placements: crate::desktop::Placements::Off,
         server: before,
         server_at_end: after,
     })
@@ -258,7 +261,7 @@ fn snapshot_inner(
             //
             // The one way to a successful capture with no placement is the
             // user saying so; see `snapshot_with_configured_retention`.
-            if topo.placements.is_none() {
+            if topo.placements.is_unknown() {
                 anyhow::bail!(
                     "the window placement for this capture could not be read; refusing \
                      to record a snapshot that would claim there is none (set \
@@ -294,7 +297,7 @@ pub fn write_topology(
     // transaction or not at all. `None` means the compositor could not be
     // trusted; writing nothing is the honest outcome, and writing an empty
     // layout over a good one is what destroyed the original mapping.
-    if let Some(ps) = topo.placements.as_deref() {
+    if let Some(ps) = topo.placements.known() {
         crate::desktop::write_placements_in(&tx, snapshot_id, ps)?;
     }
     tx.commit()?;
@@ -819,9 +822,15 @@ pub fn write_topology_in(
     let taken_at = boot::now_epoch();
 
     tx.execute(
-        "INSERT INTO snapshots (taken_at, boot_id, reason, state, server)
-         VALUES (?1, ?2, ?3, 'building', ?4)",
-        rusqlite::params![taken_at, boot_id, reason, topo.server],
+        "INSERT INTO snapshots (taken_at, boot_id, reason, state, server, placement_state)
+         VALUES (?1, ?2, ?3, 'building', ?4, ?5)",
+        rusqlite::params![
+            taken_at,
+            boot_id,
+            reason,
+            topo.server,
+            topo.placements.state()
+        ],
     )?;
     let snapshot_id = tx.last_insert_rowid();
 
@@ -2109,8 +2118,17 @@ pub fn attach_placements(
     h: &dyn crate::hypr::HyprCtl,
 ) -> Result<()> {
     topo.placements = match crate::desktop::placements_with_incarnation(h, tmux)? {
-        Some((incarnation, ps)) if topo.server.as_deref() == Some(incarnation.as_str()) => Some(ps),
-        _ => None,
+        Some((incarnation, ps)) if topo.server.as_deref() == Some(incarnation.as_str()) => {
+            crate::desktop::Placements::Known(ps)
+        }
+        Some(_) => crate::desktop::Placements::Unknown(
+            "the compositor's placement was read from a different tmux server \
+             incarnation than the topology beside it"
+                .to_string(),
+        ),
+        None => crate::desktop::Placements::Unknown(
+            "the compositor or the tmux server could not be read".to_string(),
+        ),
     };
     Ok(())
 }

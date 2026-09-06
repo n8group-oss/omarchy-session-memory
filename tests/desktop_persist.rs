@@ -1,6 +1,6 @@
 //! Placement survives a snapshot, and a distrusted compositor writes nothing.
 
-use osm::desktop::{self, Placement};
+use osm::desktop::{self, Placement, Placements};
 use osm::{capture, db, tmux::Tmux};
 
 mod common;
@@ -36,7 +36,7 @@ fn placement_is_stored_with_the_snapshot_and_read_back_intact() {
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
 
     let mut topo = capture::collect(&t).unwrap();
-    topo.placements = Some(vec![place("alpha", "7", "HDMI-A-2")]);
+    topo.placements = Placements::Known(vec![place("alpha", "7", "HDMI-A-2")]);
     let snap = capture::write_topology(&mut conn, &topo, "test", None).unwrap();
 
     let back = desktop::placements_of(&conn, snap).unwrap();
@@ -69,14 +69,72 @@ fn a_distrusted_compositor_writes_no_placement_rather_than_an_empty_one() {
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
 
     let mut topo = capture::collect(&t).unwrap();
-    topo.placements = None;
+    topo.placements = Placements::Unknown("the compositor stopped answering".into());
     let snap = capture::write_topology(&mut conn, &topo, "test", None).unwrap();
 
     assert!(desktop::placements_of(&conn, snap).unwrap().is_empty());
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM terminal_windows", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(rows, 0, "None must write nothing at all");
+    assert_eq!(rows, 0, "unknown must write nothing at all");
+
+    common::shutdown(&t);
+}
+
+/// The three placement answers are three different rows on disk.
+///
+/// Everything downstream — retention deciding what it may delete, restore
+/// deciding whether it has a layout, the panel deciding what to tell the user
+/// — reads this one column. If `Unknown` and `Known(vec![])` land on disk as
+/// the same thing, all three of them are back to guessing from "there are no
+/// `terminal_windows` rows", which is the ambiguity this whole change exists
+/// to remove.
+#[test]
+fn the_three_placement_answers_are_stored_apart() {
+    let t = server("tristate");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
+
+    let mut topo = capture::collect(&t).unwrap();
+
+    topo.placements = Placements::Known(vec![place("alpha", "7", "DP-1")]);
+    let known = capture::write_topology(&mut conn, &topo, "test", None).unwrap();
+
+    topo.placements = Placements::Known(vec![]);
+    let empty = capture::write_topology(&mut conn, &topo, "test", None).unwrap();
+
+    topo.placements = Placements::Unknown("hyprctl -j clients timed out".into());
+    let unknown = capture::write_topology(&mut conn, &topo, "test", None).unwrap();
+
+    topo.placements = Placements::Off;
+    let off = capture::write_topology(&mut conn, &topo, "test", None).unwrap();
+
+    assert_eq!(desktop::placement_state_of(&conn, known).unwrap(), "known");
+    assert_eq!(
+        desktop::placement_state_of(&conn, empty).unwrap(),
+        "known",
+        "the compositor answered and there were no terminal windows; that is \
+         an answer, not a gap"
+    );
+    assert_eq!(
+        desktop::placement_state_of(&conn, unknown).unwrap(),
+        "unknown",
+        "a capture that could not read placement must say so, and must not be \
+         readable as a machine with no windows"
+    );
+    assert_eq!(
+        desktop::placement_state_of(&conn, off).unwrap(),
+        "disabled",
+        "nobody asked the compositor; nothing is owed and nothing failed"
+    );
+
+    for id in [empty, unknown, off] {
+        assert!(
+            desktop::placements_of(&conn, id).unwrap().is_empty(),
+            "snapshot {id} must hold no placement rows"
+        );
+    }
+    assert_eq!(desktop::placements_of(&conn, known).unwrap().len(), 1);
 
     common::shutdown(&t);
 }
@@ -90,7 +148,7 @@ fn a_placement_for_a_session_not_in_the_snapshot_is_kept_but_unlinked() {
     let mut conn = db::open(&tmp.path().join("state.db")).unwrap();
 
     let mut topo = capture::collect(&t).unwrap();
-    topo.placements = Some(vec![place("ghost", "4", "DP-1")]);
+    topo.placements = Placements::Known(vec![place("ghost", "4", "DP-1")]);
     let snap = capture::write_topology(&mut conn, &topo, "test", None).unwrap();
 
     let linked: Option<i64> = conn

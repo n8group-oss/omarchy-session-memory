@@ -2249,7 +2249,7 @@ fn publish_current_boot(
         // publish a replacement snapshot with no `terminal_windows` at all,
         // retire the source that held them, and leave the next reboot with no
         // placement to restore. The feature undid itself once per boot.
-        if let Some(ps) = topo.placements.as_deref() {
+        if let Some(ps) = topo.placements.known() {
             crate::desktop::write_placements_in(&tx, published_id, ps)?;
         }
         // Every conversation the resume pass confirmed has had its debt paid,

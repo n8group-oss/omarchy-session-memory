@@ -266,8 +266,10 @@ fn placement_read_from_a_replacement_server_is_not_attached_to_the_first_ones_to
     };
     let mut topo = topo;
     osm::capture::attach_placements(&mut topo, &t, &f).unwrap();
-    assert_eq!(
-        topo.placements, None,
-        "placement read from server {second} was attached to server {first}'s topology"
+    assert!(
+        topo.placements.is_unknown(),
+        "placement read from server {second} was attached to server {first}'s \
+         topology: {:?}",
+        topo.placements
     );
 }

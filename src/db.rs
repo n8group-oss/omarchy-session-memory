@@ -42,9 +42,20 @@ use std::path::{Path, PathBuf};
 /// | 8       | migrated in place (one added column, nullable: `window_rows.auto_named`) |
 /// | 9       | migrated in place (adds `terminal_windows.session_name`, backfilled from the link) |
 /// | 10      | migrated in place (replaces the never-written `agent_sessions.summary` with `title` and `title_source`, and drops its `alive`) |
-/// | 11      | opened in place |
+/// | 11      | migrated in place (one added column with a default: `snapshots.placement_state`) |
+/// | 12      | opened in place |
 /// | unversioned (osm tables, no `schema_version`) | preserved as `state.db.unversioned.bak` |
 /// | newer than this build | preserved as `state.db.v<N>.bak` |
+///
+/// 11 is migrated by adding one column with a default, and the default is
+/// `'known'` rather than the cautious-looking `'unknown'`. Under 11 a capture
+/// whose placement could not be read was *refused*, so no row on disk can be
+/// an unknown-placement snapshot: every one of them either carries what the
+/// compositor reported or was taken with the compositor deliberately not
+/// asked. Stamping them `unknown` would hand retention a whole database of
+/// rows to hold back and would send every restore of one looking elsewhere
+/// for placement it already has — a doubt the build that wrote them never
+/// had.
 ///
 /// 10 is migrated by renaming a column nothing ever wrote. `summary` promised
 /// an opt-in paraphrase of a conversation's contents, which was never built;
@@ -75,7 +86,7 @@ use std::path::{Path, PathBuf};
 /// rather than linking the wrong window. What matters is that the file is still there
 /// afterwards. [`preserved`] reports the situation and `osm status --json`
 /// prints it, so a preserved database is visible rather than silent.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -104,7 +115,26 @@ CREATE TABLE IF NOT EXISTS snapshots (
   -- name windows on the server that produced them, and every server started
   -- on a socket hands out `@0`, `@1`, … from zero again. Comparing boot ids
   -- was not enough — a tmux restart *within* one boot leaves them equal.
-  server TEXT
+  server TEXT,
+  -- What this snapshot knows about where its sessions' terminal windows
+  -- were. Three answers, and the third is the point:
+  --
+  --   'known'    the compositor and the tmux server both answered. The
+  --              `terminal_windows` rows below are the whole of it, and
+  --              *no rows* means there genuinely were no such windows.
+  --   'unknown'  one of them could not be read, or they described different
+  --              tmux servers. The absence of rows says nothing at all.
+  --   'disabled' the compositor was never asked -- `restore.place_windows`
+  --              is off, or this capture had no compositor to ask.
+  --
+  -- Without this column the three collapse into "there are no rows", and a
+  -- snapshot recorded during a compositor hiccup is indistinguishable from a
+  -- machine that genuinely has no windows. Retention would then prune the
+  -- last snapshot that knew where the user's windows belonged in favour of
+  -- one that never knew -- the same class of loss the `unresolved` column
+  -- above exists to prevent, one level up.
+  placement_state TEXT NOT NULL DEFAULT 'known'
+                  CHECK (placement_state IN ('known','unknown','disabled'))
 );
 
 CREATE TABLE IF NOT EXISTS session_rows (
@@ -1333,6 +1363,14 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
                     }
                 }
                 version = 11;
+            }
+            // Unknown placement. One added column with a default; see the
+            // module docs for why the default is `known`.
+            11 => {
+                tx.execute_batch(
+                    "ALTER TABLE snapshots ADD COLUMN placement_state TEXT NOT NULL                      DEFAULT 'known'                      CHECK (placement_state IN ('known','unknown','disabled'))",
+                )?;
+                version = 12;
             }
             _ => return Ok(false),
         }
