@@ -919,11 +919,22 @@ pub fn placement_for_restore(
         return Ok(PlacementForRestore::Own(placements_of(conn, snapshot_id)?));
     }
 
-    // Same boot, not later than the source, and it has to actually hold
-    // windows: a `known` snapshot with no rows is an answered empty desktop,
-    // which carries nothing and must not stop the search either — the user's
-    // windows were somewhere before it, and that record is still the best one
-    // there is.
+    // Same boot, and not later than the source. The *newest* earlier `known`
+    // snapshot wins, and it wins whether or not it holds any windows.
+    //
+    // Requiring rows here — `AND EXISTS (SELECT 1 FROM terminal_windows …)`,
+    // which is what this used to say — let the search walk straight through
+    // an answered empty desktop. The history that breaks is ordinary: a
+    // `known` layout, the user closes every terminal, a `known` capture with
+    // no rows, then a capture whose placement could not be read. Skipping the
+    // empty answer carried the layout from *before* the user cleared their
+    // desktop and put those terminals back.
+    //
+    // A `known` snapshot with no rows is not a gap in the record. It is the
+    // compositor having been asked and having said there were none, and that
+    // is the most recent thing anybody knows about where the windows were. It
+    // therefore stops the search exactly as a populated one does, and what it
+    // carries forward — nothing — is the answer.
     let fallback: Option<(i64, i64)> = conn
         .query_row(
             "SELECT s.id, s.taken_at FROM snapshots s
@@ -931,7 +942,6 @@ pub fn placement_for_restore(
                AND s.state <> 'building'
                AND s.placement_state = 'known'
                AND (s.taken_at < ?2 OR (s.taken_at = ?2 AND s.id < ?3))
-               AND EXISTS (SELECT 1 FROM terminal_windows w WHERE w.snapshot_id = s.id)
              ORDER BY s.taken_at DESC, s.id DESC
              LIMIT 1",
             rusqlite::params![boot_id, taken_at, snapshot_id],

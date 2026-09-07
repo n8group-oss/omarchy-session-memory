@@ -252,12 +252,19 @@ pub fn prune(conn: &Connection, keep: usize, current_boot: &str) -> Result<usize
          -- the same reason as above: on a database that has never recorded a
          -- placement the subquery is NULL, and `<>` would make the whole
          -- WHERE never match.
+         --
+         -- Whether it holds any `terminal_windows` rows is deliberately not
+         -- asked. This clause exists to keep alive the row
+         -- `desktop::placement_for_restore` will read, and that function stops
+         -- at the newest earlier `known` snapshot, empty or not: a compositor
+         -- that was asked and answered that there are none has said where
+         -- the windows are. Requiring rows here pinned the layout such an
+         -- answer had superseded, let the answer itself age out, and so
+         -- handed the next carry-forward a desktop the user had cleared.
          AND id IS NOT (
            SELECT s.id FROM snapshots s
            WHERE s.state <> 'building'
              AND s.placement_state = 'known'
-             AND EXISTS (SELECT 1 FROM terminal_windows w
-                         WHERE w.snapshot_id = s.id)
            ORDER BY s.taken_at DESC, s.id DESC
            LIMIT 1
          )
@@ -268,8 +275,6 @@ pub fn prune(conn: &Connection, keep: usize, current_boot: &str) -> Result<usize
            WHERE s.state <> 'building'
              AND s.boot_id <> ?2
              AND s.placement_state = 'known'
-             AND EXISTS (SELECT 1 FROM terminal_windows w
-                         WHERE w.snapshot_id = s.id)
            ORDER BY s.taken_at DESC, s.id DESC
            LIMIT 1
          )",

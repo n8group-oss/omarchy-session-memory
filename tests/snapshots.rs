@@ -410,3 +410,44 @@ fn prune_keeps_the_previous_boots_layout_that_a_restore_would_borrow() {
     let source = snapshots::select_restore_source(&conn, "boot-now").unwrap();
     assert_eq!(source, Some(25));
 }
+
+/// The exemption follows the *newest* `known` snapshot, and an answered empty
+/// desktop is one of those.
+///
+/// Retention and carry-forward have to agree on which row is the record,
+/// because retention is what keeps that row alive for carry-forward to read.
+/// `placement_for_restore` stops at the newest earlier `known` snapshot,
+/// empty or not — a compositor that was asked and said "there are no terminal
+/// windows" has answered. If retention instead holds back the newest snapshot
+/// with *rows* in it, the two disagree exactly when it matters: the empty
+/// answer ages out, the layout it superseded is pinned in place for ever, and
+/// the next unknown-placement restore carries a desktop the user cleared an
+/// hour ago.
+#[test]
+fn prune_exempts_the_newest_known_snapshot_even_with_no_windows_in_it() {
+    let (_t, conn) = fresh();
+    insert_placed(&conn, 1, 10, "boot-old", "known", true);
+    // The user closes every terminal, and the next capture answers.
+    insert_placed(&conn, 2, 20, "boot-old", "known", false);
+    for i in 3..=25 {
+        insert_placed(&conn, i, i * 10, "boot-old", "unknown", false);
+    }
+
+    snapshots::prune(&conn, 20, "boot-old").unwrap();
+
+    let ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM snapshots WHERE id <= 2 ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<i64>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        ids,
+        vec![2],
+        "retention kept the layout the empty answer superseded and dropped the \
+         answer itself, so a carry-forward will find the stale layout again"
+    );
+}

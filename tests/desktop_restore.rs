@@ -1168,3 +1168,63 @@ fn placement_switched_off_owes_nothing_even_with_no_rows() {
     assert!(out.is_empty(), "{out:?}");
     assert!(!degraded(&out));
 }
+
+/// A `known` capture with no windows in it stops the carry-forward search,
+/// and the older layout behind it stays where it is.
+///
+/// The three-snapshot history this is about, in order:
+///
+///   1. `known`, with `dev` on workspace 9 — the user's terminals.
+///   2. the user closes every terminal, and the next capture answers
+///      `known` with no rows: the compositor was asked and there were none.
+///   3. the capture after that cannot read placement at all — `unknown`.
+///
+/// Restoring 3 must not put `dev`'s terminal back. Snapshot 2 is not a gap in
+/// the record to be searched past: it is the compositor's answer that the
+/// desktop is empty, and it is *newer* than the layout behind it. Reaching
+/// through it to snapshot 1 resurrects terminals the user deliberately closed
+/// and calls it a restore.
+///
+/// `a_known_empty_placement_is_never_backfilled` above is the same rule for
+/// the snapshot being restored itself; this is the rule for the snapshot a
+/// carry-forward walks back through, which is where it was missing.
+#[test]
+fn a_known_empty_capture_stops_the_carry_forward_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    seed_at(&conn, 100, "boot-a", "known", &["dev"]);
+    let cleared = seed_at(&conn, 200, "boot-a", "known", &[]);
+    let blind = seed_at(&conn, 300, "boot-a", "unknown", &[]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert!(
+        !out.iter().any(|(s, _)| s == "dev"),
+        "a layout from before the user cleared their desktop was carried past \
+         snapshot {cleared}, which had already answered that there were no \
+         terminal windows: {out:?}"
+    );
+    assert!(
+        sp.argv.borrow().is_empty(),
+        "a terminal the user had closed was spawned again: {:?}",
+        sp.argv.borrow()
+    );
+    assert!(
+        !degraded(&out),
+        "an answered, empty desktop is a complete answer, so a restore that \
+         puts no window back has not fallen short: {out:?}"
+    );
+}
