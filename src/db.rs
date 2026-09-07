@@ -1211,6 +1211,171 @@ fn open_connection(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Every table that belongs to a parent, and the column that says which one.
+///
+/// The order is top-down, because it is the order [`repair`] deletes in: a
+/// snapshot's rows go first and the triggers carry the removal down, leaving
+/// the entries below to catch anything that was already stranded on its own.
+const CHILD_RELATIONS: [(&str, &str, &str, &str); 8] = [
+    ("terminal_windows", "snapshot_id", "snapshots", "id"),
+    ("window_rows", "snapshot_id", "snapshots", "id"),
+    ("session_rows", "snapshot_id", "snapshots", "id"),
+    ("restore_attempts", "snapshot_id", "snapshots", "id"),
+    ("pane_rows", "window_row_id", "window_rows", "row_id"),
+    (
+        "session_window_links",
+        "session_row_id",
+        "session_rows",
+        "row_id",
+    ),
+    ("restore_objects", "attempt_id", "restore_attempts", "id"),
+    ("restore_window_map", "attempt_id", "restore_attempts", "id"),
+];
+
+/// Rows that name a parent which is not on record.
+///
+/// Zero on a healthy database, and that is the point: this is the cheap
+/// question [`open`] asks before it considers writing anything. Every column
+/// involved is `NOT NULL` and every parent key is a primary key, so `NOT IN`
+/// cannot be confused by a null.
+///
+/// It costs one query over tables bounded by the retention window — a few
+/// hundred rows — on every `osm` process, which includes every tmux hook and
+/// an `osm status` the panel polls every five seconds. That is the price of
+/// never again discovering this state 83 minutes late.
+pub fn orphan_rows(conn: &Connection) -> Result<i64> {
+    let terms: Vec<String> = CHILD_RELATIONS
+        .iter()
+        .map(|(child, column, parent, key)| {
+            format!(
+                "(SELECT COUNT(*) FROM {child}
+                   WHERE {column} NOT IN (SELECT {key} FROM {parent}))"
+            )
+        })
+        .collect();
+    // `session_window_links` hangs off two parents; the loop above covers one
+    // of them.
+    let sql = format!(
+        "SELECT {} + (SELECT COUNT(*) FROM session_window_links
+                        WHERE window_row_id NOT IN (SELECT row_id FROM window_rows)
+                          AND session_row_id IN (SELECT row_id FROM session_rows))",
+        terms.join(" + ")
+    );
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+}
+
+/// Every row a snapshot's subtree can hold, counted. The difference across a
+/// repair is what it removed — `sqlite3_changes` would not do, because it
+/// does not count the rows a trigger deletes.
+fn child_rows(conn: &Connection) -> Result<i64> {
+    let mut tables: Vec<&str> = CHILD_RELATIONS.iter().map(|(c, _, _, _)| *c).collect();
+    tables.push("session_window_links");
+    tables.sort_unstable();
+    tables.dedup();
+    let sql = format!(
+        "SELECT {}",
+        tables
+            .iter()
+            .map(|t| format!("(SELECT COUNT(*) FROM {t})"))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    );
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+}
+
+/// A repair [`open`] had to perform: when, and how many rows it removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Repair {
+    /// Epoch seconds.
+    pub at: i64,
+    pub rows: i64,
+}
+
+/// The last repair this database needed, or `None` if it has never needed
+/// one.
+///
+/// Reported by `osm status --json`. A repair is not routine maintenance: it
+/// means something removed a snapshot and left its rows, which is the
+/// condition that took the maintainer's capture down — so it is a fact the
+/// panel shows rather than a line in a log nobody reads.
+pub fn last_repair(conn: &Connection) -> Option<Repair> {
+    let read = |key: &str| -> Option<i64> {
+        conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|v| v.parse().ok())
+    };
+    Some(Repair {
+        at: read("repaired_at")?,
+        rows: read("repaired_rows")?,
+    })
+}
+
+/// Clear every row whose owner is gone, and record that it had to be done.
+///
+/// # Why this exists at all
+///
+/// The two guards above stop this state being created and stop it being
+/// fatal, and neither reaches a file that is already in it. Anyone who
+/// installed v0.1.0 can be holding one — and on such a file the id sequence
+/// resumes at the highest surviving snapshot, which is precisely the id the
+/// stranded rows claim, so the first capture after the upgrade collides with
+/// them exactly as it did before. The rows are unreachable by anything else:
+/// every read in this engine reaches them through `snapshots`, so what is
+/// deleted here is not data the user can see, has, or could get back.
+///
+/// # Why a healthy database is never written to
+///
+/// `open` runs in every `osm` process: every tmux hook, and an `osm status`
+/// the panel polls every five seconds. Writing on each of them would take the
+/// write lock away from captures for nothing, grow the WAL, and tell a widget
+/// the database had had to be put right when it had not. So the question is
+/// asked first, read-only, and the transaction below is opened only when the
+/// answer is not zero.
+fn repair(conn: &mut Connection) -> Result<Option<Repair>> {
+    if orphan_rows(conn)? == 0 {
+        return Ok(None);
+    }
+    let before = child_rows(conn)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have repaired it while this one queued for the
+    // migration lock — or, without the lock, between the question and here.
+    if orphan_rows(&tx)? == 0 {
+        return Ok(None);
+    }
+    for (child, column, parent, key) in CHILD_RELATIONS {
+        tx.execute(
+            &format!(
+                "DELETE FROM {child}
+                  WHERE {column} NOT IN (SELECT {key} FROM {parent})"
+            ),
+            [],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM session_window_links
+          WHERE window_row_id NOT IN (SELECT row_id FROM window_rows)",
+        [],
+    )?;
+    // Not a delete: `terminal_windows.session_row_id` is `ON DELETE SET
+    // NULL`, because a placement whose session row is gone is still a record
+    // of where a window was. A stale link is put back to what the cascade
+    // would have left.
+    tx.execute(
+        "UPDATE terminal_windows SET session_row_id = NULL
+          WHERE session_row_id IS NOT NULL
+            AND session_row_id NOT IN (SELECT row_id FROM session_rows)",
+        [],
+    )?;
+    let removed = before - child_rows(&tx)?;
+    let at = crate::boot::now_epoch();
+    set_meta(&tx, "repaired_at", &at.to_string())?;
+    set_meta(&tx, "repaired_rows", &removed.to_string())?;
+    tx.commit()?;
+    Ok(Some(Repair { at, rows: removed }))
+}
+
 fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -1636,6 +1801,19 @@ pub fn open(path: &Path) -> Result<Connection> {
     // to be recorded: the database it moved aside is nowhere the engine looks
     // any more, and `osm status --json` is the only thing that says so.
     create_schema(&mut conn, preserved.or(recovered))?;
+
+    // After the schema, so the tables and the delete triggers are there, and
+    // still under the migration lock, so two openers cannot both decide to
+    // repair the same file. A database that needs nothing is not written to.
+    if let Some(repair) = repair(&mut conn)? {
+        eprintln!(
+            "osm: {}: cleared {} row(s) belonging to snapshots that are no longer \
+             on record; something deleted them without taking their rows with them \
+             (see `osm status --json`)",
+            path.display(),
+            repair.rows
+        );
+    }
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(conn)

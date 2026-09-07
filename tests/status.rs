@@ -803,3 +803,83 @@ fn the_newest_snapshot_reports_what_it_knows_about_placement() {
     }
     assert_eq!(env.status()["snapshot"]["placement"], "known");
 }
+
+// ---------------------------------------------------------------------------
+// The wedge, made visible.
+//
+// The maintainer's panel read "captures are fresh · 40 failing in a row" for
+// 83 minutes while the real reason — a UNIQUE violation against rows that
+// belonged to snapshots that were gone — was in the journal only, where the
+// tmux hooks that hit it the most send their output to /dev/null. The
+// database's own consistency was never part of the report at all, so nothing
+// a user could look at said what was wrong or that anything had been done
+// about it.
+// ---------------------------------------------------------------------------
+
+/// A database holding rows whose snapshot is gone is repaired by the open
+/// `status` itself does, and the report says so.
+///
+/// Both fields matter and they answer different questions. `orphan_rows` is
+/// the condition *now*: anything but zero means the next capture is one id
+/// away from the wedge. `repaired` is the record that it happened, which is
+/// the part a user can act on — something removed a snapshot without taking
+/// its rows, and that is worth knowing even after osm has cleared up.
+#[test]
+fn a_database_that_had_to_be_repaired_says_so() {
+    let env = Env::new("repaired");
+    let path = env.state_dir().join("state.db");
+    {
+        let conn = osm::db::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete'),
+                      (2, 200, 'boot-a', 'manual', 'complete');
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (10, 1, '$0', 'kept'), (11, 2, '$0', 'doomed');
+             INSERT INTO window_rows (row_id, snapshot_id, tmux_window_id, name, layout)
+               VALUES (20, 1, '@0', 'w', 'l'), (21, 2, '@0', 'w', 'l');",
+        )
+        .unwrap();
+    }
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        raw.execute_batch("DROP TRIGGER IF EXISTS snapshots_cascade_delete")
+            .unwrap();
+        raw.execute("DELETE FROM snapshots WHERE id = 2", [])
+            .unwrap();
+    }
+
+    let v = env.status();
+    let db = &v["database"];
+    assert_eq!(
+        db["orphan_rows"], 0,
+        "the open behind this report must have cleared them: {v}"
+    );
+    assert_eq!(
+        db["repaired"]["rows"], 2,
+        "and must say how many it cleared: {v}"
+    );
+    assert!(
+        db["repaired"]["at"].as_i64().unwrap_or(0) > 0,
+        "and when: {v}"
+    );
+}
+
+/// A healthy database reports no repair at all — `null`, not a repair of zero
+/// rows.
+///
+/// A widget that shows "the database was repaired" every five seconds on a
+/// machine where nothing ever went wrong is the same defect as one that shows
+/// nothing when something did.
+#[test]
+fn a_healthy_database_reports_no_repair() {
+    let env = Env::new("norepair");
+    let v = env.status();
+    let db = &v["database"];
+    assert_eq!(db["orphan_rows"], 0, "{v}");
+    assert!(
+        db["repaired"].is_null(),
+        "a database that has never needed a repair must not report one: {v}"
+    );
+}

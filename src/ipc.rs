@@ -57,6 +57,30 @@ pub struct DatabaseStatus {
     /// upgraded and typed `osm status` is exactly the person who needs to be
     /// told.
     pub preserved: Option<PreservedDatabase>,
+    /// Rows in the database right now that belong to a snapshot which is not
+    /// there. Zero in every ordinary case, and reported rather than assumed:
+    /// a non-zero count is the condition that took the maintainer's capture
+    /// down for 83 minutes, and until this field existed nothing a user could
+    /// look at said the database was in it. `null` when the database could
+    /// not be read at all.
+    pub orphan_rows: Option<i64>,
+    /// The last time an `open` had to clear such rows, `null` if it never
+    /// has.
+    ///
+    /// Kept after the fact on purpose. osm repairs the file itself, so the
+    /// count above goes back to zero immediately — but *something removed a
+    /// snapshot and left its rows behind*, and that is worth a user's
+    /// attention whether or not osm has already tidied up after it.
+    pub repaired: Option<RepairedRows>,
+}
+
+/// A repair [`crate::db::open`] performed on the snapshot database.
+#[derive(Debug, Serialize)]
+pub struct RepairedRows {
+    /// Epoch seconds.
+    pub at: i64,
+    /// How many rows it removed.
+    pub rows: i64,
 }
 
 /// A database an incompatible schema version pushed aside.
@@ -311,6 +335,11 @@ pub struct DatabaseSummary {
     /// A database an incompatible schema version pushed aside, if there is
     /// one.
     pub preserved: Option<crate::db::Preserved>,
+    /// Rows belonging to a snapshot that is not on record. Read here, with
+    /// everything else, so it describes the same moment as the counts above.
+    pub orphan_rows: i64,
+    /// The last repair `open` had to perform on this database.
+    pub repaired: Option<crate::db::Repair>,
     /// The newest snapshot worth restoring, or `None`.
     pub snapshot: Option<SnapshotSummary>,
     /// Its sessions, empty when there is no snapshot.
@@ -388,11 +417,15 @@ pub fn summarize(
         })?;
 
     let preserved = crate::db::preserved(&read);
+    let orphan_rows = crate::db::orphan_rows(&read)?;
+    let repaired = crate::db::last_repair(&read);
     let Some((id, taken_at, state, placement)) = newest else {
         return Ok(DatabaseSummary {
             snapshots,
             newest_snapshot_at,
             preserved,
+            orphan_rows,
+            repaired,
             snapshot: None,
             sessions: Vec::new(),
         });
@@ -402,6 +435,8 @@ pub fn summarize(
         snapshots,
         newest_snapshot_at,
         preserved,
+        orphan_rows,
+        repaired,
         snapshot: Some(SnapshotSummary {
             id,
             taken_at,

@@ -228,7 +228,22 @@ BarWidget {
     "error": "string-or-null",
     "snapshots": "number-or-null",
     "newest_snapshot_at": "number-or-null",
-    "preserved": "object-or-null"
+    "preserved": "object-or-null",
+    // Rows belonging to a snapshot that is not on record. Zero on every
+    // healthy machine, and required rather than optional for the usual
+    // reason: absent read as zero would be this plugin saying the database
+    // is consistent on the strength of an engine that never claimed it.
+    // Non-zero means the next capture is one id away from failing on a
+    // UNIQUE constraint and staying there.
+    "orphan_rows": "number-or-null",
+    // The last time `osm` had to clear such rows, `null` if it never has.
+    "repaired": "object-or-null"
+  })
+
+  // A repair the engine performed on the snapshot database.
+  readonly property var repairedFields: ({
+    "at": "number",
+    "rows": "number"
   })
 
   // `present`, `snapshots` and `error` are what is actually in the preserved
@@ -394,6 +409,11 @@ BarWidget {
     if (value.database.preserved !== null) {
       var pres = fieldsFault(value.database.preserved, root.preservedFields, null)
       if (pres !== "") return "database.preserved." + pres
+    }
+
+    if (value.database.repaired !== null) {
+      var rep = fieldsFault(value.database.repaired, root.repairedFields, null)
+      if (rep !== "") return "database.repaired." + rep
     }
 
     // `enabled` is the list of agent kinds the menu prints verbatim; a
