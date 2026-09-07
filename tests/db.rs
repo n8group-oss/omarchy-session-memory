@@ -995,3 +995,110 @@ fn a_v11_database_gains_the_placement_state_column_as_known() {
         .unwrap();
     assert_eq!(version, osm::db::SCHEMA_VERSION);
 }
+
+/// A v12 database is rebuilt so its snapshot ids are `AUTOINCREMENT`, and
+/// **every snapshot keeps the id it had**.
+///
+/// The id is not an internal detail: every `snapshot_id` in the database is
+/// one, so renumbering would detach every session, window and placement from
+/// the snapshot it belongs to. The rebuild copies the ids across explicitly,
+/// which also seeds `sqlite_sequence` with the highest of them — so the next
+/// capture continues the user's history rather than restarting it at 1 on top
+/// of rows that are still there.
+#[test]
+fn a_v12_database_keeps_every_snapshot_id_and_stops_reusing_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+               state TEXT NOT NULL
+                     CHECK (state IN ('building','complete','restore_in_progress',
+                                      'restored','failed')),
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+               server TEXT,
+               placement_state TEXT NOT NULL DEFAULT 'known'
+                               CHECK (placement_state IN ('known','unknown','disabled')));
+             CREATE TABLE session_rows (
+               row_id INTEGER PRIMARY KEY,
+               snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+               tmux_session_id TEXT NOT NULL, name TEXT NOT NULL,
+               active_window_id TEXT,
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)));
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state, placement_state)
+               VALUES (3706, 100, 'boot-a', 'timer', 'complete', 'known'),
+                      (3716, 200, 'boot-a', 'timer', 'complete', 'unknown');
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (1, 3706, '$0', 'alpha'), (2, 3716, '$0', 'alpha');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '12');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v12 database must open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "a migratable database must not be moved aside"
+    );
+
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM snapshots ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![3706, 3716], "every snapshot keeps its own id");
+
+    // The rest of each row travelled with it, including the column the
+    // previous migration added.
+    let placement: String = conn
+        .query_row(
+            "SELECT placement_state FROM snapshots WHERE id = 3716",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(placement, "unknown");
+
+    // And the children still name the snapshots they always named.
+    let attached: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_rows s JOIN snapshots n ON n.id = s.snapshot_id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(attached, 2, "the rebuild must not detach the child rows");
+
+    // The highest id on record is gone, and the id it had must not come back.
+    conn.execute("DELETE FROM snapshots WHERE id = 3716", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO snapshots (taken_at, boot_id, reason, state)
+         VALUES (300, 'boot-a', 'timer', 'complete')",
+        [],
+    )
+    .unwrap();
+    let next: i64 = conn
+        .query_row("SELECT MAX(id) FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        next, 3717,
+        "the migrated sequence must continue past every id the database has \
+         ever handed out, not restart from what is left"
+    );
+
+    let version: u32 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0).map(|v| v.parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(version, osm::db::SCHEMA_VERSION);
+}

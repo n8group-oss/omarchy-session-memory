@@ -43,7 +43,8 @@ use std::path::{Path, PathBuf};
 /// | 9       | migrated in place (adds `terminal_windows.session_name`, backfilled from the link) |
 /// | 10      | migrated in place (replaces the never-written `agent_sessions.summary` with `title` and `title_source`, and drops its `alive`) |
 /// | 11      | migrated in place (one added column with a default: `snapshots.placement_state`) |
-/// | 12      | opened in place |
+/// | 12      | migrated in place (`snapshots` is rebuilt so its id is `AUTOINCREMENT`) |
+/// | 13      | opened in place |
 /// | unversioned (osm tables, no `schema_version`) | preserved as `state.db.unversioned.bak` |
 /// | newer than this build | preserved as `state.db.v<N>.bak` |
 ///
@@ -86,11 +87,29 @@ use std::path::{Path, PathBuf};
 /// rather than linking the wrong window. What matters is that the file is still there
 /// afterwards. [`preserved`] reports the situation and `osm status --json`
 /// prints it, so a preserved database is visible rather than silent.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS snapshots (
-  id       INTEGER PRIMARY KEY,
+  -- AUTOINCREMENT, and it is the whole of what stops one class of outage.
+  --
+  -- A plain `INTEGER PRIMARY KEY` is a rowid, and SQLite allocates one as
+  -- `max(id) + 1`: delete the highest snapshot and the next capture is handed
+  -- its id back. Every table below is keyed by this id and `window_rows` is
+  -- `UNIQUE (snapshot_id, tmux_window_id)`, so a single row that outlived its
+  -- snapshot turns that reuse into a permanent wedge — the reissued id meets
+  -- the stale row, the insert fails, and the *next* capture is handed the
+  -- same id again, for ever. That is the maintainer's 83-minute outage: 198
+  -- rows claiming snapshots 3717…3725, a highest surviving snapshot of 3716,
+  -- and 41 systemd restarts that could not have helped.
+  --
+  -- The cost is one `sqlite_sequence` row and an id that is never reissued
+  -- even when the table is emptied, which is exactly the property wanted:
+  -- with it, no stale row anywhere can collide with a new snapshot, whatever
+  -- put it there. It is not a substitute for the rows not being there — see
+  -- the delete trigger below and `db::repair` — it is what makes their
+  -- presence survivable rather than fatal.
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
   taken_at INTEGER NOT NULL,
   boot_id  TEXT    NOT NULL,
   reason   TEXT    NOT NULL,
@@ -1373,6 +1392,52 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
                      CHECK (placement_state IN ('known','unknown','disabled'))",
                 )?;
                 version = 12;
+            }
+            // Snapshot ids that are never reissued.
+            //
+            // `AUTOINCREMENT` cannot be added by `ALTER TABLE`, so the table
+            // is rebuilt and every row copied across with the id it already
+            // has: a snapshot keeps its identity, and everything that
+            // references it — every `snapshot_id` in this database — keeps
+            // pointing at the same row. The rebuild runs with foreign keys
+            // off and `legacy_alter_table` on, exactly as the 5 → 6 rebuild
+            // does and for the same two reasons: the children must not be
+            // cascaded away by the `DROP`, and they must go on naming
+            // `snapshots` across the rename.
+            //
+            // Inserting explicit ids into an `AUTOINCREMENT` table seeds
+            // `sqlite_sequence` with the highest of them, so the first
+            // snapshot written afterwards continues from where the database
+            // left off rather than from 1. An empty table seeds nothing,
+            // which is right: there is no id to avoid.
+            12 => {
+                tx.execute_batch(
+                    "CREATE TABLE snapshots_v13 (
+                       id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                       taken_at INTEGER NOT NULL,
+                       boot_id  TEXT    NOT NULL,
+                       reason   TEXT    NOT NULL,
+                       state    TEXT    NOT NULL
+                                CHECK (state IN ('building','complete',
+                                                 'restore_in_progress',
+                                                 'restored','failed')),
+                       unresolved INTEGER NOT NULL DEFAULT 0
+                                  CHECK (unresolved IN (0,1)),
+                       server TEXT,
+                       placement_state TEXT NOT NULL DEFAULT 'known'
+                                       CHECK (placement_state IN ('known','unknown',
+                                                                  'disabled'))
+                     );
+                     INSERT INTO snapshots_v13
+                       (id, taken_at, boot_id, reason, state, unresolved, server,
+                        placement_state)
+                       SELECT id, taken_at, boot_id, reason, state, unresolved, server,
+                              placement_state
+                       FROM snapshots;
+                     DROP TABLE snapshots;
+                     ALTER TABLE snapshots_v13 RENAME TO snapshots;",
+                )?;
+                version = 13;
             }
             _ => return Ok(false),
         }
