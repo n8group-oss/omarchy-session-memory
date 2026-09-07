@@ -377,10 +377,31 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 /// backup tool, and — inside this file — [`migrate`], which switches it off
 /// for a table rebuild. Every one of those can delete a snapshot and leave
 /// every row underneath it, and nothing but `PRAGMA foreign_key_check` will
-/// ever say so. That is how the maintainer's database came to hold 198 rows
-/// belonging to nine snapshots that were not there: 72 `window_rows`, 72
-/// `session_rows`, 54 `terminal_windows`. Combined with a reused id it took
-/// his capture down for 83 minutes, and it would never have recovered.
+/// ever say so.
+///
+/// It was the `sqlite3` shell, and the command was ordinary. A diagnostic run
+/// had recorded nine snapshots against the maintainer's live database with
+/// `reason` starting `diag-`; tidying up after itself, it ran
+///
+/// ```text
+/// sqlite3 ~/.local/state/osm/state.db \
+///   "DELETE FROM snapshots WHERE reason LIKE 'diag-%';"
+/// ```
+///
+/// at 01:36:47. That shell reports `PRAGMA foreign_keys` as `0`, so not one
+/// of the declarations above ran: the nine snapshot rows went and their 198
+/// children stayed — 72 `window_rows`, 72 `session_rows`, 54
+/// `terminal_windows`, claiming ids 3717–3725 against a highest surviving
+/// snapshot of 3716. The next capture, five seconds later at 01:36:52, was
+/// handed 3717, met them, and failed on
+/// `UNIQUE (snapshot_id, tmux_window_id)`; so did every capture for the next
+/// 83 minutes and 41 systemd restarts.
+///
+/// Nothing about that command was wrong. Deleting snapshots by their reason
+/// is a reasonable thing to want, the shell is the ordinary tool for it, and
+/// no user of this database should have to know that its integrity depends on
+/// a pragma they did not set. With the triggers below, the same command on
+/// the same shell takes all of it.
 ///
 /// A trigger is not optional in the same way. It lives in the schema, it runs
 /// for whoever is connected, and `PRAGMA recursive_triggers` does not govern

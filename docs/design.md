@@ -551,7 +551,23 @@ per-connection setting which stock SQLite defaults **off**: the `sqlite3`
 shell, anything linked against the system library, and `db::migrate` itself,
 which switches it off for a table rebuild. Any of them can delete a snapshot
 and leave every row underneath it, and nothing but `PRAGMA foreign_key_check`
-will say so. So the same relationships are written a second time as
+will say so.
+
+That is what happened, and the command was ordinary. A diagnostic run had
+recorded nine snapshots against the maintainer's live database with `reason`
+starting `diag-`; tidying up after itself, it ran
+
+```sh
+sqlite3 ~/.local/state/osm/state.db "DELETE FROM snapshots WHERE reason LIKE 'diag-%';"
+```
+
+at 01:36:47. That shell reports `PRAGMA foreign_keys` as `0`, so none of the
+declarations ran: nine snapshot rows went, 198 children stayed, and the
+capture five seconds later at 01:36:52 was handed 3717 and hit the UNIQUE
+constraint. Nothing about the command was wrong — deleting snapshots by reason
+is a reasonable thing to want, the shell is the ordinary tool for it, and no
+user of this database should have to know its integrity depends on a pragma
+they did not set. So the same relationships are written a second time as
 `AFTER DELETE` triggers, which no connection can opt out of. The foreign keys
 stay: they are the statement of intent, they still reject a child row written
 against a snapshot that is not there, and where they are enforced they do the
