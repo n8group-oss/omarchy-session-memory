@@ -275,6 +275,14 @@ QtObject {
 const NOW: i64 = 1_788_000_000;
 
 /// The error the maintainer's panel was showing, word for word.
+///
+/// Historical: capture no longer refuses a snapshot whose placement it could
+/// not read, so this exact sentence is not one the engine still produces. It
+/// is kept because the subject here is the *rendering* rule — whether a
+/// recorded error is drawn as history or as a condition — and that rule is
+/// the same for whatever text `last_error` happens to hold. What the panel
+/// now says about a placement-blind snapshot is a different line entirely;
+/// see `placementNote` in `Menu.qml`.
 const ERROR: &str = "the window placement for this capture could not be read; \
                      refusing to record a snapshot that would claim there is none";
 

@@ -250,6 +250,24 @@ pub struct SnapshotSummary {
     pub age_secs: i64,
     pub state: String,
     pub sessions: usize,
+    /// What this snapshot knows about where its sessions' terminal windows
+    /// were: `known`, `unknown` or `disabled` — the raw
+    /// `snapshots.placement_state` token, never a rendering of it.
+    ///
+    /// It lives here rather than in [`CaptureStatus`] because it is a fact
+    /// about *this snapshot*, not about the capture engine. A capture whose
+    /// placement could not be read now succeeds — it records the tmux
+    /// topology, which is the thing worth having — so the failure streak
+    /// stays clean, correctly. But the snapshot it produced does not know
+    /// where the user's windows were, and a panel showing "captures are
+    /// fresh" and nothing else would be telling the user their state is fully
+    /// recorded when part of it is not.
+    ///
+    /// `unknown` is the only one of the three that is a shortfall. `disabled`
+    /// is the user's own choice and `known` is a complete answer, empty or
+    /// not; a reader that treats either as a problem is reporting a failure
+    /// that did not happen.
+    pub placement: String,
 }
 
 // A seam for `tests::a_concurrent_capture_and_prune_cannot_split_the_summary`,
@@ -341,7 +359,7 @@ pub fn summarize(
     let read = conn.unchecked_transaction()?;
     let newest = read
         .query_row(
-            "SELECT id, taken_at, state FROM snapshots
+            "SELECT id, taken_at, state, placement_state FROM snapshots
              WHERE state <> 'building'
              ORDER BY taken_at DESC, id DESC
              LIMIT 1",
@@ -351,6 +369,7 @@ pub fn summarize(
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             },
         )
@@ -369,7 +388,7 @@ pub fn summarize(
         })?;
 
     let preserved = crate::db::preserved(&read);
-    let Some((id, taken_at, state)) = newest else {
+    let Some((id, taken_at, state, placement)) = newest else {
         return Ok(DatabaseSummary {
             snapshots,
             newest_snapshot_at,
@@ -389,6 +408,7 @@ pub fn summarize(
             age_secs: (now - taken_at).max(0),
             state,
             sessions: sessions.len(),
+            placement,
         }),
         sessions,
     })

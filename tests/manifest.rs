@@ -1112,3 +1112,66 @@ fn every_label_drawn_from_a_transcript_is_plain_text() {
         );
     }
 }
+
+/// The panel says when the newest snapshot does not know where the windows
+/// were — and does not call that a failure.
+///
+/// A capture whose placement could not be read now succeeds: it records the
+/// tmux topology, which is the part worth having. `capture` therefore reads
+/// perfectly healthy, correctly. But the snapshot it produced holds no window
+/// placement, and a panel that shows freshness alone tells the user their
+/// state is fully recorded when part of it is not.
+///
+/// So the newest-snapshot block has to read `snapshot.placement`, has to
+/// distinguish the three values it can take, and has to reserve the alarming
+/// colour for the one that is actually a shortfall. `disabled` is the user's
+/// own configuration and `known` is a complete answer, empty or not.
+#[test]
+fn the_panel_says_when_the_newest_snapshot_has_no_placement() {
+    let menu = without_comments(&qml("Menu.qml"));
+    let note = qml_function(&menu, "placementNote");
+    for token in ["unknown", "disabled"] {
+        assert!(
+            note.contains(&format!("\"{token}\"")),
+            "placementNote never tests for \"{token}\", so it cannot tell a \
+             snapshot that could not see the desktop from one that was never \
+             asked to look"
+        );
+    }
+    assert!(
+        note.contains("placement"),
+        "placementNote does not read snapshot.placement at all"
+    );
+
+    // The widget's own contract has to require the field, or an engine that
+    // stopped sending it would render as an absence rather than be rejected.
+    let widget = without_comments(&qml("BarWidget.qml"));
+    let fields = widget
+        .find("snapshotFields")
+        .map(|at| balanced_object(&widget, at))
+        .expect("BarWidget.qml declares snapshotFields");
+    assert!(
+        fields.contains("\"placement\""),
+        "the widget's snapshot contract does not require `placement`: {fields}"
+    );
+}
+
+/// The `({ … })` object literal that starts at `from`, verbatim.
+fn balanced_object(src: &str, from: usize) -> String {
+    let open = src[from..].find('{').expect("an opening brace") + from;
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    for i in open..bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return src[open..=i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced object from {from}");
+}

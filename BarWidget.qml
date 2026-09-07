@@ -309,7 +309,13 @@ BarWidget {
     "taken_at": "number",
     "age_secs": "number",
     "state": "string",
-    "sessions": "number"
+    "sessions": "number",
+    // What the snapshot knows about where its sessions' terminal windows
+    // were: "known", "unknown" or "disabled". Required, not optional: an
+    // engine that stopped sending it would leave the menu rendering an
+    // absence, and "this snapshot could not see the desktop" is exactly the
+    // fact that must never go quiet.
+    "placement": "string"
   })
 
   // `typeof` calls null an object and an array an object; neither is useful

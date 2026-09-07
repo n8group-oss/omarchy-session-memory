@@ -737,3 +737,69 @@ fn a_preserved_database_is_never_called_intact_on_the_strength_of_a_row_count() 
          to call anything in it intact: {msg}"
     );
 }
+
+/// The newest snapshot says what it knows about window placement, and a
+/// snapshot that knows nothing is not reported as a failure.
+///
+/// # Why this is on the snapshot and not in `capture`
+///
+/// A capture whose placement could not be read now succeeds — it records the
+/// tmux topology, which is the thing worth having — so `capture.last_error`
+/// and `consecutive_failures` stay clean, correctly: nothing failed. But the
+/// snapshot it produced does not know where the user's windows were, and a
+/// panel that shows only "captures are fresh" would be telling the user their
+/// state is fully recorded when part of it is not.
+///
+/// So the fact travels with the snapshot it is a fact about. `known`,
+/// `unknown` and `disabled` are three different sentences, and `unknown` is
+/// the only one of them that is a shortfall.
+#[test]
+fn the_newest_snapshot_reports_what_it_knows_about_placement() {
+    let env = Env::new("placement");
+    env.write_config("[restore]\nplace_windows = false\n");
+    let t = env.tmux();
+    let _server = Server(t.clone());
+    t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .unwrap();
+
+    assert!(env.osm().arg("snapshot").output().unwrap().status.success());
+
+    let v = env.status();
+    assert_eq!(
+        v["snapshot"]["placement"], "disabled",
+        "placement is switched off; the snapshot must say so rather than \
+         claim it looked and found nothing: {v}"
+    );
+
+    // The same snapshot, as a capture that could not read the compositor
+    // would have recorded it.
+    let db = env.state_dir().join("state.db");
+    {
+        let conn = osm::db::open(&db).unwrap();
+        conn.execute("UPDATE snapshots SET placement_state = 'unknown'", [])
+            .unwrap();
+    }
+
+    let v = env.status();
+    assert_eq!(
+        v["snapshot"]["placement"], "unknown",
+        "the newest snapshot does not know where the windows were, and \
+         nothing in the report says so: {v}"
+    );
+    assert_eq!(
+        v["capture"]["consecutive_failures"], 0,
+        "an unknown placement is not a capture failure: {v}"
+    );
+    assert!(
+        v["capture"]["last_error"].is_null(),
+        "and it must not be dressed up as one: {v}"
+    );
+    assert_eq!(v["ready"], true, "{v}");
+
+    {
+        let conn = osm::db::open(&db).unwrap();
+        conn.execute("UPDATE snapshots SET placement_state = 'known'", [])
+            .unwrap();
+    }
+    assert_eq!(env.status()["snapshot"]["placement"], "known");
+}

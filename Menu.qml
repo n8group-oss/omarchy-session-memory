@@ -516,6 +516,37 @@ Panel {
       || root.captureErrorIsCurrent(capture)
   }
 
+  // What the newest snapshot knows about where its sessions' terminal
+  // windows were, or "" when there is nothing to say.
+  //
+  // A capture whose placement could not be read no longer fails — it records
+  // the tmux topology, which is the part worth having — so `capture` reads
+  // perfectly healthy while the snapshot beside it holds no window placement.
+  // Freshness alone would then tell the user their state is fully recorded
+  // when part of it is not, which is this plugin's own failure mode pointed
+  // at their confidence.
+  //
+  // Three values, three sentences. `known` is a complete answer, empty desktop
+  // or not, and says nothing. `disabled` is the user's own configuration and
+  // is stated plainly. Only `unknown` is a shortfall.
+  function placementNote(snap) {
+    if (!snap) return ""
+    var placement = String(snap.placement || "")
+    if (placement === "unknown")
+      return "this snapshot could not read where the windows were; a restore "
+           + "will use the last layout this boot recorded, if there is one"
+    if (placement === "disabled")
+      return "window placement is switched off, so none was recorded"
+    return ""
+  }
+
+  // And the alarm colour is reserved for the one of the three that is a
+  // shortfall. Colouring "placement is switched off" as a problem reports a
+  // failure the user themselves configured.
+  function placementIsAlarming(snap) {
+    return !!snap && String(snap.placement || "") === "unknown"
+  }
+
   // A session row's placement line. Absent monitor reads "monitor unknown"
   // rather than being left blank, for the same reason as the group label.
   function placementText(session) {
@@ -1081,6 +1112,21 @@ Panel {
               color: (root.status && root.captureIsAlarming(root.status.capture))
                 ? root.urgent : root.dim
               text: root.status ? root.captureLine(root.status.capture) : ""
+            }
+
+            // What that snapshot knows about window placement. Its own line,
+            // not appended to the capture one: the capture engine is fine and
+            // saying so beside "the placement could not be read" in one
+            // sentence is how a healthy engine came to look broken once
+            // already.
+            Text {
+              visible: text !== ""
+              width: parent.width
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              color: root.placementIsAlarming(root.snapshot) ? root.urgent : root.dim
+              text: root.placementNote(root.snapshot)
             }
           }
 
