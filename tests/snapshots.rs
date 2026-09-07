@@ -366,3 +366,47 @@ fn prune_is_unchanged_when_every_snapshot_carries_placement() {
         .unwrap();
     assert_eq!(oldest, 6, "the five oldest are still the ones removed");
 }
+
+/// The layout a restore is about to borrow must survive until it has borrowed
+/// it.
+///
+/// Exemption (1) protects the snapshot a restore would rebuild *from*. When
+/// that snapshot's placement is unknown, the restore takes its window layout
+/// from an earlier snapshot of the same boot — and nothing protected *that*
+/// one. The first capture of the new boot answers its compositor perfectly
+/// well, becomes the newest snapshot carrying placement, and takes over
+/// exemption (5); the previous boot's layout is then an ordinary old row and
+/// ages out. The restore that runs a moment later finds its source, finds no
+/// placement in it, finds nothing to carry, and puts back sessions with no
+/// terminals.
+///
+/// So the newest placed snapshot of a *previous* boot is exempt too — the
+/// same single-row shape as (1), and for the same reason.
+#[test]
+fn prune_keeps_the_previous_boots_layout_that_a_restore_would_borrow() {
+    let (_t, conn) = fresh();
+    // The layout, and then a run of placement-blind captures over it.
+    insert_placed(&conn, 1, 10, "boot-old", "known", true);
+    for i in 2..=25 {
+        insert_placed(&conn, i, i * 10, "boot-old", "unknown", false);
+    }
+    // This boot's first capture: the compositor is up, so it carries
+    // placement and becomes the newest snapshot that does.
+    insert_placed(&conn, 26, 300, "boot-now", "known", true);
+
+    snapshots::prune(&conn, 20, "boot-now").unwrap();
+
+    let survived: i64 = conn
+        .query_row("SELECT COUNT(*) FROM snapshots WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        survived, 1,
+        "the only record of the previous boot's layout was deleted before the \
+         restore that needed it could read it"
+    );
+    // And the restore source itself, which exemption (1) covers.
+    let source = snapshots::select_restore_source(&conn, "boot-now").unwrap();
+    assert_eq!(source, Some(25));
+}

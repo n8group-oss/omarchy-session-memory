@@ -211,6 +211,20 @@ pub fn reclaim_orphaned_restores(conn: &mut Connection) -> Result<usize> {
 ///    terminal windows is the cheaper mistake, and it is the one that errs
 ///    towards keeping the user's data.
 ///
+/// 6. **The newest placed snapshot of a *previous* boot**, which is not
+///    always the same row as (5). (1) protects the snapshot a restore would
+///    rebuild from; when that snapshot's placement is unknown, the restore
+///    takes its layout from an earlier snapshot of the same boot instead —
+///    and (5) does not protect that one, because the new boot's first capture
+///    answers its compositor perfectly well and takes the exemption over. The
+///    previous boot's layout is then an ordinary old row, and a machine at
+///    the retention limit deletes it in the seconds between login and the
+///    boot restore.
+///
+///    Same single-row shape as (1), same reasoning, and it moves the bound to
+///    `keep + 3`. Together (1) and (6) are the whole guarantee: the restore
+///    can rebuild the topology *and* put the windows back.
+///
 /// `current_boot` must be the caller's real boot id — passing something else
 /// silently changes which row is protected.
 pub fn prune(conn: &Connection, keep: usize, current_boot: &str) -> Result<usize> {
@@ -241,6 +255,18 @@ pub fn prune(conn: &Connection, keep: usize, current_boot: &str) -> Result<usize
          AND id IS NOT (
            SELECT s.id FROM snapshots s
            WHERE s.state <> 'building'
+             AND s.placement_state = 'known'
+             AND EXISTS (SELECT 1 FROM terminal_windows w
+                         WHERE w.snapshot_id = s.id)
+           ORDER BY s.taken_at DESC, s.id DESC
+           LIMIT 1
+         )
+         -- And the same row restricted to a previous boot: the layout the
+         -- snapshot a restore would select is about to borrow.
+         AND id IS NOT (
+           SELECT s.id FROM snapshots s
+           WHERE s.state <> 'building'
+             AND s.boot_id <> ?2
              AND s.placement_state = 'known'
              AND EXISTS (SELECT 1 FROM terminal_windows w
                          WHERE w.snapshot_id = s.id)
