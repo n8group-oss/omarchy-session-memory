@@ -911,7 +911,10 @@ fn an_engine_that_is_not_ready_always_says_why() {
     std::fs::create_dir_all(env.state_dir().join("state.db")).unwrap();
 
     let v = env.status();
-    assert_eq!(v["ready"], false, "an unopenable database is not ready: {v}");
+    assert_eq!(
+        v["ready"], false,
+        "an unopenable database is not ready: {v}"
+    );
     let msg = v["message"].as_str().unwrap_or_default();
     assert!(
         !msg.trim().is_empty(),
