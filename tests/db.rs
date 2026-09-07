@@ -933,36 +933,89 @@ fn a_preserved_database_holding_its_rows_in_a_wal_is_counted_with_them() {
     );
 }
 
-/// A v11 database gains `snapshots.placement_state`, and every row already in
-/// it is called `known`.
+/// A database exactly as schema 11 left it: no `placement_state` anywhere,
+/// and a `terminal_windows` table that already holds every column v11 wrote.
 ///
-/// Not `unknown`, which would be the cautious-looking answer and is the wrong
-/// one. Under v11 a capture that could not read placement was **refused**, so
-/// no v11 row can be an unknown-placement snapshot: every one of them either
-/// carries the placement the compositor reported or was taken with the
-/// compositor deliberately not asked. Stamping them `unknown` would hand
-/// retention a fleet of rows to protect and would make a restore of any of
-/// them go looking for placement somewhere else — inventing a doubt the old
-/// build never had.
+/// Rows are left to the caller, because the whole question below is what the
+/// rows say.
+fn write_v11(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE snapshots (
+           id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+           boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+           state TEXT NOT NULL
+                 CHECK (state IN ('building','complete','restore_in_progress',
+                                  'restored','failed')),
+           unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+           server TEXT);
+         CREATE TABLE session_rows (
+           row_id INTEGER PRIMARY KEY,
+           snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+           tmux_session_id TEXT NOT NULL, name TEXT NOT NULL,
+           active_window_id TEXT,
+           unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)));
+         CREATE TABLE terminal_windows (
+           row_id INTEGER PRIMARY KEY,
+           snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+           hypr_address TEXT NOT NULL,
+           window_class TEXT NOT NULL,
+           terminal_kind TEXT NOT NULL,
+           session_row_id INTEGER REFERENCES session_rows(row_id) ON DELETE SET NULL,
+           session_name TEXT NOT NULL DEFAULT '',
+           workspace_kind TEXT NOT NULL,
+           workspace_ref TEXT NOT NULL,
+           monitor_connector TEXT NOT NULL,
+           monitor_desc TEXT, monitor_scale REAL, monitor_transform INTEGER,
+           floating INTEGER NOT NULL DEFAULT 0 CHECK (floating IN (0,1)),
+           rel_x REAL, rel_y REAL, rel_w REAL, rel_h REAL,
+           UNIQUE (snapshot_id, hypr_address));
+         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta (key, value) VALUES ('schema_version', '11');",
+    )
+    .unwrap();
+}
+
+/// Migrating a v11 database may call a snapshot `known` only where the
+/// database itself says the placement was read.
+///
+/// A v11 row carries no record of whether anyone asked the compositor, so
+/// there are two kinds of row in one:
+///
+/// * rows with `terminal_windows` behind them — the compositor answered and
+///   these are its answer. `known`, and nothing is lost.
+/// * rows with none — and *nothing on disk says which* of "the compositor
+///   answered, there were no terminal windows" and "the compositor was never
+///   asked" produced them. v11 captures ran the second way routinely: a
+///   capture with no compositor to ask, and every capture on a machine with
+///   `restore.place_windows = false`.
+///
+/// Calling the second kind `known` is the migration inventing a fact. What it
+/// costs is specific: `known` with no rows means "there were no terminal
+/// windows", so a restore of such a snapshot has nothing to put back, finds
+/// no shortfall to report, and retires the user's snapshot as fully restored
+/// having opened no window at all. The user turns window placement on, reboots
+/// and gets their sessions back with an empty screen — and the record that
+/// could have done better is gone.
+///
+/// So a row with no evidence keeps its uncertainty and is migrated `unknown`,
+/// which is the state the engine already has for exactly this: absence of
+/// rows says nothing. It is not `disabled` either — that is the user's own
+/// choice, and this migration does not know whether they made it.
 #[test]
-fn a_v11_database_gains_the_placement_state_column_as_known() {
+fn a_v11_snapshot_with_placement_rows_is_migrated_as_known() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("state.db");
+    write_v11(&path);
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE snapshots (
-               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
-               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
-               state TEXT NOT NULL
-                     CHECK (state IN ('building','complete','restore_in_progress',
-                                      'restored','failed')),
-               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
-               server TEXT);
-             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
                VALUES (1, 100, 'boot-a', 'manual', 'complete');
-             INSERT INTO meta (key, value) VALUES ('schema_version', '11');",
+             INSERT INTO terminal_windows
+               (row_id, snapshot_id, hypr_address, window_class, terminal_kind,
+                session_name, workspace_kind, workspace_ref, monitor_connector)
+               VALUES (50, 1, '0xa', 'ghostty', 'ghostty', 'dev', 'id', '1', 'DP-1');",
         )
         .unwrap();
     }
@@ -982,8 +1035,7 @@ fn a_v11_database_gains_the_placement_state_column_as_known() {
         .expect("the column exists after the migration");
     assert_eq!(
         state, "known",
-        "a row written by a build that refused to record unknown placement \
-         cannot be an unknown-placement row"
+        "a row with the compositor's own answer behind it was not called known"
     );
 
     let version: u32 = conn
@@ -994,6 +1046,47 @@ fn a_v11_database_gains_the_placement_state_column_as_known() {
         )
         .unwrap();
     assert_eq!(version, osm::db::SCHEMA_VERSION);
+}
+
+/// And a v11 row with no placement rows behind it keeps its uncertainty.
+///
+/// The assertion is made twice, deliberately: once on the stored token, and
+/// once on the thing the token decides. `placement_for_restore` is what a
+/// restore asks, and for a `known` snapshot it answers `Own(vec![])` — "the
+/// compositor said there were none" — which is the claim this migration has
+/// no grounds to make on the user's behalf.
+#[test]
+fn a_v11_snapshot_with_no_placement_rows_is_not_called_known() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    write_v11(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v11 database must open");
+    let state: String = conn
+        .query_row(
+            "SELECT placement_state FROM snapshots WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the column exists after the migration");
+    assert_eq!(
+        state, "unknown",
+        "the migration decided, on no evidence, what a v11 capture knew about          window placement"
+    );
+
+    assert_eq!(
+        osm::desktop::placement_for_restore(&conn, 1).unwrap(),
+        osm::desktop::PlacementForRestore::Unavailable,
+        "a restore of a migrated row was handed an empty layout as though the          compositor had answered it"
+    );
 }
 
 /// A v12 database is rebuilt so its snapshot ids are `AUTOINCREMENT`, and

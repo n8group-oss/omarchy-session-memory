@@ -42,21 +42,26 @@ use std::path::{Path, PathBuf};
 /// | 8       | migrated in place (one added column, nullable: `window_rows.auto_named`) |
 /// | 9       | migrated in place (adds `terminal_windows.session_name`, backfilled from the link) |
 /// | 10      | migrated in place (replaces the never-written `agent_sessions.summary` with `title` and `title_source`, and drops its `alive`) |
-/// | 11      | migrated in place (one added column with a default: `snapshots.placement_state`) |
+/// | 11      | migrated in place (adds `snapshots.placement_state`, `known` only where placement rows say so) |
 /// | 12      | migrated in place (`snapshots` is rebuilt so its id is `AUTOINCREMENT`) |
 /// | 13      | opened in place |
 /// | unversioned (osm tables, no `schema_version`) | preserved as `state.db.unversioned.bak` |
 /// | newer than this build | preserved as `state.db.v<N>.bak` |
 ///
-/// 11 is migrated by adding one column with a default, and the default is
-/// `'known'` rather than the cautious-looking `'unknown'`. Under 11 a capture
-/// whose placement could not be read was *refused*, so no row on disk can be
-/// an unknown-placement snapshot: every one of them either carries what the
-/// compositor reported or was taken with the compositor deliberately not
-/// asked. Stamping them `unknown` would hand retention a whole database of
-/// rows to hold back and would send every restore of one looking elsewhere
-/// for placement it already has — a doubt the build that wrote them never
-/// had.
+/// 11 is migrated by adding one column, and the only interesting thing about
+/// it is which rows may be called `known`. Under 11 a capture whose placement
+/// could not be *read* was refused — but a capture that never asked was not,
+/// and v11 wrote plenty of those: a capture with no compositor to ask, and
+/// every capture on a machine with `restore.place_windows = false`. On disk
+/// those look exactly like a capture that asked and found no terminal
+/// windows, and v11 recorded nothing that tells the two apart.
+///
+/// So the rows with `terminal_windows` behind them — the compositor's own
+/// answer, still there — are migrated `known`, and the rest keep their
+/// uncertainty as `unknown`. Calling the rest `known` would have the
+/// migration decide, on nothing, that there were no windows: a restore of
+/// such a snapshot then has nothing to put back, reports no shortfall, and
+/// retires the user's only record having opened no window at all.
 ///
 /// 10 is migrated by renaming a column nothing ever wrote. `summary` promised
 /// an opt-in paraphrase of a conversation's contents, which was never built;
@@ -1669,14 +1674,57 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
                 }
                 version = 11;
             }
-            // Unknown placement. One added column with a default; see the
-            // module docs for why the default is `known`.
+            // Unknown placement. One added column, and then the only
+            // question this migration has to answer: which of the rows
+            // already on disk may be called `known`.
+            //
+            // Only the ones the database itself vouches for. A v11 row
+            // recorded nothing about whether the compositor was asked, so a
+            // row with no `terminal_windows` behind it is one of two rows
+            // wearing the same face: the compositor answered and there were
+            // no terminal windows, or the compositor was never asked at all —
+            // a capture with no compositor to ask, and every capture on a
+            // machine with `restore.place_windows = false`. v11 wrote both,
+            // and nothing on disk separates them.
+            //
+            // Calling those `known` invents the first reading. It is not a
+            // harmless guess: `known` with no rows *means* "there were no
+            // terminal windows", so a restore of such a snapshot has nothing
+            // to put back, finds no shortfall to report, and retires the
+            // user's snapshot as fully restored having opened no window. The
+            // user who switches window placement on and reboots gets their
+            // sessions back on an empty screen, with the record that could
+            // have done better already retired.
+            //
+            // So the default is `unknown` — the state that exists for exactly
+            // this, where absence of rows says nothing — and the rows with
+            // the compositor's own answer behind them are promoted out of it.
+            // Not `disabled`: that is the user's own choice, and this
+            // migration does not know whether they made it.
             11 => {
                 tx.execute_batch(
                     "ALTER TABLE snapshots ADD COLUMN placement_state TEXT NOT NULL
-                     DEFAULT 'known'
+                     DEFAULT 'unknown'
                      CHECK (placement_state IN ('known','unknown','disabled'))",
                 )?;
+                // Guarded like the 9 → 10 step, and for the same reason: a
+                // database migrating up from further back may not have
+                // reached `terminal_windows` yet. With no such table there is
+                // no evidence anywhere, and every row correctly keeps the
+                // `unknown` it was just given.
+                let has_table: bool = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='table' AND name='terminal_windows'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )? == 1;
+                if has_table {
+                    tx.execute_batch(
+                        "UPDATE snapshots SET placement_state = 'known'
+                          WHERE EXISTS (SELECT 1 FROM terminal_windows w
+                                         WHERE w.snapshot_id = snapshots.id)",
+                    )?;
+                }
                 version = 12;
             }
             // Snapshot ids that are never reissued.
