@@ -951,6 +951,9 @@ fn an_unknown_placement_carries_the_last_layout_the_same_boot_knew() {
     let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
     let known = seed_at(&conn, 100, "boot-a", "known", &["dev"]);
     let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    // The topology the restore rebuilds is this snapshot's, and the carried
+    // layout is trimmed to it, so the session has to be in it.
+    seed_sessions(&conn, blind, &["dev"]);
 
     let h = Recording {
         dispatched: Default::default(),
@@ -1045,6 +1048,7 @@ fn the_carried_layout_never_comes_from_another_boot() {
     let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
     seed_at(&conn, 100, "boot-older", "known", &["dev"]);
     let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    seed_sessions(&conn, blind, &["dev"]);
 
     let h = Recording {
         dispatched: Default::default(),
@@ -1080,6 +1084,7 @@ fn the_carried_layout_never_comes_from_a_later_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
     let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    seed_sessions(&conn, blind, &["dev"]);
     seed_at(&conn, 300, "boot-a", "known", &["dev"]);
 
     let h = Recording {
@@ -1195,6 +1200,10 @@ fn a_known_empty_capture_stops_the_carry_forward_search() {
     seed_at(&conn, 100, "boot-a", "known", &["dev"]);
     let cleared = seed_at(&conn, 200, "boot-a", "known", &[]);
     let blind = seed_at(&conn, 300, "boot-a", "unknown", &[]);
+    // `dev` is still a live session; it is its *window* the user closed.
+    // Without this the carried list would be empty for want of a session to
+    // match, and the assertion below would pass without testing anything.
+    seed_sessions(&conn, blind, &["dev"]);
 
     let h = Recording {
         dispatched: Default::default(),
@@ -1226,5 +1235,69 @@ fn a_known_empty_capture_stops_the_carry_forward_search() {
         !degraded(&out),
         "an answered, empty desktop is a complete answer, so a restore that \
          puts no window back has not fallen short: {out:?}"
+    );
+}
+
+/// A session row for each name, so a snapshot can say which sessions it held.
+fn seed_sessions(conn: &rusqlite::Connection, snapshot: i64, sessions: &[&str]) {
+    for (i, s) in sessions.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO session_rows (snapshot_id, tmux_session_id, name)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![snapshot, format!("${i}"), s],
+        )
+        .unwrap();
+    }
+}
+
+/// A carried layout is trimmed to the sessions the snapshot being restored
+/// actually held.
+///
+/// The layout comes from an earlier snapshot, and "earlier" is exactly when
+/// the machine held different sessions. A layout recorded while `dev` and
+/// `notes` were both open, carried onto a snapshot that has only `dev`,
+/// arrives with a window for a session this restore was never going to
+/// deliver — and `notes` is then reported `skipped`, which is a shortfall,
+/// which keeps the run partial and the source snapshot perpetually
+/// restorable for work it never contained.
+///
+/// The topology is the newest snapshot's, always; only the *placement* is
+/// borrowed. So the borrowed half is cut down to the sessions the topology
+/// has, and a session the source never held is not a window this restore owes
+/// anybody.
+#[test]
+fn a_carried_layout_is_trimmed_to_the_sessions_the_source_actually_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    let known = seed_at(&conn, 100, "boot-a", "known", &["dev", "notes"]);
+    seed_sessions(&conn, known, &["dev", "notes"]);
+    // By the time the placement-blind capture ran, `notes` was gone.
+    let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    seed_sessions(&conn, blind, &["dev"]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert!(
+        !out.iter().any(|(s, _)| s == "notes"),
+        "a window was owed for a session the snapshot being restored never \
+         held: {out:?}"
+    );
+    assert!(
+        out.iter().any(|(s, _)| s == "dev"),
+        "the sessions the source did hold must still get their carried \
+         layout: {out:?}"
     );
 }

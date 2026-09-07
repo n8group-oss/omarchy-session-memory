@@ -854,6 +854,12 @@ pub enum PlacementForRestore {
     /// The snapshot's placement was `unknown`, and this is the newest earlier
     /// snapshot of the **same boot** that knew, with its id and the time it
     /// was taken.
+    ///
+    /// `placements` is that snapshot's layout **trimmed to the sessions the
+    /// snapshot being restored holds**. The two snapshots are minutes apart
+    /// and the machine's sessions move in minutes, so an untrimmed carry
+    /// hands the pass a window to owe for a session this restore was never
+    /// going to deliver.
     Carried {
         from: i64,
         taken_at: i64,
@@ -950,13 +956,43 @@ pub fn placement_for_restore(
         .optional()?;
 
     Ok(match fallback {
-        Some((from, at)) => PlacementForRestore::Carried {
-            from,
-            taken_at: at,
-            placements: placements_of(conn, from)?,
-        },
+        Some((from, at)) => {
+            // Only the sessions the snapshot being restored actually holds.
+            //
+            // The borrowed layout is older, and "older" is exactly when the
+            // machine held different sessions. Carrying it whole put a window
+            // on the list for a session this restore was never going to
+            // deliver, and the pass then reported that session `skipped` — a
+            // shortfall, which keeps the run partial and leaves the source
+            // snapshot restorable for ever for work it never contained.
+            //
+            // The topology is the newest snapshot's, always; only the
+            // placement is borrowed. Intersecting the two is what keeps the
+            // borrowed half from making claims the topology does not support.
+            let held = sessions_of(conn, snapshot_id)?;
+            PlacementForRestore::Carried {
+                from,
+                taken_at: at,
+                placements: placements_of(conn, from)?
+                    .into_iter()
+                    .filter(|p| held.contains(&p.session))
+                    .collect(),
+            }
+        }
         None => PlacementForRestore::Unavailable,
     })
+}
+
+/// The session names a snapshot's topology holds.
+fn sessions_of(
+    conn: &rusqlite::Connection,
+    snapshot_id: i64,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM session_rows WHERE snapshot_id = ?1")?;
+    let names = stmt
+        .query_map([snapshot_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<String>>>()?;
+    Ok(names)
 }
 
 /// The window a placement pass delivered, and where it put it.
