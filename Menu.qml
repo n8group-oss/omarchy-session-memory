@@ -91,6 +91,10 @@ Panel {
 
   property string actionStatus: ""
   property bool restoreArmed: false
+  // Which command `actionProcess` is currently running, so its output is read
+  // as what it is: `osm restore --json` prints a report worth reading and
+  // `osm snapshot` prints nothing of the kind.
+  property string actionKind: ""
 
   // The agents probe. Deliberately not on a timer: it walks /proc and every
   // agent's transcript store, which is far too much work to repeat every five
@@ -663,6 +667,7 @@ Panel {
 
   function snapshotNow() {
     if (actionProcess.running || engineState !== "ready") return
+    actionKind = "capture"
     actionStatus = "Capturing…"
     actionTimedOut = false
     actionProcess.command = root.argv(["snapshot", "--reason", "menu"])
@@ -686,6 +691,7 @@ Panel {
     }
     restoreArmed = false
     disarmTimer.stop()
+    actionKind = "restore"
     actionStatus = "Restoring…"
     actionTimedOut = false
     actionProcess.command = root.argv(["restore", "--json"])
@@ -724,6 +730,65 @@ Panel {
     Quickshell.clipboardText = "osm resume -- " + root.shellQuote(entry.native_id)
     actionStatus = "Resume command copied — run it in the pane you want it in."
     actionStatusTimer.restart()
+  }
+
+  // The `placement_carried` note in an `osm restore --json` report, or null.
+  //
+  // The engine has three ways of putting a window layout back and one of them
+  // is *borrowed*: when the source snapshot's placement could not be read at
+  // capture time, the restore carries the last layout the same boot knew and
+  // says so, naming the snapshot it took it from. That report exists because
+  // a restore that used a layout it did not itself record has to say so — and
+  // this panel is the consumer it was written for.
+  //
+  // Every failure to read the output is `null`, never a throw: this same
+  // `Process` also runs `osm snapshot`, which prints no report at all, and a
+  // run the watchdog killed leaves whatever half a report it had written.
+  function carriedNote(out) {
+    var parsed = null
+    try {
+      parsed = JSON.parse(String(out || ""))
+    } catch (e) {
+      return null
+    }
+    if (!parsed || !parsed.windows || !parsed.windows.length) return null
+    for (var i = 0; i < parsed.windows.length; i++) {
+      var w = parsed.windows[i]
+      if (w && String(w.outcome) === "placement_carried") return w
+    }
+    return null
+  }
+
+  // The snapshot a carried layout came from, or "" when the note does not
+  // name one.
+  //
+  // Read out of the note's own sentence, which is where the engine puts it —
+  // `windows[]` carries a session, an outcome and a detail, and the detail is
+  // the only place the source id appears. `tests/qml_restore_line.rs` builds
+  // its fixture from the engine's own `format!` so that a change to that
+  // sentence fails there rather than quietly leaving this returning "".
+  function carriedFrom(note) {
+    if (!note || !note.detail) return ""
+    var m = /snapshot ([0-9]+)/.exec(String(note.detail))
+    return m ? m[1] : ""
+  }
+
+  // What a finished restore is called.
+  //
+  // `Done.` for a restore that replayed the layout it recorded itself. A
+  // restore that borrowed one says so and names the snapshot it borrowed
+  // from: the user's terminals are back, but on a layout from earlier in the
+  // boot, and being told the same word as an exact replay is how a panel
+  // hides the one thing about this run that was unusual.
+  function restoreDone(out) {
+    var note = root.carriedNote(out)
+    if (note === null) return "Done."
+    var from = root.carriedFrom(note)
+    return from === ""
+      ? "Done — this snapshot had no window layout recorded; an earlier one "
+        + "from this boot was used."
+      : "Done — this snapshot had no window layout recorded; the one from "
+        + "snapshot #" + from + " was used."
   }
 
   function copyInstallCommand() {
@@ -818,7 +883,14 @@ Panel {
       if (root.actionTimedOut) return
       var err = root.elide(String(actionErr.text || ""), 300)
       if (exitCode === 0) {
-        root.actionStatus = "Done."
+        // Not every exit 0 is the same sentence. `osm restore --json` prints
+        // a report, and one of the things it reports is that the layout it
+        // put back was borrowed from an earlier snapshot — which used to be
+        // visible in the CLI and invisible here, in the one place it was
+        // written for.
+        root.actionStatus = root.actionKind === "restore"
+          ? root.restoreDone(String(actionOut.text || ""))
+          : "Done."
       } else {
         // The exit status is reported, not swallowed. `osm restore` exits
         // non-zero for a partial restore precisely so a caller can tell that
