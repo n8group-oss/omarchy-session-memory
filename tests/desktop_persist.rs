@@ -178,8 +178,12 @@ fn a_v9_database_gains_session_name_without_losing_its_placement() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
+            // `unresolved` (added at 5) and `server` (added at 7) are part of
+            // what a real v9 `snapshots` holds; a fixture without them is not
+            // a v9 database, and the migration is entitled to expect them.
             "CREATE TABLE snapshots (id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
-               boot_id TEXT NOT NULL, reason TEXT NOT NULL, state TEXT NOT NULL);
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL, state TEXT NOT NULL,
+               unresolved INTEGER NOT NULL DEFAULT 0, server TEXT);
              CREATE TABLE session_rows (row_id INTEGER PRIMARY KEY, snapshot_id INTEGER,
                name TEXT NOT NULL);
              CREATE TABLE terminal_windows (row_id INTEGER PRIMARY KEY,
@@ -191,7 +195,8 @@ fn a_v9_database_gains_session_name_without_losing_its_placement() {
                floating INTEGER NOT NULL DEFAULT 0,
                rel_x REAL, rel_y REAL, rel_w REAL, rel_h REAL);
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO snapshots VALUES (1, 1, 'b', 'r', 'complete');
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 1, 'b', 'r', 'complete');
              INSERT INTO session_rows VALUES (11, 1, 'dev');
              INSERT INTO terminal_windows (row_id, snapshot_id, hypr_address, window_class,
                terminal_kind, session_row_id, workspace_kind, workspace_ref,

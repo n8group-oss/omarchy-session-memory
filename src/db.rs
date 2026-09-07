@@ -366,6 +366,78 @@ CREATE TABLE IF NOT EXISTS agent_resume_debt (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
+/// The `ON DELETE` behaviour declared above, written a second time as
+/// triggers — because the declarations alone are not enforced by this
+/// database.
+///
+/// # Why this is not belt and braces
+///
+/// `PRAGMA foreign_keys` is **per connection** and stock SQLite defaults it
+/// off: the `sqlite3` shell, anything linked against the system library, a
+/// backup tool, and — inside this file — [`migrate`], which switches it off
+/// for a table rebuild. Every one of those can delete a snapshot and leave
+/// every row underneath it, and nothing but `PRAGMA foreign_key_check` will
+/// ever say so. That is how the maintainer's database came to hold 198 rows
+/// belonging to nine snapshots that were not there: 72 `window_rows`, 72
+/// `session_rows`, 54 `terminal_windows`. Combined with a reused id it took
+/// his capture down for 83 minutes, and it would never have recovered.
+///
+/// A trigger is not optional in the same way. It lives in the schema, it runs
+/// for whoever is connected, and `PRAGMA recursive_triggers` does not govern
+/// it: a `DELETE` inside a trigger body still fires the triggers of the table
+/// it deletes from, which is what carries a snapshot's removal all the way
+/// down to `pane_rows`. The foreign keys are kept as well — they are the
+/// statement of intent, they still reject a child row written against a
+/// snapshot that does not exist, and where they are enforced they simply do
+/// the work first and leave the trigger nothing to find.
+///
+/// Deliberately **not** a numbered migration step. `CREATE TRIGGER IF NOT
+/// EXISTS` needs the tables it names to exist, and a migration runs before
+/// [`create_schema`] has made them; more to the point, a schema version is
+/// what decides whether an older build moves a user's database aside, and
+/// nothing here changes a single row or column. So these are created by every
+/// [`create_schema`] instead, which every [`open`] calls whatever the version
+/// on disk — which also means a database that loses them (a rebuild of
+/// `snapshots` drops its triggers with it) has them back before anything else
+/// touches the file.
+const CASCADE_TRIGGERS_SQL: &str = r#"
+-- `terminal_windows` first: deleting the session rows below would otherwise
+-- spend a pass setting `session_row_id` to NULL on rows that are about to go.
+CREATE TRIGGER IF NOT EXISTS snapshots_cascade_delete
+AFTER DELETE ON snapshots
+BEGIN
+  DELETE FROM terminal_windows WHERE snapshot_id = OLD.id;
+  DELETE FROM window_rows      WHERE snapshot_id = OLD.id;
+  DELETE FROM session_rows     WHERE snapshot_id = OLD.id;
+  DELETE FROM restore_attempts WHERE snapshot_id = OLD.id;
+END;
+
+-- The `ON DELETE SET NULL` here is deliberate and is mirrored, not upgraded
+-- to a delete: a placement whose session row is gone is still a record of
+-- where a window was.
+CREATE TRIGGER IF NOT EXISTS session_rows_cascade_delete
+AFTER DELETE ON session_rows
+BEGIN
+  DELETE FROM session_window_links WHERE session_row_id = OLD.row_id;
+  UPDATE terminal_windows SET session_row_id = NULL
+   WHERE session_row_id = OLD.row_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS window_rows_cascade_delete
+AFTER DELETE ON window_rows
+BEGIN
+  DELETE FROM pane_rows            WHERE window_row_id = OLD.row_id;
+  DELETE FROM session_window_links WHERE window_row_id  = OLD.row_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_attempts_cascade_delete
+AFTER DELETE ON restore_attempts
+BEGIN
+  DELETE FROM restore_objects    WHERE attempt_id = OLD.id;
+  DELETE FROM restore_window_map WHERE attempt_id = OLD.id;
+END;
+"#;
+
 /// What an existing database file says about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OnDisk {
@@ -1459,6 +1531,7 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
 fn create_schema(conn: &mut Connection, preserved: Option<(String, Option<u32>)>) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute_batch(SCHEMA_SQL)?;
+    tx.execute_batch(CASCADE_TRIGGERS_SQL)?;
     set_meta(&tx, "schema_version", &SCHEMA_VERSION.to_string())?;
     if let Some((backup, version)) = preserved {
         set_meta(&tx, "preserved_db_path", &backup)?;

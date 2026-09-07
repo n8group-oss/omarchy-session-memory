@@ -1102,3 +1102,122 @@ fn a_v12_database_keeps_every_snapshot_id_and_stops_reusing_them() {
         .unwrap();
     assert_eq!(version, osm::db::SCHEMA_VERSION);
 }
+
+/// Deleting a snapshot takes its rows with it **on a connection that
+/// enforces no foreign keys**.
+///
+/// This is the defect that cost the maintainer 83 minutes, one level below
+/// the id reuse that made it fatal. `ON DELETE CASCADE` is not a property of
+/// the database: it is a property of whoever is connected to it.
+/// `PRAGMA foreign_keys` defaults **off** in stock SQLite — the `sqlite3`
+/// shell, any tool built on the system library, a future osm path that
+/// switches it off for a table rebuild and does not switch it back — so a
+/// snapshot deleted through any of them leaves every child row behind, and
+/// `PRAGMA foreign_key_check` is the only thing that ever notices. His
+/// database held 198 such rows: 72 `window_rows`, 72 `session_rows`, 54
+/// `terminal_windows`, claiming nine snapshots that were not there.
+///
+/// So the relationship is written into the schema as well, where it belongs
+/// and where no connection can opt out of it. Every table below is reached,
+/// including the ones two levels down: a `pane_rows` row belongs to a window
+/// that belongs to a snapshot, and with foreign keys off nothing else would
+/// have taken it.
+#[test]
+fn a_snapshot_delete_takes_its_rows_with_it_without_foreign_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = osm::db::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete'),
+                      (2, 200, 'boot-a', 'manual', 'complete');
+
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (10, 1, '$0', 'doomed'), (11, 2, '$0', 'kept');
+             INSERT INTO window_rows (row_id, snapshot_id, tmux_window_id, name, layout)
+               VALUES (20, 1, '@0', 'w', 'l'), (21, 2, '@0', 'w', 'l');
+             INSERT INTO session_window_links (row_id, session_row_id, window_row_id, idx)
+               VALUES (30, 10, 20, 0), (31, 11, 21, 0);
+             INSERT INTO pane_rows (row_id, window_row_id, tmux_pane_id, idx, cwd,
+                                    restore_policy)
+               VALUES (40, 20, '%0', 0, '/tmp', 'shell'),
+                      (41, 21, '%0', 0, '/tmp', 'shell');
+             INSERT INTO terminal_windows (row_id, snapshot_id, hypr_address, window_class,
+                                           terminal_kind, session_row_id, session_name,
+                                           workspace_kind, workspace_ref, monitor_connector)
+               VALUES (50, 1, '0xa', 'ghostty', 'ghostty', 10, 'doomed', 'id', '1', 'DP-1'),
+                      (51, 2, '0xb', 'ghostty', 'ghostty', 11, 'kept', 'id', '1', 'DP-1');
+             INSERT INTO restore_attempts (id, snapshot_id, started_at, state)
+               VALUES (60, 1, 100, 'failed'), (61, 2, 100, 'failed');
+             INSERT INTO restore_objects (row_id, attempt_id, kind, ref, state)
+               VALUES (70, 60, 'session', 'doomed', 'done'),
+                      (71, 61, 'session', 'kept', 'done');
+             INSERT INTO restore_window_map (row_id, attempt_id, captured_window_id,
+                                             live_window_id)
+               VALUES (80, 60, '@0', '@7'), (81, 61, '@0', '@7');",
+        )
+        .unwrap();
+    }
+
+    // A connection like any other tool's: no pragma, nothing enforced.
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let fk: i64 = raw
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fk, 0, "this connection must enforce no foreign keys");
+    raw.execute("DELETE FROM snapshots WHERE id = 1", [])
+        .unwrap();
+
+    for (table, column, id) in [
+        ("session_rows", "row_id", 10),
+        ("window_rows", "row_id", 20),
+        ("session_window_links", "row_id", 30),
+        ("pane_rows", "row_id", 40),
+        ("terminal_windows", "row_id", 50),
+        ("restore_attempts", "id", 60),
+        ("restore_objects", "row_id", 70),
+        ("restore_window_map", "row_id", 80),
+    ] {
+        let left: i64 = raw
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "{table} still holds a row belonging to the snapshot that was deleted"
+        );
+    }
+
+    // And the snapshot that was not deleted keeps everything it had.
+    for (table, column, id) in [
+        ("session_rows", "row_id", 11),
+        ("window_rows", "row_id", 21),
+        ("session_window_links", "row_id", 31),
+        ("pane_rows", "row_id", 41),
+        ("terminal_windows", "row_id", 51),
+        ("restore_attempts", "id", 61),
+        ("restore_objects", "row_id", 71),
+        ("restore_window_map", "row_id", 81),
+    ] {
+        let left: i64 = raw
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "{table} lost a row belonging to a live snapshot");
+    }
+
+    let violations: i64 = raw
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "the delete left the database inconsistent");
+}
