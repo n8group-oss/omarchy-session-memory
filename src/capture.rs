@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct Topology {
-    /// Where each session's terminal window is, when the compositor could
-    /// be trusted. `None` means it could not, and no placement is written.
-    pub placements: Option<Vec<crate::desktop::Placement>>,
+    /// Where each session's terminal window is — or that it could not be
+    /// read, or that it was never asked for. See [`crate::desktop::Placements`]:
+    /// the three are different facts and collapsing the last two into "no
+    /// rows" is what made a compositor hiccup cost a whole capture.
+    pub placements: crate::desktop::Placements,
     pub sessions: Vec<SessionRec>,
     pub windows: Vec<WindowRec>,
     pub panes: Vec<PaneRec>,
@@ -153,8 +155,9 @@ pub fn collect_once(tmux: &Tmux) -> Result<Topology> {
         panes,
         // Placement is collected separately, by the caller that has a
         // compositor to ask. A topology gathered without one is not wrong,
-        // it simply carries no placement.
-        placements: None,
+        // and it is not *unknown* either: nothing was asked, so nothing is
+        // owed.
+        placements: crate::desktop::Placements::Off,
         server: before,
         server_at_end: after,
     })
@@ -249,20 +252,30 @@ fn snapshot_inner(
             let topo = collect_with_desktop(tmux, h)?;
             // Placement was asked for and could not be read: a transient
             // compositor failure, a `list-clients` that errored, a reply that
-            // did not parse, an identity that moved. `write_topology` would
-            // commit this as a `complete` snapshot anyway, report success,
-            // and prune the previous snapshot — the one that still held the
-            // layout — out of retention. A capture that cannot see where the
-            // windows are has not captured this machine's state, so it fails
-            // and is retried, by the next hook or the next daemon tick.
+            // did not parse, an identity that moved.
             //
-            // The one way to a successful capture with no placement is the
-            // user saying so; see `snapshot_with_configured_retention`.
-            if topo.placements.is_none() {
-                anyhow::bail!(
-                    "the window placement for this capture could not be read; refusing \
-                     to record a snapshot that would claim there is none (set \
-                     restore.place_windows = false for a machine with no compositor)"
+            // This used to fail the whole capture. The hazard it guarded was
+            // real — a snapshot with no placement rows was indistinguishable
+            // from a machine with no windows, so retention would prune the
+            // last snapshot that knew the layout — but the price was the tmux
+            // topology as well, on a machine where the read failed 11 times
+            // against 19 successes within one hour. Losing sessions, panes,
+            // working directories and agent bindings to a compositor that
+            // stuttered is a far larger loss than the one being prevented.
+            //
+            // So the snapshot is recorded, `placement_state` says `unknown`,
+            // and the layout is protected where the hazard actually lives:
+            // `crate::snapshots::prune` holds back the newest snapshot that
+            // carries placement, whatever is recorded after it.
+            if let Some(why) = topo.placements.why() {
+                // The tmux hooks send output to /dev/null, but the daemon and
+                // the CLI do not, and `osm status --json` reports the same
+                // state off the snapshot itself. Silence here would make an
+                // hour of placement-blind snapshots look like an hour of
+                // ordinary ones.
+                eprintln!(
+                    "osm: recording this snapshot with its window placement marked \
+                     unknown: {why}"
                 );
             }
             topo
@@ -294,7 +307,7 @@ pub fn write_topology(
     // transaction or not at all. `None` means the compositor could not be
     // trusted; writing nothing is the honest outcome, and writing an empty
     // layout over a good one is what destroyed the original mapping.
-    if let Some(ps) = topo.placements.as_deref() {
+    if let Some(ps) = topo.placements.known() {
         crate::desktop::write_placements_in(&tx, snapshot_id, ps)?;
     }
     tx.commit()?;
@@ -819,9 +832,15 @@ pub fn write_topology_in(
     let taken_at = boot::now_epoch();
 
     tx.execute(
-        "INSERT INTO snapshots (taken_at, boot_id, reason, state, server)
-         VALUES (?1, ?2, ?3, 'building', ?4)",
-        rusqlite::params![taken_at, boot_id, reason, topo.server],
+        "INSERT INTO snapshots (taken_at, boot_id, reason, state, server, placement_state)
+         VALUES (?1, ?2, ?3, 'building', ?4, ?5)",
+        rusqlite::params![
+            taken_at,
+            boot_id,
+            reason,
+            topo.server,
+            topo.placements.state()
+        ],
     )?;
     let snapshot_id = tx.last_insert_rowid();
 
@@ -2096,21 +2115,46 @@ pub fn collect_with_desktop(tmux: &Tmux, h: &dyn crate::hypr::HyprCtl) -> Result
 /// inside `collect_once`; the tmux/compositor boundary is the one place it
 /// had never been applied.
 ///
-/// A mismatch leaves `topo.placements` at `None`, which is the same
-/// "unreadable" the compositor half already produces — never an empty layout,
-/// which is the value that destroyed the maintainer's original mapping.
+/// A mismatch leaves `topo.placements` [`Unknown`], which is the same
+/// "unreadable" the compositor half produces — never an empty layout, which
+/// is the value that destroyed the maintainer's original mapping. The
+/// comparison stays here, outside the retry: a read that is re-attempted is
+/// still a read of whatever server is there *now*, so retrying a mismatch
+/// could only ever produce the same mismatch more slowly.
 ///
 /// Taking the topology as an argument is also the only seam a test has for
 /// the failure this exists to catch: nothing can interpose between `collect`
 /// and the placement read from outside [`collect_with_desktop`].
+///
+/// [`Unknown`]: crate::desktop::Placements::Unknown
 pub fn attach_placements(
     topo: &mut Topology,
     tmux: &Tmux,
     h: &dyn crate::hypr::HyprCtl,
 ) -> Result<()> {
-    topo.placements = match crate::desktop::placements_with_incarnation(h, tmux)? {
-        Some((incarnation, ps)) if topo.server.as_deref() == Some(incarnation.as_str()) => Some(ps),
-        _ => None,
+    use crate::desktop::{PlacementRead, Placements};
+
+    // No server at all: there is no session for a window to hold, so there is
+    // nothing the retry below could discover, and spending its whole budget
+    // here would put three seconds into every capture on a machine whose tmux
+    // is simply not running.
+    let Some(server) = topo.server.clone() else {
+        topo.placements = Placements::Unknown(
+            "no tmux server was running when the topology was read, so no \
+             window could be matched to a session"
+                .to_string(),
+        );
+        return Ok(());
+    };
+
+    let deadline = std::time::Instant::now() + crate::desktop::PLACEMENT_READ_BUDGET;
+    topo.placements = match crate::desktop::placements_within(h, tmux, deadline)? {
+        PlacementRead::Mapped(incarnation, ps) if incarnation == server => Placements::Known(ps),
+        PlacementRead::Mapped(incarnation, _) => Placements::Unknown(format!(
+            "the placement was read from tmux server incarnation {incarnation}, \
+             but the topology beside it came from {server}"
+        )),
+        PlacementRead::Unreadable(why) => Placements::Unknown(why),
     };
     Ok(())
 }

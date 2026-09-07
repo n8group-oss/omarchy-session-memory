@@ -83,7 +83,7 @@ const FAKE_SERVER: &str =
 
 fn topology() -> Topology {
     Topology {
-        placements: None,
+        placements: osm::desktop::Placements::Off,
         sessions: vec![SessionRec {
             id: "$0".to_string(),
             name: "alpha".to_string(),

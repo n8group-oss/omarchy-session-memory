@@ -1012,6 +1012,26 @@ fn main() -> Result<()> {
                                 },
                             }
                         });
+                        if let Some(r) = &summary.repaired {
+                            notices.push(format!(
+                                "the snapshot database had to be repaired: {} row(s) \
+                                 belonging to snapshots that were no longer on record \
+                                 were cleared. Something deleted those snapshots \
+                                 without taking their rows with them; until they were \
+                                 cleared, every capture that was handed one of their \
+                                 ids failed on a UNIQUE constraint and no snapshot \
+                                 could be recorded at all",
+                                r.rows
+                            ));
+                        }
+                        if summary.orphan_rows > 0 {
+                            problems.push(format!(
+                                "database: {} row(s) belong to snapshots that are not \
+                                 on record and could not be cleared; capture will fail \
+                                 as soon as one of their ids comes round again",
+                                summary.orphan_rows
+                            ));
+                        }
                         osm::ipc::DatabaseStatus {
                             path: db_path.display().to_string(),
                             reachable: true,
@@ -1019,6 +1039,11 @@ fn main() -> Result<()> {
                             snapshots: Some(summary.snapshots),
                             newest_snapshot_at: summary.newest_snapshot_at,
                             preserved,
+                            orphan_rows: Some(summary.orphan_rows),
+                            repaired: summary.repaired.map(|r| osm::ipc::RepairedRows {
+                                at: r.at,
+                                rows: r.rows,
+                            }),
                         }
                     }
                     // The file opened and could not be read. `ready` stays
@@ -1036,6 +1061,8 @@ fn main() -> Result<()> {
                             snapshots: None,
                             newest_snapshot_at: None,
                             preserved: None,
+                            orphan_rows: None,
+                            repaired: None,
                         }
                     }
                 },
@@ -1048,6 +1075,8 @@ fn main() -> Result<()> {
                         snapshots: None,
                         newest_snapshot_at: None,
                         preserved: None,
+                        orphan_rows: None,
+                        repaired: None,
                     }
                 }
             };

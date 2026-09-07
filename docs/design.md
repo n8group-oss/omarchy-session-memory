@@ -146,7 +146,9 @@ per snapshot without key collisions.
 
 ```sql
 CREATE TABLE snapshots (
-  id         INTEGER PRIMARY KEY,
+  -- AUTOINCREMENT: an id, once handed out, is never handed out again. See
+  -- "Ids and orphans" below for what a reused one costs.
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
   taken_at   INTEGER NOT NULL,          -- unix epoch
   boot_id    TEXT    NOT NULL,          -- /proc/sys/kernel/random/boot_id
   reason     TEXT    NOT NULL,          -- hook name, timer, shutdown, manual
@@ -522,6 +524,81 @@ snapshot on the machine at all. If that publication fails, the attempt is
 `unsecured` rather than `succeeded` — the sessions are back, but nothing
 durable records them — and `osm restore` exits non-zero so systemd restarts
 it instead of recording a clean success.
+
+### Ids and orphans
+
+Two rules keep a snapshot's removal from taking capture down with it, and both
+exist because they once did not.
+
+**An id is never reused.** `snapshots.id` is `AUTOINCREMENT`. A plain
+`INTEGER PRIMARY KEY` is a rowid, and SQLite allocates one as `max(id) + 1`, so
+deleting the highest snapshot hands its id straight back. Every child table is
+keyed by that id and `window_rows` is `UNIQUE (snapshot_id, tmux_window_id)`, so
+a single row that outlives its snapshot turns the reuse into a permanent wedge:
+the reissued id meets the stale row, the insert fails with
+`UNIQUE constraint failed: window_rows.snapshot_id, window_rows.tmux_window_id`,
+and the next capture is handed the same id again. On the maintainer's machine
+that was 198 rows claiming snapshots 3717-3725 against a highest surviving
+snapshot of 3716: 83 minutes with no capture at all, across 41 systemd
+restarts, none of which could have helped. The cost of `AUTOINCREMENT` is one
+`sqlite_sequence` row and an id that is never reissued even when the table is
+emptied — which is exactly the property wanted, because it makes *any* stale
+row harmless rather than only the ones we thought of.
+
+**The cascade belongs to the database, not to the connection.** `ON DELETE
+CASCADE` is only enforced when `PRAGMA foreign_keys` is on, and that is a
+per-connection setting which stock SQLite defaults **off**: the `sqlite3`
+shell, anything linked against the system library, and `db::migrate` itself,
+which switches it off for a table rebuild. Any of them can delete a snapshot
+and leave every row underneath it, and nothing but `PRAGMA foreign_key_check`
+will say so.
+
+That is what happened, and the command was ordinary. A diagnostic run had
+recorded nine snapshots against the maintainer's live database with `reason`
+starting `diag-`; tidying up after itself, it ran
+
+```sh
+sqlite3 ~/.local/state/osm/state.db "DELETE FROM snapshots WHERE reason LIKE 'diag-%';"
+```
+
+at 01:36:47. That shell reports `PRAGMA foreign_keys` as `0`, so none of the
+declarations ran: nine snapshot rows went, 198 children stayed, and the
+capture five seconds later at 01:36:52 was handed 3717 and hit the UNIQUE
+constraint. Nothing about the command was wrong — deleting snapshots by reason
+is a reasonable thing to want, the shell is the ordinary tool for it, and no
+user of this database should have to know its integrity depends on a pragma
+they did not set. So the same relationships are written a second time as
+`AFTER DELETE` triggers, which no connection can opt out of. The foreign keys
+stay: they are the statement of intent, they still reject a child row written
+against a snapshot that is not there, and where they are enforced they do the
+work first and leave the triggers nothing to find. The triggers are created by
+`create_schema` on every `open` rather than by a numbered migration —
+`CREATE TRIGGER IF NOT EXISTS` needs tables a migration runs before
+`create_schema` has made, and a version bump is what makes an older build move
+a user's database aside, for a change that alters no row and no column.
+
+**A file that is already in that state is repaired, once, and reported.**
+Neither rule reaches a database that arrived damaged, and on such a file the id
+sequence resumes at the highest surviving snapshot — precisely the id the
+stranded rows claim. So `open` asks one read-only question (are there rows
+whose owner is not on record?) and clears them only when the answer is not
+zero: `open` runs in every `osm` process, including every tmux hook and the
+`osm status` the panel polls every five seconds, and writing on each of them
+would take the write lock away from captures for nothing. What is deleted is
+unreachable by anything else — every read in this engine reaches those rows
+through `snapshots` — so no data the user has, can see, or could get back is
+involved. A stale `terminal_windows.session_row_id` is set to NULL rather than
+deleted, because that is what the schema says there: a placement whose session
+row is gone is still a record of where a window was.
+
+`status --json` carries both halves under `database`: `orphan_rows` is the
+condition now, and anything but zero means the next capture is one id away from
+the wedge (it is a `problem`, so `ready` goes false); `repaired` is the record
+that osm had to clear rows, kept after the fact because *something removed a
+snapshot and left its rows behind* is worth knowing even once osm has tidied
+up. Before this, nothing about the database's own consistency was in the report
+at all, and the failing captures were visible only in a journal the tmux hooks
+do not even write to.
 
 ### Schema versions
 

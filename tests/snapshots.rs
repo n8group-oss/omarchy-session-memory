@@ -242,3 +242,212 @@ fn reclaim_leaves_healthy_snapshots_alone() {
         .collect();
     assert_eq!(states, vec!["complete", "restored", "failed"]);
 }
+
+/// Insert a snapshot that records `state` about its placement, and — when
+/// `windows` is true — one terminal window to go with it.
+fn insert_placed(
+    conn: &Connection,
+    id: i64,
+    at: i64,
+    boot: &str,
+    placement_state: &str,
+    windows: bool,
+) {
+    conn.execute(
+        "INSERT INTO snapshots (id, taken_at, boot_id, reason, state, placement_state)
+         VALUES (?1, ?2, ?3, 'test', 'complete', ?4)",
+        rusqlite::params![id, at, boot, placement_state],
+    )
+    .unwrap();
+    if windows {
+        conn.execute(
+            "INSERT INTO terminal_windows
+               (snapshot_id, hypr_address, window_class, terminal_kind, session_name,
+                workspace_kind, workspace_ref, monitor_connector)
+             VALUES (?1, ?2, 'com.mitchellh.ghostty', 'ghostty', 'dev',
+                     'numbered', '7', 'DP-1')",
+            rusqlite::params![id, format!("0x{id}")],
+        )
+        .unwrap();
+    }
+}
+
+/// A run of unknown-placement snapshots must not push the last snapshot that
+/// *knew* where the windows were out of retention.
+///
+/// This is the retention half of "unknown placement is not absent placement".
+/// A compositor hiccup lasting a few minutes produces a string of snapshots
+/// with no placement in them — perfectly good tmux topologies, and worth
+/// keeping — and under plain recency retention they would evict the one row
+/// that still records the user's workspace and monitor layout. Nothing else
+/// on the machine holds it: the compositor is asked afresh every capture and
+/// remembers nothing.
+#[test]
+fn prune_never_deletes_the_last_snapshot_that_knows_where_the_windows_were() {
+    let (_t, conn) = fresh();
+    insert_placed(&conn, 1, 10, "boot-old", "known", true);
+    for i in 2..=25 {
+        insert_placed(&conn, i, i * 10, "boot-old", "unknown", false);
+    }
+
+    // "boot-old" is also the current boot here, so nothing is a restore
+    // source and the only exemption that can save row 1 is the placement one.
+    snapshots::prune(&conn, 20, "boot-old").unwrap();
+
+    let survived: i64 = conn
+        .query_row("SELECT COUNT(*) FROM snapshots WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        survived, 1,
+        "twenty-four snapshots that do not know where the windows were \
+         deleted the only one that did"
+    );
+    let windows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM terminal_windows", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(windows, 1, "and its placement rows went with it");
+}
+
+/// The exemption is one row, not a second archive.
+///
+/// It protects the *newest* snapshot that carries placement, on the same
+/// reasoning the restore-source exemption is a single row: an older
+/// placed snapshot has been superseded by a newer one, and a rule that kept
+/// every placed snapshot would let a machine whose compositor is broken for a
+/// week grow without limit. The bound stays `keep + 2`.
+#[test]
+fn prune_exempts_only_the_newest_placed_snapshot() {
+    let (_t, conn) = fresh();
+    insert_placed(&conn, 1, 10, "boot-old", "known", true);
+    insert_placed(&conn, 2, 20, "boot-old", "known", true);
+    for i in 3..=25 {
+        insert_placed(&conn, i, i * 10, "boot-old", "unknown", false);
+    }
+
+    snapshots::prune(&conn, 20, "boot-old").unwrap();
+
+    let ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM snapshots WHERE id <= 2 ORDER BY id")
+            .unwrap();
+        let v = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<i64>, _>>()
+            .unwrap();
+        v
+    };
+    assert_eq!(
+        ids,
+        vec![2],
+        "the newest placed snapshot is kept and the one it superseded is not"
+    );
+}
+
+/// And when placement is being recorded normally, retention is unchanged.
+///
+/// The control for the two above. If the exemption ever starts holding rows
+/// back on a healthy machine, this is what says so: every snapshot here knows
+/// where the windows were, so the newest of them is the exempt one, and it is
+/// inside the retention window anyway.
+#[test]
+fn prune_is_unchanged_when_every_snapshot_carries_placement() {
+    let (_t, conn) = fresh();
+    for i in 1..=25 {
+        insert_placed(&conn, i, i * 10, "boot-old", "known", true);
+    }
+
+    let deleted = snapshots::prune(&conn, 20, "boot-old").unwrap();
+    assert_eq!(deleted, 5);
+    let oldest: i64 = conn
+        .query_row("SELECT MIN(id) FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(oldest, 6, "the five oldest are still the ones removed");
+}
+
+/// The layout a restore is about to borrow must survive until it has borrowed
+/// it.
+///
+/// Exemption (1) protects the snapshot a restore would rebuild *from*. When
+/// that snapshot's placement is unknown, the restore takes its window layout
+/// from an earlier snapshot of the same boot — and nothing protected *that*
+/// one. The first capture of the new boot answers its compositor perfectly
+/// well, becomes the newest snapshot carrying placement, and takes over
+/// exemption (5); the previous boot's layout is then an ordinary old row and
+/// ages out. The restore that runs a moment later finds its source, finds no
+/// placement in it, finds nothing to carry, and puts back sessions with no
+/// terminals.
+///
+/// So the newest placed snapshot of a *previous* boot is exempt too — the
+/// same single-row shape as (1), and for the same reason.
+#[test]
+fn prune_keeps_the_previous_boots_layout_that_a_restore_would_borrow() {
+    let (_t, conn) = fresh();
+    // The layout, and then a run of placement-blind captures over it.
+    insert_placed(&conn, 1, 10, "boot-old", "known", true);
+    for i in 2..=25 {
+        insert_placed(&conn, i, i * 10, "boot-old", "unknown", false);
+    }
+    // This boot's first capture: the compositor is up, so it carries
+    // placement and becomes the newest snapshot that does.
+    insert_placed(&conn, 26, 300, "boot-now", "known", true);
+
+    snapshots::prune(&conn, 20, "boot-now").unwrap();
+
+    let survived: i64 = conn
+        .query_row("SELECT COUNT(*) FROM snapshots WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        survived, 1,
+        "the only record of the previous boot's layout was deleted before the \
+         restore that needed it could read it"
+    );
+    // And the restore source itself, which exemption (1) covers.
+    let source = snapshots::select_restore_source(&conn, "boot-now").unwrap();
+    assert_eq!(source, Some(25));
+}
+
+/// The exemption follows the *newest* `known` snapshot, and an answered empty
+/// desktop is one of those.
+///
+/// Retention and carry-forward have to agree on which row is the record,
+/// because retention is what keeps that row alive for carry-forward to read.
+/// `placement_for_restore` stops at the newest earlier `known` snapshot,
+/// empty or not — a compositor that was asked and said "there are no terminal
+/// windows" has answered. If retention instead holds back the newest snapshot
+/// with *rows* in it, the two disagree exactly when it matters: the empty
+/// answer ages out, the layout it superseded is pinned in place for ever, and
+/// the next unknown-placement restore carries a desktop the user cleared an
+/// hour ago.
+#[test]
+fn prune_exempts_the_newest_known_snapshot_even_with_no_windows_in_it() {
+    let (_t, conn) = fresh();
+    insert_placed(&conn, 1, 10, "boot-old", "known", true);
+    // The user closes every terminal, and the next capture answers.
+    insert_placed(&conn, 2, 20, "boot-old", "known", false);
+    for i in 3..=25 {
+        insert_placed(&conn, i, i * 10, "boot-old", "unknown", false);
+    }
+
+    snapshots::prune(&conn, 20, "boot-old").unwrap();
+
+    let ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM snapshots WHERE id <= 2 ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<i64>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        ids,
+        vec![2],
+        "retention kept the layout the empty answer superseded and dropped the \
+         answer itself, so a carry-forward will find the stale layout again"
+    );
+}

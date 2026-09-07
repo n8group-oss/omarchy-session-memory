@@ -1240,18 +1240,35 @@ sleep 30
     common::shutdown(&env.tmux());
 }
 
-/// Everything below is about the capture half alone: what `osm snapshot`
-/// does when the compositor cannot be read.
+// Everything below is about the capture half alone: what `osm snapshot`
+// does when the compositor cannot be read.
 
+/// A capture whose placement cannot be read records the tmux tree anyway,
+/// says its placement is *unknown*, and cannot evict the snapshot that still
+/// holds the layout.
+///
+/// # The defect this replaces
+///
+/// The capture used to fail outright — "the window placement for this capture
+/// could not be read; refusing to record a snapshot that would claim there is
+/// none". That refusal was the conservative fix for a real hazard: a snapshot
+/// recorded with no placement rows is indistinguishable from a machine that
+/// genuinely has no windows, so retention would prune the last snapshot that
+/// *did* know, and the layout would be gone.
+///
+/// It cost too much. On the maintainer's machine the read failed 11 times
+/// against 19 successes in one hour, and every failure threw away the whole
+/// capture: sessions, panes, working directories, agent bindings. His newest
+/// snapshot went six and a half minutes stale during one such run, on the
+/// machine he is about to make this the only thing restoring his session tree
+/// at login.
+///
+/// The hazard was never that the snapshot exists. It was that nothing could
+/// tell "no placement" from "no windows". So the snapshot is recorded and
+/// says which — and retention holds back the last placed snapshot rather than
+/// the whole capture.
 #[test]
-fn a_capture_that_cannot_read_placement_fails_and_keeps_the_last_good_layout() {
-    // The whole harm in one run. `desktop::placements` returns `None` for a
-    // compositor that has stopped answering, a `list-clients` that failed, a
-    // reply that did not parse, or an identity that moved — and the capture
-    // used to commit a `complete` snapshot with no placement at all, report
-    // success, and prune the snapshot that still held the layout out of
-    // retention. `keep_snapshots = 1` is not contrived: it is the same
-    // deletion every retention setting performs, brought within one capture.
+fn a_capture_that_cannot_read_placement_still_records_the_session_tree() {
     let env = Env::new("blind");
     env.write_config(
         "[restore]\nterminal = \"ghostty\"\n\
@@ -1286,21 +1303,72 @@ fn a_capture_that_cannot_read_placement_fails_and_keeps_the_last_good_layout() {
     // nothing about this is "the machine is idle".
     env.break_the_compositor();
 
-    let out = env
-        .osm()
-        .args(["snapshot", "--reason", "test"])
-        .output()
-        .unwrap();
+    let (blind, out) = env.run(&["snapshot", "--reason", "test"]);
     assert!(
-        !out.status.success(),
-        "a capture that could not read placement reported success: stdout={:?}",
-        String::from_utf8_lossy(&out.stdout)
+        out.status.success(),
+        "a capture that could not read placement threw the tmux topology away \
+         with it: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let blind_id = blind["snapshot_id"]
+        .as_i64()
+        .expect("the blind capture recorded a snapshot");
+
+    let conn = osm::db::open(&env.db()).unwrap();
+
+    // 1. The tmux tree is there. This is the whole point: a compositor
+    //    hiccup must not cost the user their sessions.
+    let sessions: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM session_rows WHERE snapshot_id = ?1 ORDER BY name")
+            .unwrap();
+        let v = stmt
+            .query_map([blind_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        v
+    };
     assert_eq!(
-        env.snapshot_ids(),
-        vec![good_id],
-        "the capture that could not see the desktop wrote a snapshot, \
-         and retention deleted the one that still held the layout"
+        sessions,
+        vec!["dev".to_string()],
+        "the blind capture recorded no sessions"
+    );
+    let panes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pane_rows p
+             JOIN window_rows w ON w.row_id = p.window_row_id
+             WHERE w.snapshot_id = ?1",
+            [blind_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(panes >= 1, "the blind capture recorded no panes");
+
+    // 2. And it says its placement is unknown, rather than letting an empty
+    //    `terminal_windows` be read as "this machine has no windows".
+    assert_eq!(
+        osm::desktop::placement_state_of(&conn, blind_id).unwrap(),
+        "unknown",
+        "a snapshot with no placement rows and no marker is a snapshot that \
+         claims the desktop is empty"
+    );
+    assert!(
+        osm::desktop::placements_of(&conn, blind_id)
+            .unwrap()
+            .is_empty(),
+        "an unknown placement must still write no rows: a guessed layout is \
+         worse than none"
+    );
+
+    // 3. And `keep_snapshots = 1` did not delete the one that knows. This is
+    //    the half the refusal was protecting, and it is now protected
+    //    directly.
+    drop(conn);
+    assert!(
+        env.snapshot_ids().contains(&good_id),
+        "retention deleted the snapshot that still held the layout: {:?}",
+        env.snapshot_ids()
     );
     let conn = osm::db::open(&env.db()).unwrap();
     let still = osm::desktop::placements_of(&conn, good_id).unwrap();
@@ -1338,6 +1406,12 @@ fn a_machine_with_no_compositor_captures_tmux_happily_when_placement_is_off() {
     assert!(
         osm::desktop::placements_of(&conn, id).unwrap().is_empty(),
         "placement is off; nothing may be recorded"
+    );
+    assert_eq!(
+        osm::desktop::placement_state_of(&conn, id).unwrap(),
+        "disabled",
+        "a machine that switched placement off has not *failed* to read it, \
+         and must not be reported as though a compositor had let it down"
     );
     let sessions: i64 = conn
         .query_row(

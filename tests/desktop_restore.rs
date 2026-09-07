@@ -123,6 +123,23 @@ fn outcomes_have_stable_machine_readable_names() {
         PlaceOutcome::PlacementDisabled.as_str(),
         "placement_disabled"
     );
+    assert_eq!(
+        PlaceOutcome::PlacementCarried("from 4".into()).as_str(),
+        "placement_carried"
+    );
+    assert_eq!(
+        PlaceOutcome::PlacementCarried("from 4".into()).detail(),
+        Some("from 4"),
+        "a carried layout has to name the snapshot it came from"
+    );
+    assert_eq!(
+        PlaceOutcome::PlacementUnknown("nothing knew".into()).as_str(),
+        "placement_unknown"
+    );
+    assert_eq!(
+        PlaceOutcome::PlacementUnknown("nothing knew".into()).detail(),
+        Some("nothing knew")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -854,5 +871,433 @@ fn what_auto_defers_to_and_what_overrides_it() {
         Some("alacritty".to_string()),
         "an explicit restore.terminal was substituted: {:?}",
         sp.argv.borrow()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// place_windows: a source snapshot whose placement is unknown.
+// ---------------------------------------------------------------------------
+
+/// A snapshot recording `placement_state`, `boot_id` and `taken_at` of its
+/// own, with placement rows only when it has a layout to hold.
+fn seed_at(
+    conn: &rusqlite::Connection,
+    taken_at: i64,
+    boot: &str,
+    placement_state: &str,
+    sessions: &[&str],
+) -> i64 {
+    conn.execute(
+        "INSERT INTO snapshots (taken_at, boot_id, reason, state, placement_state)
+         VALUES (?1, ?2, 'test', 'complete', ?3)",
+        rusqlite::params![taken_at, boot, placement_state],
+    )
+    .unwrap();
+    let snap = conn.last_insert_rowid();
+    if !sessions.is_empty() {
+        let tx = conn.unchecked_transaction().unwrap();
+        let ps: Vec<Placement> = sessions
+            .iter()
+            .map(|s| Placement {
+                session: (*s).into(),
+                address: format!("0x{s}"),
+                class: "com.mitchellh.ghostty".into(),
+                terminal_kind: "ghostty".into(),
+                workspace_kind: "numbered".into(),
+                workspace_ref: "9".into(),
+                monitor_connector: "DP-1".into(),
+                monitor_desc: None,
+                monitor_scale: None,
+                monitor_transform: None,
+                floating: false,
+                rel: None,
+            })
+            .collect();
+        desktop::write_placements_in(&tx, snap, &ps).unwrap();
+        tx.commit().unwrap();
+    }
+    snap
+}
+
+fn delivered(sessions: &[&str]) -> RestoreOutcome {
+    let mut o = RestoreOutcome::default();
+    for s in sessions {
+        o.created.push((*s).to_string());
+    }
+    o
+}
+
+/// The restore reads the last layout the same boot knew, rather than treating
+/// an unknown placement as "this session had no window".
+///
+/// # Why carry it rather than only report the shortfall
+///
+/// Both were on the table. Carrying wins because of what the two facts are:
+/// the tmux topology is what the user was *doing*, and it changes by the
+/// minute, so it must come from the newest snapshot. Where a session's
+/// terminal lives is a much slower fact — a workspace and a monitor the user
+/// chose once and rarely moves — so a copy of it from a few minutes earlier is
+/// very likely still true, and is certainly closer to the truth than opening
+/// no terminal at all. The alternative delivers a machine with the sessions
+/// back and nothing on screen, which is the failure this whole feature exists
+/// to prevent.
+///
+/// It is not a silent substitution: the pass reports which snapshot the layout
+/// came from, so `osm restore --json` says so and a human can see that this
+/// restore used a layout it did not itself record.
+#[test]
+fn an_unknown_placement_carries_the_last_layout_the_same_boot_knew() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    let known = seed_at(&conn, 100, "boot-a", "known", &["dev"]);
+    let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    // The topology the restore rebuilds is this snapshot's, and the carried
+    // layout is trimmed to it, so the session has to be in it.
+    seed_sessions(&conn, blind, &["dev"]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert!(
+        out.iter().any(|(s, _)| s == "dev"),
+        "the restore treated an unknown placement as 'this session had no \
+         window' and did nothing at all: {out:?}"
+    );
+    let note = out
+        .iter()
+        .find(|(_, o)| o.as_str() == "placement_carried")
+        .unwrap_or_else(|| panic!("the carried layout was not reported: {out:?}"));
+    assert!(
+        note.1
+            .detail()
+            .unwrap_or_default()
+            .contains(&known.to_string()),
+        "the note must name the snapshot the layout came from: {:?}",
+        note.1
+    );
+    assert!(
+        !degraded(std::slice::from_ref(note)),
+        "carrying a layout forward is not a shortfall; it is the pass doing \
+         its job with the best record there is"
+    );
+}
+
+/// And when nothing knew, the restore says so instead of reporting silence.
+///
+/// This is the other half of the choice: a shortfall that is *reported* keeps
+/// the run `partial` and the source snapshot selectable, so a later attempt
+/// can try again. An empty window list would have read as "this snapshot had
+/// no terminal windows", retired the source, and left the user with no record
+/// anywhere of where their windows belonged.
+#[test]
+fn an_unknown_placement_with_nothing_to_carry_is_a_reported_shortfall() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0].0, "*");
+    assert_eq!(out[0].1.as_str(), "placement_unknown");
+    assert!(
+        degraded(&out),
+        "a restore that could not put any window back has not finished its \
+         work, and the snapshot must stay restorable"
+    );
+    assert!(
+        sp.argv.borrow().is_empty(),
+        "nothing may be spawned with no placement to spawn it onto"
+    );
+}
+
+/// The carried layout never crosses a boot.
+///
+/// A snapshot's placement describes where windows were during *that* boot.
+/// Reaching back past a reboot would resurrect a desktop arrangement the user
+/// may have abandoned two boots ago and present it as this one's — and the
+/// restore has no way to know which. A reported shortfall is the honest answer.
+#[test]
+fn the_carried_layout_never_comes_from_another_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    seed_at(&conn, 100, "boot-older", "known", &["dev"]);
+    let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    seed_sessions(&conn, blind, &["dev"]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert_eq!(
+        out.len(),
+        1,
+        "a previous boot's layout was carried: {out:?}"
+    );
+    assert_eq!(out[0].1.as_str(), "placement_unknown");
+}
+
+/// Nor from a snapshot taken *after* it.
+///
+/// The snapshot a restore publishes when it finishes carries placement of its
+/// own, and it is newer than the source. Reading forward would let a restore
+/// place windows from the layout its own previous attempt produced, which is
+/// a claim about the machine after the restore rather than before the reboot.
+#[test]
+fn the_carried_layout_never_comes_from_a_later_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    seed_sessions(&conn, blind, &["dev"]);
+    seed_at(&conn, 300, "boot-a", "known", &["dev"]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert_eq!(
+        out.len(),
+        1,
+        "a later snapshot's layout was carried: {out:?}"
+    );
+    assert_eq!(out[0].1.as_str(), "placement_unknown");
+}
+
+/// A snapshot whose own placement is known needs no fallback, and must not be
+/// given one.
+///
+/// The control. `Known(vec![])` means the compositor answered and there were
+/// no terminal windows — a fact, not a gap — so reaching back for an older
+/// layout would put terminals on a desktop the user had deliberately cleared.
+#[test]
+fn a_known_empty_placement_is_never_backfilled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    seed_at(&conn, 100, "boot-a", "known", &["dev"]);
+    let empty = seed_at(&conn, 200, "boot-a", "known", &[]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        empty,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert!(
+        out.is_empty(),
+        "an answered, empty desktop was backfilled from an older layout: {out:?}"
+    );
+    assert!(sp.argv.borrow().is_empty());
+}
+
+/// And placement being switched off is still not a shortfall.
+///
+/// A machine with `restore.place_windows = false` records `disabled`, never
+/// `unknown`, so nothing here is owed and nothing is reported.
+#[test]
+fn placement_switched_off_owes_nothing_even_with_no_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    let off = seed_at(&conn, 200, "boot-a", "disabled", &[]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        off,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert!(out.is_empty(), "{out:?}");
+    assert!(!degraded(&out));
+}
+
+/// A `known` capture with no windows in it stops the carry-forward search,
+/// and the older layout behind it stays where it is.
+///
+/// The three-snapshot history this is about, in order:
+///
+///   1. `known`, with `dev` on workspace 9 — the user's terminals.
+///   2. the user closes every terminal, and the next capture answers
+///      `known` with no rows: the compositor was asked and there were none.
+///   3. the capture after that cannot read placement at all — `unknown`.
+///
+/// Restoring 3 must not put `dev`'s terminal back. Snapshot 2 is not a gap in
+/// the record to be searched past: it is the compositor's answer that the
+/// desktop is empty, and it is *newer* than the layout behind it. Reaching
+/// through it to snapshot 1 resurrects terminals the user deliberately closed
+/// and calls it a restore.
+///
+/// `a_known_empty_placement_is_never_backfilled` above is the same rule for
+/// the snapshot being restored itself; this is the rule for the snapshot a
+/// carry-forward walks back through, which is where it was missing.
+#[test]
+fn a_known_empty_capture_stops_the_carry_forward_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    seed_at(&conn, 100, "boot-a", "known", &["dev"]);
+    let cleared = seed_at(&conn, 200, "boot-a", "known", &[]);
+    let blind = seed_at(&conn, 300, "boot-a", "unknown", &[]);
+    // `dev` is still a live session; it is its *window* the user closed.
+    // Without this the carried list would be empty for want of a session to
+    // match, and the assertion below would pass without testing anything.
+    seed_sessions(&conn, blind, &["dev"]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert!(
+        !out.iter().any(|(s, _)| s == "dev"),
+        "a layout from before the user cleared their desktop was carried past \
+         snapshot {cleared}, which had already answered that there were no \
+         terminal windows: {out:?}"
+    );
+    assert!(
+        sp.argv.borrow().is_empty(),
+        "a terminal the user had closed was spawned again: {:?}",
+        sp.argv.borrow()
+    );
+    assert!(
+        !degraded(&out),
+        "an answered, empty desktop is a complete answer, so a restore that \
+         puts no window back has not fallen short: {out:?}"
+    );
+}
+
+/// A session row for each name, so a snapshot can say which sessions it held.
+fn seed_sessions(conn: &rusqlite::Connection, snapshot: i64, sessions: &[&str]) {
+    for (i, s) in sessions.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO session_rows (snapshot_id, tmux_session_id, name)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![snapshot, format!("${i}"), s],
+        )
+        .unwrap();
+    }
+}
+
+/// A carried layout is trimmed to the sessions the snapshot being restored
+/// actually held.
+///
+/// The layout comes from an earlier snapshot, and "earlier" is exactly when
+/// the machine held different sessions. A layout recorded while `dev` and
+/// `notes` were both open, carried onto a snapshot that has only `dev`,
+/// arrives with a window for a session this restore was never going to
+/// deliver — and `notes` is then reported `skipped`, which is a shortfall,
+/// which keeps the run partial and the source snapshot perpetually
+/// restorable for work it never contained.
+///
+/// The topology is the newest snapshot's, always; only the *placement* is
+/// borrowed. So the borrowed half is cut down to the sessions the topology
+/// has, and a session the source never held is not a window this restore owes
+/// anybody.
+#[test]
+fn a_carried_layout_is_trimmed_to_the_sessions_the_source_actually_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = osm::db::open(&tmp.path().join("s.db")).unwrap();
+    let known = seed_at(&conn, 100, "boot-a", "known", &["dev", "notes"]);
+    seed_sessions(&conn, known, &["dev", "notes"]);
+    // By the time the placement-blind capture ran, `notes` was gone.
+    let blind = seed_at(&conn, 200, "boot-a", "unknown", &[]);
+    seed_sessions(&conn, blind, &["dev"]);
+
+    let h = Recording {
+        dispatched: Default::default(),
+    };
+    let sp = NoSpawn::default();
+    let out = place_windows(
+        &h,
+        &sp,
+        &no_server(),
+        &conn,
+        blind,
+        &delivered(&["dev"]),
+        7,
+        &cfg(),
+    );
+
+    assert!(
+        !out.iter().any(|(s, _)| s == "notes"),
+        "a window was owed for a session the snapshot being restored never \
+         held: {out:?}"
+    );
+    assert!(
+        out.iter().any(|(s, _)| s == "dev"),
+        "the sessions the source did hold must still get their carried \
+         layout: {out:?}"
     );
 }

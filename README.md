@@ -16,6 +16,13 @@ both in the tree; neither has been released or submitted yet.
 
 ## Building
 
+Most people do not need this. [Installing from a
+release](#installing-from-a-release) downloads a prebuilt `osm` and verifies
+it against the SHA-256 that the workflow which built it wrote into the
+installer — no toolchain, no build, and a check that a source install cannot
+make. Build from source to work on osm itself, or on a machine this release
+ships no binary for.
+
 ```bash
 cargo build --release
 install -Dm755 target/release/osm ~/.local/share/osm/bin/osm
@@ -626,9 +633,28 @@ it back there. A session whose window did not come back makes the restore
 Because that placement is part of the state osm promises to keep, a capture
 that is asked for it and **cannot read it** — Hyprland not answering,
 `hyprctl` printing something that is not a client list, the tmux server
-changing identity mid-read — fails and is retried, instead of recording "no
-session has a terminal window" over the last good layout and pruning that
-layout out of retention.
+changing identity mid-read — does not write down "no session has a terminal
+window". The read is re-attempted for up to three seconds first, and if it
+still cannot be made, the snapshot is recorded with its placement marked
+**unknown**: a third state, distinct both from "the compositor answered and
+there were no windows" and from "placement is switched off". Your sessions,
+panes, working directories and agent bindings are captured either way — a
+compositor that stutters for a second must not cost you the whole snapshot.
+
+Three things follow from that mark, and they are the reason it exists:
+
+* Retention never deletes the newest snapshot that *does* carry placement, so
+  a run of placement-blind captures cannot age the last record of your layout
+  out of the database.
+* A restore of an unknown-placement snapshot takes its window layout from the
+  newest earlier snapshot of the same boot that knew — never across a reboot,
+  never from a later one — and says so, as `placement_carried` in
+  `osm restore --json`. If nothing knew, it reports `placement_unknown`, the
+  run is `partial`, and the source snapshot stays restorable.
+* `osm status --json` reports it as `snapshot.placement`
+  (`known` | `unknown` | `disabled`) and the panel says so in words. It is not
+  a capture failure and is not shown as one — the capture succeeded; it is the
+  snapshot that knows less.
 
 On a machine with no compositor, say so once:
 

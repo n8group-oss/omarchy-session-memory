@@ -266,8 +266,267 @@ fn placement_read_from_a_replacement_server_is_not_attached_to_the_first_ones_to
     };
     let mut topo = topo;
     osm::capture::attach_placements(&mut topo, &t, &f).unwrap();
+    assert!(
+        topo.placements.is_unknown(),
+        "placement read from server {second} was attached to server {first}'s \
+         topology: {:?}",
+        topo.placements
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The bounded retry: a compositor that stutters is asked again.
+// ---------------------------------------------------------------------------
+
+/// A compositor whose first `fail_first` client reads fail and whose later
+/// ones answer, so a test can tell a *transient* failure from a dead one.
+struct Flaky {
+    remaining_failures: std::cell::Cell<u32>,
+    calls: std::cell::Cell<u32>,
+    clients: String,
+}
+
+impl Flaky {
+    fn new(fail_first: u32, clients: &str) -> Self {
+        Flaky {
+            remaining_failures: std::cell::Cell::new(fail_first),
+            calls: std::cell::Cell::new(0),
+            clients: clients.to_string(),
+        }
+    }
+}
+
+impl HyprCtl for Flaky {
+    fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
+        self.calls.set(self.calls.get() + 1);
+        let left = self.remaining_failures.get();
+        if left > 0 {
+            self.remaining_failures.set(left - 1);
+            anyhow::bail!("could not connect to the Hyprland socket");
+        }
+        Ok(self.clients.clone())
+    }
+    fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
+        Ok(MONITORS.to_string())
+    }
+    fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
+        panic!("no test here may dispatch: it would move a real window")
+    }
+}
+
+/// The instant that made the maintainer lose 37% of an hour's captures.
+///
+/// `hyprctl` answered in 5ms throughout and a standalone reproduction of the
+/// read succeeded 6 times out of 6, so what fails is not a dead compositor —
+/// it is one of the transient branches, hit in the instant it has no answer.
+/// Giving up on the first refusal turns that instant into a snapshot with no
+/// placement in it. Asking again, within a bound, turns it into nothing at
+/// all.
+#[test]
+fn a_compositor_that_stutters_once_is_asked_again_rather_than_written_off() {
+    let t = server("stutter");
+    let f = Flaky::new(1, A_BROWSER);
+    let deadline = std::time::Instant::now() + desktop::PLACEMENT_READ_BUDGET;
+
+    match desktop::placements_within(&f, &t, deadline).unwrap() {
+        desktop::PlacementRead::Mapped(_, ps) => assert!(ps.is_empty(), "{ps:?}"),
+        other => panic!("one failed call was treated as an unreadable desktop: {other:?}"),
+    }
     assert_eq!(
-        topo.placements, None,
-        "placement read from server {second} was attached to server {first}'s topology"
+        f.calls.get(),
+        2,
+        "the read was not retried, or was retried more than it needed to be"
+    );
+}
+
+/// And the retry is a bound, not a loop.
+///
+/// A compositor that has really gone away must not hold a capture open. The
+/// budget is what separates "wait out an instant" from "wait for a machine
+/// that is not coming back", and a retry with no ceiling would park the
+/// daemon's two-minute tick inside a dead `hyprctl`.
+#[test]
+fn a_compositor_that_never_answers_gives_up_inside_the_budget() {
+    let t = server("givesup");
+    let f = Flaky::new(u32::MAX, A_BROWSER);
+
+    let started = std::time::Instant::now();
+    let read =
+        desktop::placements_within(&f, &t, started + desktop::PLACEMENT_READ_BUDGET).unwrap();
+    let elapsed = started.elapsed();
+
+    match read {
+        desktop::PlacementRead::Unreadable(why) => assert!(
+            why.contains("Hyprland"),
+            "the reason must name what actually went wrong: {why}"
+        ),
+        other => panic!("a compositor that never answered produced {other:?}"),
+    }
+    assert!(
+        elapsed < desktop::PLACEMENT_READ_BUDGET * 2,
+        "the retry ran for {elapsed:?}, past its {:?} budget",
+        desktop::PLACEMENT_READ_BUDGET
+    );
+    assert!(
+        f.calls.get() > 1,
+        "nothing was retried at all: {} call(s)",
+        f.calls.get()
+    );
+}
+
+/// The retry never papers over the incarnation check.
+///
+/// Topology and placement must still come from one tmux incarnation. A read
+/// that is retried until it succeeds is still a read of whatever server is
+/// there *now*, and if that is not the server the topology came from, the two
+/// describe different machines and must not be stored together.
+#[test]
+fn the_retry_does_not_relax_the_incarnation_check() {
+    let t = server("retryidentity");
+    let mut topo = osm::capture::collect(&t).unwrap();
+    // A topology attributed to a server that is not the one running here.
+    topo.server = Some("deadbeefdeadbeef".to_string());
+
+    let f = Flaky::new(1, A_BROWSER);
+    osm::capture::attach_placements(&mut topo, &t, &f).unwrap();
+
+    assert!(
+        topo.placements.is_unknown(),
+        "a retried read was attached to a topology from another server: {:?}",
+        topo.placements
+    );
+}
+
+/// And a topology that belongs to no tmux server is not made to wait out the
+/// budget.
+///
+/// There is no session for a window to hold, so there is nothing the retry
+/// could discover; spending the whole budget on it would put three seconds
+/// into a capture that has nothing to place. Built by hand rather than by
+/// `collect`, which cannot produce this shape — it fails outright when the
+/// server it was pointed at is not there — while `Topology` can hold it and
+/// `write_topology_in` has a branch for it.
+#[test]
+fn a_topology_with_no_server_is_answered_at_once_rather_than_waited_out() {
+    let t = Tmux::with_socket(&socket("noserver-fast"));
+    assert!(!t.server_running(), "this socket must have no server on it");
+    let mut topo = osm::capture::Topology {
+        placements: osm::desktop::Placements::Off,
+        sessions: Vec::new(),
+        windows: Vec::new(),
+        panes: Vec::new(),
+        server: None,
+        server_at_end: None,
+    };
+
+    let f = Flaky::new(0, A_BROWSER);
+    let started = std::time::Instant::now();
+    osm::capture::attach_placements(&mut topo, &t, &f).unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(topo.placements.is_unknown(), "{:?}", topo.placements);
+    assert_eq!(
+        f.calls.get(),
+        0,
+        "the compositor was asked about a machine with no tmux server on it"
+    );
+    assert!(
+        elapsed < desktop::PLACEMENT_READ_BUDGET,
+        "waited {elapsed:?} for a server that is not there"
+    );
+}
+
+/// A compositor that takes the time it is given, and remembers how much that
+/// was.
+///
+/// `Flaky` above answers instantly and ignores its `budget`, which is why the
+/// six-second assertion in
+/// [`a_compositor_that_never_answers_gives_up_inside_the_budget`] cannot see
+/// this defect: a stub that never waits makes any budget look the same. This
+/// one behaves the way `hypr::run_hyprctl` does — it runs until it is either
+/// finished or out of budget — so what the read hands it decides how long the
+/// capture is held open.
+struct Timed {
+    /// Every budget handed to the compositor, in call order.
+    budgets: std::cell::RefCell<Vec<std::time::Duration>>,
+    /// How long the client list takes to come back.
+    clients_take: std::time::Duration,
+    /// How long the monitor list runs before giving up — capped so that a
+    /// failing run of this test finishes in seconds rather than in the
+    /// fifteen it is complaining about.
+    monitors_cap: std::time::Duration,
+}
+
+impl HyprCtl for Timed {
+    fn clients_json(&self, budget: std::time::Duration) -> anyhow::Result<String> {
+        self.budgets.borrow_mut().push(budget);
+        std::thread::sleep(self.clients_take.min(budget));
+        Ok(A_BROWSER.to_string())
+    }
+    fn monitors_json(&self, budget: std::time::Duration) -> anyhow::Result<String> {
+        self.budgets.borrow_mut().push(budget);
+        std::thread::sleep(budget.min(self.monitors_cap));
+        anyhow::bail!("could not connect to the Hyprland socket")
+    }
+    fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
+        panic!("no test here may dispatch: it would move a real window")
+    }
+}
+
+/// The retry budget bounds the calls it makes, not just how many of them
+/// there are.
+///
+/// `PLACEMENT_READ_BUDGET` is three seconds, and the reason it is three is
+/// that a capture is held open for the whole of it — `attach_placements` runs
+/// inside one. Handing each `hyprctl` call the independent fifteen-second
+/// `CALL_TIMEOUT` made that bound a statement about nothing: an attempt
+/// starting a millisecond before the deadline still ran two calls of up to
+/// fifteen seconds each, so a compositor that had wedged rather than died
+/// held the capture for thirty seconds against a budget of three.
+///
+/// So each call is started with what is left of the budget, recomputed
+/// between them — the same rule `spawn_and_place` already follows through
+/// `call_budget`, which is also where the floor comes from: a deadline may
+/// bound how long osm waits, but it may not cut a call off after a
+/// millisecond and call the placement failed for nothing but arithmetic.
+#[test]
+fn each_compositor_call_is_started_with_what_is_left_of_the_budget() {
+    let t = server("callbudget");
+    let h = Timed {
+        budgets: std::cell::RefCell::new(Vec::new()),
+        clients_take: std::time::Duration::from_millis(1200),
+        monitors_cap: std::time::Duration::from_secs(4),
+    };
+
+    let started = std::time::Instant::now();
+    let read =
+        desktop::placements_within(&h, &t, started + desktop::PLACEMENT_READ_BUDGET).unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(read, desktop::PlacementRead::Unreadable(_)),
+        "the monitor list never came back, so this is not a readable desktop: {read:?}"
+    );
+
+    let budgets = h.budgets.borrow().clone();
+    assert!(
+        budgets.len() >= 2,
+        "both halves of the read have to be asked before this can say anything: {budgets:?}"
+    );
+    assert!(
+        budgets.iter().all(|b| *b <= desktop::PLACEMENT_READ_BUDGET),
+        "a call was started with more time than the whole retry budget: {budgets:?}"
+    );
+    assert!(
+        budgets[1] < budgets[0],
+        "the second call was not given the budget the first one had spent \
+         ({:?} then {:?}); it is recomputed between them or it bounds nothing",
+        budgets[0],
+        budgets[1]
+    );
+    assert!(
+        elapsed < desktop::PLACEMENT_READ_BUDGET * 2,
+        "the read held the capture open for {elapsed:?} against a {:?} budget",
+        desktop::PLACEMENT_READ_BUDGET
     );
 }

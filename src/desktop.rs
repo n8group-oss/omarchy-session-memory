@@ -401,10 +401,113 @@ pub fn placements(
     h: &dyn crate::hypr::HyprCtl,
     tmux: &crate::tmux::Tmux,
 ) -> Result<Option<Vec<Placement>>> {
-    Ok(placements_with_incarnation(h, tmux)?.map(|(_, ps)| ps))
+    let deadline = std::time::Instant::now() + PLACEMENT_READ_BUDGET;
+    Ok(match placements_with_incarnation(h, tmux, deadline)? {
+        PlacementRead::Mapped(_, ps) => Some(ps),
+        PlacementRead::Unreadable(_) => None,
+    })
 }
 
-/// [`placements`], and the tmux incarnation the mapping was read from.
+/// The outcome of one attempt to read the placement.
+///
+/// `Unreadable` and `Mapped(_, vec![])` are the two answers that used to be
+/// one `Ok(None)`/`Ok(Some(vec![]))` pair, and keeping them apart is the whole
+/// subject of this module: "the compositor answered and no terminal has a
+/// session in it" is a fact; "one of the two could not be read" is the absence
+/// of one, and writing the second down as the first is what destroyed the
+/// maintainer's original mapping.
+///
+/// `Unreadable` carries *why*, which the `Ok(None)` it replaced could not. Six
+/// different failures produced that value — a tmux that would not identify
+/// itself, a compositor that did not answer, a reply that did not parse, a
+/// `list-clients` that errored, output that did not parse, an identity that
+/// moved mid-read — and an operator looking at a machine where captures keep
+/// coming back placement-blind has no way to act on "one of six things".
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementRead {
+    /// The mapping, and the tmux incarnation both halves were read from.
+    Mapped(String, Vec<Placement>),
+    /// It could not be read, and what went wrong.
+    Unreadable(String),
+}
+
+/// How long the placement read may spend being retried before it is called
+/// unreadable.
+///
+/// A bound on a *retry*, not a wait for slow work — the same distinction
+/// [`MONITOR_READ_BUDGET`] draws, and the same three seconds. On the
+/// maintainer's machine `hyprctl` answered in 5ms throughout while 11 captures
+/// in 19 came back with no placement, and a standalone reproduction of the
+/// read succeeded 6 times out of 6: what fails is one of the transient
+/// branches below, hit in the instant it has no answer, not a compositor that
+/// has gone away. Three seconds is long enough to cross that instant and short
+/// enough that a machine whose compositor really has died does not hold up the
+/// daemon's tick.
+pub const PLACEMENT_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often the placement read is re-attempted while
+/// [`PLACEMENT_READ_BUDGET`] lasts.
+const PLACEMENT_READ_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`placements_with_incarnation`], re-attempted until it succeeds or
+/// `deadline` passes.
+///
+/// # The budget bounds the calls, not only the number of them
+///
+/// Each `hyprctl` call is started with whatever is left before `deadline`,
+/// recomputed between the two halves of an attempt — the same rule
+/// [`monitors_within`] and [`spawn_and_place`] follow, through
+/// [`call_budget`].
+///
+/// It used to hand every call the full, independent
+/// [`crate::hypr::CALL_TIMEOUT`] and bound only the *number* of attempts,
+/// which made this budget a statement about nothing: an attempt starting a
+/// millisecond before the deadline still ran a client list and a monitor list
+/// of up to fifteen seconds each, so a compositor that had wedged rather than
+/// died held the capture open for thirty seconds against a bound of three.
+/// And it is a capture that is held: [`crate::capture::attach_placements`]
+/// runs inside one, which is the entire reason this bound is three seconds.
+///
+/// [`call_budget`]'s floor is what keeps that from going too far the other
+/// way — the last call before a deadline still gets a whole second, because a
+/// deadline may bound how long osm waits and may not cut a call off after a
+/// millisecond and report the placement failed for nothing but arithmetic.
+///
+/// One attempt always happens, whatever `deadline` says. A budget is a bound
+/// on waiting, never a reason to skip the question.
+///
+/// The incarnation equality inside each attempt is untouched, and so is the
+/// one [`crate::capture::attach_placements`] makes against the topology: a
+/// retried read is still a read of whatever server is there *now*, and if that
+/// is not the server the topology came from, the two describe different
+/// machines.
+pub fn placements_within(
+    h: &dyn crate::hypr::HyprCtl,
+    tmux: &crate::tmux::Tmux,
+    deadline: std::time::Instant,
+) -> Result<PlacementRead> {
+    loop {
+        let why = match placements_with_incarnation(h, tmux, deadline)? {
+            mapped @ PlacementRead::Mapped(_, _) => return Ok(mapped),
+            PlacementRead::Unreadable(why) => why,
+        };
+        if expired(deadline) {
+            return Ok(PlacementRead::Unreadable(why));
+        }
+        // Checked on both sides of the wait, for the reason `monitors_within`
+        // gives: sleeping a flat poll interval and then asking again unchecked
+        // turns the bound into the bound plus one whole attempt.
+        std::thread::sleep(
+            PLACEMENT_READ_POLL.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+        if expired(deadline) {
+            return Ok(PlacementRead::Unreadable(why));
+        }
+    }
+}
+
+/// One attempt at [`placements`], with the tmux incarnation the mapping was
+/// read from.
 ///
 /// The identity has to leave this function. Checking it only *inside* the
 /// collection proves the client list and the window list describe one server,
@@ -415,40 +518,75 @@ pub fn placements(
 /// they were one machine state. Plan 1 applies exactly this rule to its three
 /// `list-*` reads; it simply had never been carried across the
 /// tmux/compositor boundary. See [`crate::capture::attach_placements`].
+///
+/// Every failure below is transient as far as this function can tell, so none
+/// of them is final: [`placements_within`] is what production calls, and it
+/// asks again within a bounded budget before the answer is written down.
 pub fn placements_with_incarnation(
     h: &dyn crate::hypr::HyprCtl,
     tmux: &crate::tmux::Tmux,
-) -> Result<Option<(String, Vec<Placement>)>> {
+    deadline: std::time::Instant,
+) -> Result<PlacementRead> {
     // The tmux server's identity is read *before* the compositor and again
     // after the client list, so the whole mapping is known to describe one
     // server. A server replaced in between hands out `$0`, `%0`, … from zero
     // again, and the sessions its clients name are not the sessions this
     // snapshot's topology holds.
     //
-    // `Ok(None)` — no server at all — is `None` here too, deliberately.
+    // `Ok(None)` — no server at all — is unreadable here too, deliberately.
     // Terminals do not vanish when tmux dies; a window whose session cannot
     // be read is a window whose placement is unknown, and "unknown" must
     // never be written down as "there were none".
     let before = match tmux.running_server_incarnation() {
         Ok(Some(id)) => id,
-        _ => return Ok(None),
+        Ok(None) => {
+            return Ok(PlacementRead::Unreadable(
+                "no tmux server was running, so no window could be matched to a session".into(),
+            ))
+        }
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server would not identify itself: {e:#}"
+            )))
+        }
     };
 
-    let clients_json = match h.clients_json(crate::hypr::CALL_TIMEOUT) {
+    // `call_budget` is re-evaluated for each of the two calls rather than
+    // computed once: the client list is the slow half, and a monitor list
+    // started with the budget the client list has already spent is a call
+    // outside the bound this whole function is under.
+    let clients_json = match h.clients_json(call_budget(deadline)) {
         Ok(j) => j,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor would not list its windows: {e:#}"
+            )))
+        }
     };
-    let monitors_json = match h.monitors_json(crate::hypr::CALL_TIMEOUT) {
+    let monitors_json = match h.monitors_json(call_budget(deadline)) {
         Ok(j) => j,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor would not list its monitors: {e:#}"
+            )))
+        }
     };
     // A malformed reply is an unreachable compositor, not an empty desktop.
-    let (windows, monitors) = match (
-        crate::hypr::parse_clients(&clients_json),
-        crate::hypr::parse_monitors(&monitors_json),
-    ) {
-        (Ok(w), Ok(m)) => (w, m),
-        _ => return Ok(None),
+    let windows = match crate::hypr::parse_clients(&clients_json) {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor's window list could not be read: {e:#}"
+            )))
+        }
+    };
+    let monitors = match crate::hypr::parse_monitors(&monitors_json) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor's monitor list could not be read: {e:#}"
+            )))
+        }
     };
 
     // The tmux half gets the same treatment as the compositor half, which is
@@ -460,15 +598,39 @@ pub fn placements_with_incarnation(
     // retention.
     let raw = match tmux.run(&["list-clients", "-F", "#{client_pid} #{client_session}"]) {
         Ok(raw) => raw,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server would not list its clients: {e:#}"
+            )))
+        }
     };
     let tmux_clients = match parse_clients_output(&raw) {
         Ok(cs) => cs,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux client list could not be read: {e:#}"
+            )))
+        }
     };
     match tmux.running_server_incarnation() {
         Ok(Some(after)) if after == before => {}
-        _ => return Ok(None),
+        Ok(Some(after)) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server changed identity while the placement was being \
+                 read: {before} became {after}"
+            )))
+        }
+        Ok(None) => {
+            return Ok(PlacementRead::Unreadable(
+                "the tmux server went away while the placement was being read".into(),
+            ))
+        }
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server would not confirm its identity after the placement \
+                 was read: {e:#}"
+            )))
+        }
     }
 
     let mapped = map_windows(&windows, &tmux_clients);
@@ -497,7 +659,7 @@ pub fn placements_with_incarnation(
             rel: relative_geometry(w, &monitors),
         });
     }
-    Ok(Some((before, out)))
+    Ok(PlacementRead::Mapped(before, out))
 }
 
 /// The terminal a window class belongs to, for spawning its like again.
@@ -511,12 +673,99 @@ pub fn terminal_kind_of(class: &str) -> String {
     class.to_string()
 }
 
+/// What a capture found out about window placement.
+///
+/// Three answers, and the third is the whole reason this type exists.
+/// `Option<Vec<Placement>>` could only say "here it is" or "here it is not",
+/// so a compositor that hiccupped for one capture and a machine that has no
+/// windows produced the same value — and the only safe thing to do with an
+/// ambiguity like that was to refuse the capture outright, which cost the
+/// user the tmux topology as well. Naming the third state instead lets the
+/// snapshot be recorded and lets everything downstream — retention, restore,
+/// `osm status` — treat *unknown* as the different fact it is.
+///
+/// The project's own rule, one level up: unknown placement is not absent
+/// placement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Placements {
+    /// The compositor answered, the tmux server answered, and both described
+    /// the same server incarnation. This is every terminal window that had a
+    /// session in it — and an **empty** vector is a fact, not an absence:
+    /// there were none.
+    Known(Vec<Placement>),
+    /// One of them could not be read, or the two described different tmux
+    /// servers. Carries the last thing that went wrong, for the operator who
+    /// has to work out which.
+    ///
+    /// Emphatically not `Known(vec![])`. Writing this down as an empty layout
+    /// is what destroyed the maintainer's original mapping.
+    Unknown(String),
+    /// The compositor was never asked: `restore.place_windows` is off, or
+    /// this capture path has no compositor to ask (a tmux-only capture, a
+    /// test). Not a failure, and nothing is owed.
+    Off,
+}
+
+/// `snapshots.placement_state` for [`Placements::Known`].
+pub const PLACEMENT_KNOWN: &str = "known";
+/// `snapshots.placement_state` for [`Placements::Unknown`].
+pub const PLACEMENT_UNKNOWN: &str = "unknown";
+/// `snapshots.placement_state` for [`Placements::Off`].
+pub const PLACEMENT_DISABLED: &str = "disabled";
+
+impl Placements {
+    /// The token this is stored as in `snapshots.placement_state`.
+    pub fn state(&self) -> &'static str {
+        match self {
+            Placements::Known(_) => PLACEMENT_KNOWN,
+            Placements::Unknown(_) => PLACEMENT_UNKNOWN,
+            Placements::Off => PLACEMENT_DISABLED,
+        }
+    }
+
+    /// The windows, when they are known. `None` is *not* "there were none" —
+    /// callers that write rows must use this rather than an empty slice, so
+    /// that "unknown" can never be flattened into "empty" by accident.
+    pub fn known(&self) -> Option<&[Placement]> {
+        match self {
+            Placements::Known(ps) => Some(ps),
+            _ => None,
+        }
+    }
+
+    /// Why the placement could not be read, or `None` when it could be or was
+    /// never asked for.
+    pub fn why(&self) -> Option<&str> {
+        match self {
+            Placements::Unknown(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Placements::Unknown(_))
+    }
+}
+
+/// What snapshot `snapshot_id` knows about its window placement.
+///
+/// The raw token, not a rendering of it, and an error rather than a guess for
+/// a snapshot that is not there: every caller of this decides something about
+/// retention or restore, and a default would decide it wrongly and silently.
+pub fn placement_state_of(conn: &rusqlite::Connection, snapshot_id: i64) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT placement_state FROM snapshots WHERE id = ?1",
+        [snapshot_id],
+        |r| r.get(0),
+    )?)
+}
+
 /// Write a snapshot's window placement.
 ///
 /// Called inside the snapshot's own transaction so placement lands with the
-/// topology it describes or not at all. `None` means the compositor could
-/// not be trusted and nothing is written — the rows already present belong
-/// to earlier snapshots and are left alone.
+/// topology it describes or not at all. Only ever reached for
+/// [`Placements::Known`]: an unknown placement writes nothing, and the rows
+/// already present belong to earlier snapshots and are left alone.
 pub fn write_placements_in(
     tx: &rusqlite::Transaction,
     snapshot_id: i64,
@@ -607,6 +856,157 @@ pub fn placements_of(conn: &rusqlite::Connection, snapshot_id: i64) -> Result<Ve
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// The layout a restore of one snapshot should put back, and where it came
+/// from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementForRestore {
+    /// The snapshot's own placement — it was `known` (possibly empty) or
+    /// `disabled`, and either way it is the answer.
+    Own(Vec<Placement>),
+    /// The snapshot's placement was `unknown`, and this is the newest earlier
+    /// snapshot of the **same boot** that knew, with its id and the time it
+    /// was taken.
+    ///
+    /// `placements` is that snapshot's layout **trimmed to the sessions the
+    /// snapshot being restored holds**. The two snapshots are minutes apart
+    /// and the machine's sessions move in minutes, so an untrimmed carry
+    /// hands the pass a window to owe for a session this restore was never
+    /// going to deliver.
+    Carried {
+        from: i64,
+        taken_at: i64,
+        placements: Vec<Placement>,
+    },
+    /// The snapshot's placement was `unknown` and nothing earlier in the same
+    /// boot knew either. There is no layout to put back and none may be
+    /// invented.
+    Unavailable,
+}
+
+/// What a restore of `snapshot_id` has to work with.
+///
+/// # Why an older layout beats no layout
+///
+/// The tmux topology and the window placement are facts of very different
+/// speeds. What sessions and panes exist, and what is running in them, changes
+/// by the minute — so the topology must come from the newest snapshot, always.
+/// Which workspace and monitor a session's terminal lives on is something the
+/// user decided once and rarely revisits; a copy of it from a few minutes
+/// earlier in the same boot is very likely still true, and is certainly closer
+/// to the truth than opening no terminal at all.
+///
+/// The alternative — report the shortfall and place nothing — hands the user
+/// back their sessions with an empty screen, which is the outcome this whole
+/// feature exists to prevent. So the layout is carried forward, and the carry
+/// is *reported* ([`PlaceOutcome::PlacementCarried`]) rather than performed
+/// silently: a restore that used a layout it did not itself record has to say
+/// so.
+///
+/// # The two directions it will not look
+///
+/// **Across a boot.** A snapshot's placement describes where windows were
+/// during that boot. Reaching further back would resurrect an arrangement the
+/// user may have abandoned two reboots ago and present it as this one's.
+///
+/// **Forward.** The snapshot a restore publishes when it finishes carries
+/// placement of its own and is newer than the source; reading forward would
+/// let a restore place windows from the layout its own earlier attempt
+/// produced — a claim about the machine after the restore rather than before
+/// the reboot.
+///
+/// A snapshot that is `known` is never backfilled, empty or not:
+/// `Known(vec![])` is the compositor answering that there are no terminal
+/// windows, and putting terminals onto a desktop the user deliberately
+/// cleared is not a restore.
+pub fn placement_for_restore(
+    conn: &rusqlite::Connection,
+    snapshot_id: i64,
+) -> Result<PlacementForRestore> {
+    let (state, boot_id, taken_at) = conn.query_row(
+        "SELECT placement_state, boot_id, taken_at FROM snapshots WHERE id = ?1",
+        [snapshot_id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    if state != PLACEMENT_UNKNOWN {
+        return Ok(PlacementForRestore::Own(placements_of(conn, snapshot_id)?));
+    }
+
+    // Same boot, and not later than the source. The *newest* earlier `known`
+    // snapshot wins, and it wins whether or not it holds any windows.
+    //
+    // Requiring rows here — `AND EXISTS (SELECT 1 FROM terminal_windows …)`,
+    // which is what this used to say — let the search walk straight through
+    // an answered empty desktop. The history that breaks is ordinary: a
+    // `known` layout, the user closes every terminal, a `known` capture with
+    // no rows, then a capture whose placement could not be read. Skipping the
+    // empty answer carried the layout from *before* the user cleared their
+    // desktop and put those terminals back.
+    //
+    // A `known` snapshot with no rows is not a gap in the record. It is the
+    // compositor having been asked and having said there were none, and that
+    // is the most recent thing anybody knows about where the windows were. It
+    // therefore stops the search exactly as a populated one does, and what it
+    // carries forward — nothing — is the answer.
+    let fallback: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT s.id, s.taken_at FROM snapshots s
+             WHERE s.boot_id = ?1
+               AND s.state <> 'building'
+               AND s.placement_state = 'known'
+               AND (s.taken_at < ?2 OR (s.taken_at = ?2 AND s.id < ?3))
+             ORDER BY s.taken_at DESC, s.id DESC
+             LIMIT 1",
+            rusqlite::params![boot_id, taken_at, snapshot_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    Ok(match fallback {
+        Some((from, at)) => {
+            // Only the sessions the snapshot being restored actually holds.
+            //
+            // The borrowed layout is older, and "older" is exactly when the
+            // machine held different sessions. Carrying it whole put a window
+            // on the list for a session this restore was never going to
+            // deliver, and the pass then reported that session `skipped` — a
+            // shortfall, which keeps the run partial and leaves the source
+            // snapshot restorable for ever for work it never contained.
+            //
+            // The topology is the newest snapshot's, always; only the
+            // placement is borrowed. Intersecting the two is what keeps the
+            // borrowed half from making claims the topology does not support.
+            let held = sessions_of(conn, snapshot_id)?;
+            PlacementForRestore::Carried {
+                from,
+                taken_at: at,
+                placements: placements_of(conn, from)?
+                    .into_iter()
+                    .filter(|p| held.contains(&p.session))
+                    .collect(),
+            }
+        }
+        None => PlacementForRestore::Unavailable,
+    })
+}
+
+/// The session names a snapshot's topology holds.
+fn sessions_of(
+    conn: &rusqlite::Connection,
+    snapshot_id: i64,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM session_rows WHERE snapshot_id = ?1")?;
+    let names = stmt
+        .query_map([snapshot_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<String>>>()?;
+    Ok(names)
 }
 
 /// The window a placement pass delivered, and where it put it.
@@ -709,6 +1109,25 @@ pub enum PlaceOutcome {
     /// outcome that says "no window, and that is finished work": a headless
     /// machine, or a user who wants their tmux back without terminals.
     PlacementDisabled,
+    /// The source snapshot's placement is [`Placements::Unknown`], and the
+    /// layout being applied came from an earlier snapshot of the same boot
+    /// that knew. Carries which one, and when it was taken.
+    ///
+    /// Reported against the pseudo-session `*` beside the real per-session
+    /// outcomes, because it is a statement about the pass rather than about
+    /// one window. **Not** a shortfall: the pass did its job, with the best
+    /// record of the desktop that exists. See [`placement_for_restore`] for
+    /// why an older layout is preferred to no layout.
+    PlacementCarried(String),
+    /// The source snapshot's placement is [`Placements::Unknown`] and no
+    /// earlier snapshot of the same boot knew either, so this restore has no
+    /// layout to put back and did not invent one.
+    ///
+    /// A shortfall, and deliberately so: the run stays `partial` and the
+    /// source snapshot stays selectable. Reporting nothing would have read as
+    /// "this snapshot had no terminal windows", retired the source, and left
+    /// no record anywhere of where the user's windows belonged.
+    PlacementUnknown(String),
 }
 
 impl PlaceOutcome {
@@ -723,6 +1142,8 @@ impl PlaceOutcome {
             PlaceOutcome::LostCompositor(_) => "lost_compositor",
             PlaceOutcome::Skipped(_) => "skipped",
             PlaceOutcome::PlacementDisabled => "placement_disabled",
+            PlaceOutcome::PlacementCarried(_) => "placement_carried",
+            PlaceOutcome::PlacementUnknown(_) => "placement_unknown",
         }
     }
 
@@ -732,7 +1153,9 @@ impl PlaceOutcome {
             PlaceOutcome::SpawnFailed(d)
             | PlaceOutcome::LostCompositor(d)
             | PlaceOutcome::Misplaced(d)
-            | PlaceOutcome::Skipped(d) => Some(d),
+            | PlaceOutcome::Skipped(d)
+            | PlaceOutcome::PlacementCarried(d)
+            | PlaceOutcome::PlacementUnknown(d) => Some(d),
             _ => None,
         }
     }

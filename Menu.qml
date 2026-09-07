@@ -91,6 +91,10 @@ Panel {
 
   property string actionStatus: ""
   property bool restoreArmed: false
+  // Which command `actionProcess` is currently running, so its output is read
+  // as what it is: `osm restore --json` prints a report worth reading and
+  // `osm snapshot` prints nothing of the kind.
+  property string actionKind: ""
 
   // The agents probe. Deliberately not on a timer: it walks /proc and every
   // agent's transcript store, which is far too much work to repeat every five
@@ -516,6 +520,37 @@ Panel {
       || root.captureErrorIsCurrent(capture)
   }
 
+  // What the newest snapshot knows about where its sessions' terminal
+  // windows were, or "" when there is nothing to say.
+  //
+  // A capture whose placement could not be read no longer fails — it records
+  // the tmux topology, which is the part worth having — so `capture` reads
+  // perfectly healthy while the snapshot beside it holds no window placement.
+  // Freshness alone would then tell the user their state is fully recorded
+  // when part of it is not, which is this plugin's own failure mode pointed
+  // at their confidence.
+  //
+  // Three values, three sentences. `known` is a complete answer, empty desktop
+  // or not, and says nothing. `disabled` is the user's own configuration and
+  // is stated plainly. Only `unknown` is a shortfall.
+  function placementNote(snap) {
+    if (!snap) return ""
+    var placement = String(snap.placement || "")
+    if (placement === "unknown")
+      return "this snapshot could not read where the windows were; a restore "
+           + "will use the last layout this boot recorded, if there is one"
+    if (placement === "disabled")
+      return "window placement is switched off, so none was recorded"
+    return ""
+  }
+
+  // And the alarm colour is reserved for the one of the three that is a
+  // shortfall. Colouring "placement is switched off" as a problem reports a
+  // failure the user themselves configured.
+  function placementIsAlarming(snap) {
+    return !!snap && String(snap.placement || "") === "unknown"
+  }
+
   // A session row's placement line. Absent monitor reads "monitor unknown"
   // rather than being left blank, for the same reason as the group label.
   function placementText(session) {
@@ -632,6 +667,7 @@ Panel {
 
   function snapshotNow() {
     if (actionProcess.running || engineState !== "ready") return
+    actionKind = "capture"
     actionStatus = "Capturing…"
     actionTimedOut = false
     actionProcess.command = root.argv(["snapshot", "--reason", "menu"])
@@ -655,6 +691,7 @@ Panel {
     }
     restoreArmed = false
     disarmTimer.stop()
+    actionKind = "restore"
     actionStatus = "Restoring…"
     actionTimedOut = false
     actionProcess.command = root.argv(["restore", "--json"])
@@ -695,9 +732,84 @@ Panel {
     actionStatusTimer.restart()
   }
 
+  // The `placement_carried` note in an `osm restore --json` report, or null.
+  //
+  // The engine has three ways of putting a window layout back and one of them
+  // is *borrowed*: when the source snapshot's placement could not be read at
+  // capture time, the restore carries the last layout the same boot knew and
+  // says so, naming the snapshot it took it from. That report exists because
+  // a restore that used a layout it did not itself record has to say so — and
+  // this panel is the consumer it was written for.
+  //
+  // Every failure to read the output is `null`, never a throw: this same
+  // `Process` also runs `osm snapshot`, which prints no report at all, and a
+  // run the watchdog killed leaves whatever half a report it had written.
+  function carriedNote(out) {
+    var parsed = null
+    try {
+      parsed = JSON.parse(String(out || ""))
+    } catch (e) {
+      return null
+    }
+    if (!parsed || !parsed.windows || !parsed.windows.length) return null
+    for (var i = 0; i < parsed.windows.length; i++) {
+      var w = parsed.windows[i]
+      if (w && String(w.outcome) === "placement_carried") return w
+    }
+    return null
+  }
+
+  // The snapshot a carried layout came from, or "" when the note does not
+  // name one.
+  //
+  // Read out of the note's own sentence, which is where the engine puts it —
+  // `windows[]` carries a session, an outcome and a detail, and the detail is
+  // the only place the source id appears. `tests/qml_restore_line.rs` builds
+  // its fixture from the engine's own `format!` so that a change to that
+  // sentence fails there rather than quietly leaving this returning "".
+  function carriedFrom(note) {
+    if (!note || !note.detail) return ""
+    var m = /snapshot ([0-9]+)/.exec(String(note.detail))
+    return m ? m[1] : ""
+  }
+
+  // What a finished restore is called.
+  //
+  // `Done.` for a restore that replayed the layout it recorded itself. A
+  // restore that borrowed one says so and names the snapshot it borrowed
+  // from: the user's terminals are back, but on a layout from earlier in the
+  // boot, and being told the same word as an exact replay is how a panel
+  // hides the one thing about this run that was unusual.
+  function restoreDone(out) {
+    var note = root.carriedNote(out)
+    if (note === null) return "Done."
+    var from = root.carriedFrom(note)
+    return from === ""
+      ? "Done — this snapshot had no window layout recorded; an earlier one "
+        + "from this boot was used."
+      : "Done — this snapshot had no window layout recorded; the one from "
+        + "snapshot #" + from + " was used."
+  }
+
+  // The released installer, not a build from git.
+  //
+  // Each `v*` tag publishes the binary, its SHA-256, and an `install.sh` with
+  // *that build's* digest written into it by the workflow that built it. The
+  // script checks the download against the digest it was built with rather
+  // than against a checksum fetched from the same server as the file, which
+  // would check for corruption and for nothing else.
+  //
+  // What this replaced was a one-liner that fetched the repository at whatever
+  // state its branch happened to be in, built it with a full Rust toolchain,
+  // and ran the result. The Omarchy marketplace's automated review reads a
+  // line like that as `package-manager` plus `remote-build`, and it is right
+  // to: it is slower, it needs far more installed, and it verifies nothing.
+  // Building from source belongs in the README, where a developer will look
+  // for it — and it stays the documented route on a machine this release has
+  // no binary for.
   function copyInstallCommand() {
-    Quickshell.clipboardText = "cargo install --git https://github.com/n8group-oss/omarchy-session-memory osm && osm install"
-    actionStatus = "Install command copied."
+    Quickshell.clipboardText = "curl -fsSLO https://github.com/n8group-oss/omarchy-session-memory/releases/latest/download/install.sh && sh install.sh"
+    actionStatus = "Install command copied — run `sh install.sh --dry-run` first to see every step."
     actionStatusTimer.restart()
   }
 
@@ -787,7 +899,14 @@ Panel {
       if (root.actionTimedOut) return
       var err = root.elide(String(actionErr.text || ""), 300)
       if (exitCode === 0) {
-        root.actionStatus = "Done."
+        // Not every exit 0 is the same sentence. `osm restore --json` prints
+        // a report, and one of the things it reports is that the layout it
+        // put back was borrowed from an earlier snapshot — which used to be
+        // visible in the CLI and invisible here, in the one place it was
+        // written for.
+        root.actionStatus = root.actionKind === "restore"
+          ? root.restoreDone(String(actionOut.text || ""))
+          : "Done."
       } else {
         // The exit status is reported, not swallowed. `osm restore` exits
         // non-zero for a partial restore precisely so a caller can tell that
@@ -1021,9 +1140,14 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             color: root.dim
-            text: "Install it once, then this widget fills in:\n"
-              + "  cargo install --git https://github.com/n8group-oss/omarchy-session-memory osm\n"
-              + "  osm install          # inspect it first with --dry-run"
+            text: "Install the engine once, then this widget fills in. The installer "
+              + "verifies the binary against the SHA-256 the release workflow built it "
+              + "with, which is written into the script itself:\n"
+              + "  curl -fsSLO https://github.com/n8group-oss/omarchy-session-memory/releases/latest/download/install.sh\n"
+              + "  sh install.sh --dry-run   # prints every step, touches nothing\n"
+              + "  sh install.sh\n"
+              + "Building from source is in the README, and is the only route on a "
+              + "machine that is not x86_64."
           }
 
           Flow {
@@ -1081,6 +1205,21 @@ Panel {
               color: (root.status && root.captureIsAlarming(root.status.capture))
                 ? root.urgent : root.dim
               text: root.status ? root.captureLine(root.status.capture) : ""
+            }
+
+            // What that snapshot knows about window placement. Its own line,
+            // not appended to the capture one: the capture engine is fine and
+            // saying so beside "the placement could not be read" in one
+            // sentence is how a healthy engine came to look broken once
+            // already.
+            Text {
+              visible: text !== ""
+              width: parent.width
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              color: root.placementIsAlarming(root.snapshot) ? root.urgent : root.dim
+              text: root.placementNote(root.snapshot)
             }
           }
 

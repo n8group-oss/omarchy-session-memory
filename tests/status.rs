@@ -737,3 +737,149 @@ fn a_preserved_database_is_never_called_intact_on_the_strength_of_a_row_count() 
          to call anything in it intact: {msg}"
     );
 }
+
+/// The newest snapshot says what it knows about window placement, and a
+/// snapshot that knows nothing is not reported as a failure.
+///
+/// # Why this is on the snapshot and not in `capture`
+///
+/// A capture whose placement could not be read now succeeds — it records the
+/// tmux topology, which is the thing worth having — so `capture.last_error`
+/// and `consecutive_failures` stay clean, correctly: nothing failed. But the
+/// snapshot it produced does not know where the user's windows were, and a
+/// panel that shows only "captures are fresh" would be telling the user their
+/// state is fully recorded when part of it is not.
+///
+/// So the fact travels with the snapshot it is a fact about. `known`,
+/// `unknown` and `disabled` are three different sentences, and `unknown` is
+/// the only one of them that is a shortfall.
+#[test]
+fn the_newest_snapshot_reports_what_it_knows_about_placement() {
+    let env = Env::new("placement");
+    env.write_config("[restore]\nplace_windows = false\n");
+    let t = env.tmux();
+    let _server = Server(t.clone());
+    t.run(&["new-session", "-d", "-s", "alpha", "-c", "/tmp"])
+        .unwrap();
+
+    assert!(env.osm().arg("snapshot").output().unwrap().status.success());
+
+    let v = env.status();
+    assert_eq!(
+        v["snapshot"]["placement"], "disabled",
+        "placement is switched off; the snapshot must say so rather than \
+         claim it looked and found nothing: {v}"
+    );
+
+    // The same snapshot, as a capture that could not read the compositor
+    // would have recorded it.
+    let db = env.state_dir().join("state.db");
+    {
+        let conn = osm::db::open(&db).unwrap();
+        conn.execute("UPDATE snapshots SET placement_state = 'unknown'", [])
+            .unwrap();
+    }
+
+    let v = env.status();
+    assert_eq!(
+        v["snapshot"]["placement"], "unknown",
+        "the newest snapshot does not know where the windows were, and \
+         nothing in the report says so: {v}"
+    );
+    assert_eq!(
+        v["capture"]["consecutive_failures"], 0,
+        "an unknown placement is not a capture failure: {v}"
+    );
+    assert!(
+        v["capture"]["last_error"].is_null(),
+        "and it must not be dressed up as one: {v}"
+    );
+    assert_eq!(v["ready"], true, "{v}");
+
+    {
+        let conn = osm::db::open(&db).unwrap();
+        conn.execute("UPDATE snapshots SET placement_state = 'known'", [])
+            .unwrap();
+    }
+    assert_eq!(env.status()["snapshot"]["placement"], "known");
+}
+
+// ---------------------------------------------------------------------------
+// The wedge, made visible.
+//
+// The maintainer's panel read "captures are fresh · 40 failing in a row" for
+// 83 minutes while the real reason — a UNIQUE violation against rows that
+// belonged to snapshots that were gone — was in the journal only, where the
+// tmux hooks that hit it the most send their output to /dev/null. The
+// database's own consistency was never part of the report at all, so nothing
+// a user could look at said what was wrong or that anything had been done
+// about it.
+// ---------------------------------------------------------------------------
+
+/// A database holding rows whose snapshot is gone is repaired by the open
+/// `status` itself does, and the report says so.
+///
+/// Both fields matter and they answer different questions. `orphan_rows` is
+/// the condition *now*: anything but zero means the next capture is one id
+/// away from the wedge. `repaired` is the record that it happened, which is
+/// the part a user can act on — something removed a snapshot without taking
+/// its rows, and that is worth knowing even after osm has cleared up.
+#[test]
+fn a_database_that_had_to_be_repaired_says_so() {
+    let env = Env::new("repaired");
+    let path = env.state_dir().join("state.db");
+    {
+        let conn = osm::db::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete'),
+                      (2, 200, 'boot-a', 'manual', 'complete');
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (10, 1, '$0', 'kept'), (11, 2, '$0', 'doomed');
+             INSERT INTO window_rows (row_id, snapshot_id, tmux_window_id, name, layout)
+               VALUES (20, 1, '@0', 'w', 'l'), (21, 2, '@0', 'w', 'l');",
+        )
+        .unwrap();
+    }
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        raw.execute_batch("DROP TRIGGER IF EXISTS snapshots_cascade_delete")
+            .unwrap();
+        raw.execute("DELETE FROM snapshots WHERE id = 2", [])
+            .unwrap();
+    }
+
+    let v = env.status();
+    let db = &v["database"];
+    assert_eq!(
+        db["orphan_rows"], 0,
+        "the open behind this report must have cleared them: {v}"
+    );
+    assert_eq!(
+        db["repaired"]["rows"], 2,
+        "and must say how many it cleared: {v}"
+    );
+    assert!(
+        db["repaired"]["at"].as_i64().unwrap_or(0) > 0,
+        "and when: {v}"
+    );
+}
+
+/// A healthy database reports no repair at all — `null`, not a repair of zero
+/// rows.
+///
+/// A widget that shows "the database was repaired" every five seconds on a
+/// machine where nothing ever went wrong is the same defect as one that shows
+/// nothing when something did.
+#[test]
+fn a_healthy_database_reports_no_repair() {
+    let env = Env::new("norepair");
+    let v = env.status();
+    let db = &v["database"];
+    assert_eq!(db["orphan_rows"], 0, "{v}");
+    assert!(
+        db["repaired"].is_null(),
+        "a database that has never needed a repair must not report one: {v}"
+    );
+}

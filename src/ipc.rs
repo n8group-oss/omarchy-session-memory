@@ -57,6 +57,30 @@ pub struct DatabaseStatus {
     /// upgraded and typed `osm status` is exactly the person who needs to be
     /// told.
     pub preserved: Option<PreservedDatabase>,
+    /// Rows in the database right now that belong to a snapshot which is not
+    /// there. Zero in every ordinary case, and reported rather than assumed:
+    /// a non-zero count is the condition that took the maintainer's capture
+    /// down for 83 minutes, and until this field existed nothing a user could
+    /// look at said the database was in it. `null` when the database could
+    /// not be read at all.
+    pub orphan_rows: Option<i64>,
+    /// The last time an `open` had to clear such rows, `null` if it never
+    /// has.
+    ///
+    /// Kept after the fact on purpose. osm repairs the file itself, so the
+    /// count above goes back to zero immediately — but *something removed a
+    /// snapshot and left its rows behind*, and that is worth a user's
+    /// attention whether or not osm has already tidied up after it.
+    pub repaired: Option<RepairedRows>,
+}
+
+/// A repair [`crate::db::open`] performed on the snapshot database.
+#[derive(Debug, Serialize)]
+pub struct RepairedRows {
+    /// Epoch seconds.
+    pub at: i64,
+    /// How many rows it removed.
+    pub rows: i64,
 }
 
 /// A database an incompatible schema version pushed aside.
@@ -250,6 +274,24 @@ pub struct SnapshotSummary {
     pub age_secs: i64,
     pub state: String,
     pub sessions: usize,
+    /// What this snapshot knows about where its sessions' terminal windows
+    /// were: `known`, `unknown` or `disabled` — the raw
+    /// `snapshots.placement_state` token, never a rendering of it.
+    ///
+    /// It lives here rather than in [`CaptureStatus`] because it is a fact
+    /// about *this snapshot*, not about the capture engine. A capture whose
+    /// placement could not be read now succeeds — it records the tmux
+    /// topology, which is the thing worth having — so the failure streak
+    /// stays clean, correctly. But the snapshot it produced does not know
+    /// where the user's windows were, and a panel showing "captures are
+    /// fresh" and nothing else would be telling the user their state is fully
+    /// recorded when part of it is not.
+    ///
+    /// `unknown` is the only one of the three that is a shortfall. `disabled`
+    /// is the user's own choice and `known` is a complete answer, empty or
+    /// not; a reader that treats either as a problem is reporting a failure
+    /// that did not happen.
+    pub placement: String,
 }
 
 // A seam for `tests::a_concurrent_capture_and_prune_cannot_split_the_summary`,
@@ -293,6 +335,11 @@ pub struct DatabaseSummary {
     /// A database an incompatible schema version pushed aside, if there is
     /// one.
     pub preserved: Option<crate::db::Preserved>,
+    /// Rows belonging to a snapshot that is not on record. Read here, with
+    /// everything else, so it describes the same moment as the counts above.
+    pub orphan_rows: i64,
+    /// The last repair `open` had to perform on this database.
+    pub repaired: Option<crate::db::Repair>,
     /// The newest snapshot worth restoring, or `None`.
     pub snapshot: Option<SnapshotSummary>,
     /// Its sessions, empty when there is no snapshot.
@@ -341,7 +388,7 @@ pub fn summarize(
     let read = conn.unchecked_transaction()?;
     let newest = read
         .query_row(
-            "SELECT id, taken_at, state FROM snapshots
+            "SELECT id, taken_at, state, placement_state FROM snapshots
              WHERE state <> 'building'
              ORDER BY taken_at DESC, id DESC
              LIMIT 1",
@@ -351,6 +398,7 @@ pub fn summarize(
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             },
         )
@@ -369,11 +417,15 @@ pub fn summarize(
         })?;
 
     let preserved = crate::db::preserved(&read);
-    let Some((id, taken_at, state)) = newest else {
+    let orphan_rows = crate::db::orphan_rows(&read)?;
+    let repaired = crate::db::last_repair(&read);
+    let Some((id, taken_at, state, placement)) = newest else {
         return Ok(DatabaseSummary {
             snapshots,
             newest_snapshot_at,
             preserved,
+            orphan_rows,
+            repaired,
             snapshot: None,
             sessions: Vec::new(),
         });
@@ -383,12 +435,15 @@ pub fn summarize(
         snapshots,
         newest_snapshot_at,
         preserved,
+        orphan_rows,
+        repaired,
         snapshot: Some(SnapshotSummary {
             id,
             taken_at,
             age_secs: (now - taken_at).max(0),
             state,
             sessions: sessions.len(),
+            placement,
         }),
         sessions,
     })
@@ -670,9 +725,17 @@ pub struct AgentResumeFailure {
 ///
 /// `outcome` is a stable token from [`crate::desktop::PlaceOutcome::as_str`]:
 /// `placed`, `misplaced`, `never_mapped`, `never_attached`, `spawn_failed`,
-/// `no_compositor`, `lost_compositor`, `skipped`, `placement_disabled`.
-/// Everything except `placed` and `placement_disabled` means the restore is
+/// `no_compositor`, `lost_compositor`, `skipped`, `placement_disabled`,
+/// `placement_carried`, `placement_unknown`. Everything except `placed`,
+/// `placement_disabled` and `placement_carried` means the restore is
 /// `partial` and the snapshot stays restorable.
+///
+/// Two of them are reported against the pseudo-session `*`, because they are
+/// statements about the pass rather than about one window:
+/// `placement_carried` (the source snapshot's placement was unknown, so the
+/// layout came from an earlier snapshot of the same boot — which one is in
+/// `detail`) and `placement_unknown` (it was unknown and nothing earlier knew
+/// either, so no window was put back).
 ///
 /// `placed` means the compositor was asked where the window is and said it is
 /// on the workspace and monitor the capture recorded. It never means "the

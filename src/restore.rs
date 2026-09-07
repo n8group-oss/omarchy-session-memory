@@ -2249,7 +2249,7 @@ fn publish_current_boot(
         // publish a replacement snapshot with no `terminal_windows` at all,
         // retire the source that held them, and leave the next reboot with no
         // placement to restore. The feature undid itself once per boot.
-        if let Some(ps) = topo.placements.as_deref() {
+        if let Some(ps) = topo.placements.known() {
             crate::desktop::write_placements_in(&tx, published_id, ps)?;
         }
         // Every conversation the resume pass confirmed has had its debt paid,
@@ -2576,6 +2576,15 @@ pub fn window_outcomes_are_degraded(outcomes: &[(String, crate::desktop::PlaceOu
                 | Skipped(_)
                 | NoCompositor
                 | LostCompositor(_)
+                // The sessions are back and their terminals are not. Every
+                // reason the other arms are here applies: the source snapshot
+                // is the only record of where those windows belonged, and it
+                // must stay selectable until something has put them back.
+                //
+                // `PlacementCarried` deliberately is *not* here. The pass did
+                // its job, with the best record of the desktop that exists;
+                // the windows it produced report their own outcomes beside it.
+                | PlacementUnknown(_)
         )
     })
 }
@@ -2602,7 +2611,9 @@ pub fn place_windows(
 ) -> Vec<(String, crate::desktop::PlaceOutcome)> {
     use crate::desktop::PlaceOutcome;
 
-    let placements = match crate::desktop::placements_of(conn, snapshot_id) {
+    use crate::desktop::PlacementForRestore;
+
+    let source = match crate::desktop::placement_for_restore(conn, snapshot_id) {
         Ok(p) => p,
         Err(e) => {
             return vec![(
@@ -2610,6 +2621,43 @@ pub fn place_windows(
                 PlaceOutcome::Skipped(format!("reading placement: {e:#}")),
             )]
         }
+    };
+
+    // A snapshot whose placement could not be read at capture time, with
+    // nothing earlier in the same boot to carry forward. Reported rather than
+    // passed over in silence: an empty window list reads as "this snapshot had
+    // no terminal windows", which would retire the source — the only record of
+    // where the user's windows belonged — against a restore that put none of
+    // them back.
+    //
+    // Unless the user switched placement off, in which case nothing is owed
+    // and there is nothing to report.
+    if matches!(source, PlacementForRestore::Unavailable) {
+        if !cfg.restore.place_windows {
+            return Vec::new();
+        }
+        return vec![(
+            "*".to_string(),
+            PlaceOutcome::PlacementUnknown(
+                "this snapshot's window placement could not be read when it was \
+                 captured, and no earlier snapshot of the same boot recorded one; \
+                 the sessions are back but their terminals are not"
+                    .to_string(),
+            ),
+        )];
+    }
+
+    let carried = match &source {
+        PlacementForRestore::Carried { from, taken_at, .. } => Some(format!(
+            "this snapshot's window placement could not be read when it was \
+             captured; the layout comes from snapshot {from}, taken at {taken_at}"
+        )),
+        _ => None,
+    };
+    let placements = match source {
+        PlacementForRestore::Own(ps) => ps,
+        PlacementForRestore::Carried { placements, .. } => placements,
+        PlacementForRestore::Unavailable => unreachable!("handled above"),
     };
     if placements.is_empty() {
         return Vec::new();
@@ -2644,6 +2692,11 @@ pub fn place_windows(
     let marker = crate::terminal::marker_for(attempt_id);
 
     let mut out = Vec::new();
+    // Said once, before the per-session outcomes, so a reader sees which
+    // layout the rest of this list was produced from.
+    if let Some(why) = carried {
+        out.push(("*".to_string(), PlaceOutcome::PlacementCarried(why)));
+    }
     for p in &placements {
         if !delivered.contains(p.session.as_str()) {
             out.push((

@@ -932,3 +932,792 @@ fn a_preserved_database_holding_its_rows_in_a_wal_is_counted_with_them() {
         "the rows in the -wal were not counted"
     );
 }
+
+/// A database exactly as schema 11 left it: no `placement_state` anywhere,
+/// and a `terminal_windows` table that already holds every column v11 wrote.
+///
+/// Rows are left to the caller, because the whole question below is what the
+/// rows say.
+fn write_v11(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE snapshots (
+           id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+           boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+           state TEXT NOT NULL
+                 CHECK (state IN ('building','complete','restore_in_progress',
+                                  'restored','failed')),
+           unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+           server TEXT);
+         CREATE TABLE session_rows (
+           row_id INTEGER PRIMARY KEY,
+           snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+           tmux_session_id TEXT NOT NULL, name TEXT NOT NULL,
+           active_window_id TEXT,
+           unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)));
+         CREATE TABLE terminal_windows (
+           row_id INTEGER PRIMARY KEY,
+           snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+           hypr_address TEXT NOT NULL,
+           window_class TEXT NOT NULL,
+           terminal_kind TEXT NOT NULL,
+           session_row_id INTEGER REFERENCES session_rows(row_id) ON DELETE SET NULL,
+           session_name TEXT NOT NULL DEFAULT '',
+           workspace_kind TEXT NOT NULL,
+           workspace_ref TEXT NOT NULL,
+           monitor_connector TEXT NOT NULL,
+           monitor_desc TEXT, monitor_scale REAL, monitor_transform INTEGER,
+           floating INTEGER NOT NULL DEFAULT 0 CHECK (floating IN (0,1)),
+           rel_x REAL, rel_y REAL, rel_w REAL, rel_h REAL,
+           UNIQUE (snapshot_id, hypr_address));
+         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta (key, value) VALUES ('schema_version', '11');",
+    )
+    .unwrap();
+}
+
+/// Migrating a v11 database may call a snapshot `known` only where the
+/// database itself says the placement was read.
+///
+/// A v11 row carries no record of whether anyone asked the compositor, so
+/// there are two kinds of row in one:
+///
+/// * rows with `terminal_windows` behind them — the compositor answered and
+///   these are its answer. `known`, and nothing is lost.
+/// * rows with none — and *nothing on disk says which* of "the compositor
+///   answered, there were no terminal windows" and "the compositor was never
+///   asked" produced them. v11 captures ran the second way routinely: a
+///   capture with no compositor to ask, and every capture on a machine with
+///   `restore.place_windows = false`.
+///
+/// Calling the second kind `known` is the migration inventing a fact. What it
+/// costs is specific: `known` with no rows means "there were no terminal
+/// windows", so a restore of such a snapshot has nothing to put back, finds
+/// no shortfall to report, and retires the user's snapshot as fully restored
+/// having opened no window at all. The user turns window placement on, reboots
+/// and gets their sessions back with an empty screen — and the record that
+/// could have done better is gone.
+///
+/// So a row with no evidence keeps its uncertainty and is migrated `unknown`,
+/// which is the state the engine already has for exactly this: absence of
+/// rows says nothing. It is not `disabled` either — that is the user's own
+/// choice, and this migration does not know whether they made it.
+#[test]
+fn a_v11_snapshot_with_placement_rows_is_migrated_as_known() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    write_v11(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');
+             INSERT INTO terminal_windows
+               (row_id, snapshot_id, hypr_address, window_class, terminal_kind,
+                session_name, workspace_kind, workspace_ref, monitor_connector)
+               VALUES (50, 1, '0xa', 'ghostty', 'ghostty', 'dev', 'id', '1', 'DP-1');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v11 database must open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "a migratable database must not be moved aside"
+    );
+
+    let state: String = conn
+        .query_row(
+            "SELECT placement_state FROM snapshots WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the column exists after the migration");
+    assert_eq!(
+        state, "known",
+        "a row with the compositor's own answer behind it was not called known"
+    );
+
+    let version: u32 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0).map(|v| v.parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(version, osm::db::SCHEMA_VERSION);
+}
+
+/// And a v11 row with no placement rows behind it keeps its uncertainty.
+///
+/// The assertion is made twice, deliberately: once on the stored token, and
+/// once on the thing the token decides. `placement_for_restore` is what a
+/// restore asks, and for a `known` snapshot it answers `Own(vec![])` — "the
+/// compositor said there were none" — which is the claim this migration has
+/// no grounds to make on the user's behalf.
+#[test]
+fn a_v11_snapshot_with_no_placement_rows_is_not_called_known() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    write_v11(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v11 database must open");
+    let state: String = conn
+        .query_row(
+            "SELECT placement_state FROM snapshots WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the column exists after the migration");
+    assert_eq!(
+        state, "unknown",
+        "the migration decided, on no evidence, what a v11 capture knew about          window placement"
+    );
+
+    assert_eq!(
+        osm::desktop::placement_for_restore(&conn, 1).unwrap(),
+        osm::desktop::PlacementForRestore::Unavailable,
+        "a restore of a migrated row was handed an empty layout as though the          compositor had answered it"
+    );
+}
+
+/// A v12 database is rebuilt so its snapshot ids are `AUTOINCREMENT`, and
+/// **every snapshot keeps the id it had**.
+///
+/// The id is not an internal detail: every `snapshot_id` in the database is
+/// one, so renumbering would detach every session, window and placement from
+/// the snapshot it belongs to. The rebuild copies the ids across explicitly,
+/// which also seeds `sqlite_sequence` with the highest of them — so the next
+/// capture continues the user's history rather than restarting it at 1 on top
+/// of rows that are still there.
+#[test]
+fn a_v12_database_keeps_every_snapshot_id_and_stops_reusing_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+               state TEXT NOT NULL
+                     CHECK (state IN ('building','complete','restore_in_progress',
+                                      'restored','failed')),
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+               server TEXT,
+               placement_state TEXT NOT NULL DEFAULT 'known'
+                               CHECK (placement_state IN ('known','unknown','disabled')));
+             CREATE TABLE session_rows (
+               row_id INTEGER PRIMARY KEY,
+               snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+               tmux_session_id TEXT NOT NULL, name TEXT NOT NULL,
+               active_window_id TEXT,
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)));
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state, placement_state)
+               VALUES (3706, 100, 'boot-a', 'timer', 'complete', 'known'),
+                      (3716, 200, 'boot-a', 'timer', 'complete', 'unknown');
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (1, 3706, '$0', 'alpha'), (2, 3716, '$0', 'alpha');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '12');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a v12 database must open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "a migratable database must not be moved aside"
+    );
+
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM snapshots ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![3706, 3716], "every snapshot keeps its own id");
+
+    // The rest of each row travelled with it, including the column the
+    // previous migration added.
+    let placement: String = conn
+        .query_row(
+            "SELECT placement_state FROM snapshots WHERE id = 3716",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(placement, "unknown");
+
+    // And the children still name the snapshots they always named.
+    let attached: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_rows s JOIN snapshots n ON n.id = s.snapshot_id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(attached, 2, "the rebuild must not detach the child rows");
+
+    // The highest id on record is gone, and the id it had must not come back.
+    conn.execute("DELETE FROM snapshots WHERE id = 3716", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO snapshots (taken_at, boot_id, reason, state)
+         VALUES (300, 'boot-a', 'timer', 'complete')",
+        [],
+    )
+    .unwrap();
+    let next: i64 = conn
+        .query_row("SELECT MAX(id) FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        next, 3717,
+        "the migrated sequence must continue past every id the database has \
+         ever handed out, not restart from what is left"
+    );
+
+    let version: u32 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0).map(|v| v.parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(version, osm::db::SCHEMA_VERSION);
+}
+
+/// Deleting a snapshot takes its rows with it **on a connection that
+/// enforces no foreign keys**.
+///
+/// This is the defect that cost the maintainer 83 minutes, one level below
+/// the id reuse that made it fatal. `ON DELETE CASCADE` is not a property of
+/// the database: it is a property of whoever is connected to it.
+/// `PRAGMA foreign_keys` defaults **off** in stock SQLite — the `sqlite3`
+/// shell, any tool built on the system library, a future osm path that
+/// switches it off for a table rebuild and does not switch it back — so a
+/// snapshot deleted through any of them leaves every child row behind, and
+/// `PRAGMA foreign_key_check` is the only thing that ever notices. His
+/// database held 198 such rows: 72 `window_rows`, 72 `session_rows`, 54
+/// `terminal_windows`, claiming nine snapshots that were not there.
+///
+/// So the relationship is written into the schema as well, where it belongs
+/// and where no connection can opt out of it. Every table below is reached,
+/// including the ones two levels down: a `pane_rows` row belongs to a window
+/// that belongs to a snapshot, and with foreign keys off nothing else would
+/// have taken it.
+#[test]
+fn a_snapshot_delete_takes_its_rows_with_it_without_foreign_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = osm::db::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete'),
+                      (2, 200, 'boot-a', 'manual', 'complete');
+
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (10, 1, '$0', 'doomed'), (11, 2, '$0', 'kept');
+             INSERT INTO window_rows (row_id, snapshot_id, tmux_window_id, name, layout)
+               VALUES (20, 1, '@0', 'w', 'l'), (21, 2, '@0', 'w', 'l');
+             INSERT INTO session_window_links (row_id, session_row_id, window_row_id, idx)
+               VALUES (30, 10, 20, 0), (31, 11, 21, 0);
+             INSERT INTO pane_rows (row_id, window_row_id, tmux_pane_id, idx, cwd,
+                                    restore_policy)
+               VALUES (40, 20, '%0', 0, '/tmp', 'shell'),
+                      (41, 21, '%0', 0, '/tmp', 'shell');
+             INSERT INTO terminal_windows (row_id, snapshot_id, hypr_address, window_class,
+                                           terminal_kind, session_row_id, session_name,
+                                           workspace_kind, workspace_ref, monitor_connector)
+               VALUES (50, 1, '0xa', 'ghostty', 'ghostty', 10, 'doomed', 'id', '1', 'DP-1'),
+                      (51, 2, '0xb', 'ghostty', 'ghostty', 11, 'kept', 'id', '1', 'DP-1');
+             INSERT INTO restore_attempts (id, snapshot_id, started_at, state)
+               VALUES (60, 1, 100, 'failed'), (61, 2, 100, 'failed');
+             INSERT INTO restore_objects (row_id, attempt_id, kind, ref, state)
+               VALUES (70, 60, 'session', 'doomed', 'done'),
+                      (71, 61, 'session', 'kept', 'done');
+             INSERT INTO restore_window_map (row_id, attempt_id, captured_window_id,
+                                             live_window_id)
+               VALUES (80, 60, '@0', '@7'), (81, 61, '@0', '@7');",
+        )
+        .unwrap();
+    }
+
+    // A connection like any other tool's: no pragma, nothing enforced.
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let fk: i64 = raw
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fk, 0, "this connection must enforce no foreign keys");
+    raw.execute("DELETE FROM snapshots WHERE id = 1", [])
+        .unwrap();
+
+    for (table, column, id) in [
+        ("session_rows", "row_id", 10),
+        ("window_rows", "row_id", 20),
+        ("session_window_links", "row_id", 30),
+        ("pane_rows", "row_id", 40),
+        ("terminal_windows", "row_id", 50),
+        ("restore_attempts", "id", 60),
+        ("restore_objects", "row_id", 70),
+        ("restore_window_map", "row_id", 80),
+    ] {
+        let left: i64 = raw
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "{table} still holds a row belonging to the snapshot that was deleted"
+        );
+    }
+
+    // And the snapshot that was not deleted keeps everything it had.
+    for (table, column, id) in [
+        ("session_rows", "row_id", 11),
+        ("window_rows", "row_id", 21),
+        ("session_window_links", "row_id", 31),
+        ("pane_rows", "row_id", 41),
+        ("terminal_windows", "row_id", 51),
+        ("restore_attempts", "id", 61),
+        ("restore_objects", "row_id", 71),
+        ("restore_window_map", "row_id", 81),
+    ] {
+        let left: i64 = raw
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "{table} lost a row belonging to a live snapshot");
+    }
+
+    let violations: i64 = raw
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "the delete left the database inconsistent");
+}
+
+/// Put `path` into the shape the maintainer's database was in: real rows,
+/// belonging to a snapshot that is not there any more.
+///
+/// Built the way it happened — a delete on a connection enforcing nothing,
+/// with the trigger this build carries dropped first — because the subject of
+/// the tests below is a database that has *somehow* reached that state, on a
+/// machine where it should no longer be reachable.
+fn strand_a_snapshots_rows(path: &std::path::Path) -> i64 {
+    {
+        let conn = osm::db::open(path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete'),
+                      (2, 200, 'boot-a', 'manual', 'complete');
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (10, 1, '$0', 'kept'), (11, 2, '$0', 'doomed');
+             INSERT INTO window_rows (row_id, snapshot_id, tmux_window_id, name, layout)
+               VALUES (20, 1, '@0', 'w', 'l'), (21, 2, '@0', 'w', 'l');
+             INSERT INTO pane_rows (row_id, window_row_id, tmux_pane_id, idx, cwd,
+                                    restore_policy)
+               VALUES (40, 20, '%0', 0, '/tmp', 'shell'),
+                      (41, 21, '%0', 0, '/tmp', 'shell');
+             INSERT INTO terminal_windows (row_id, snapshot_id, hypr_address, window_class,
+                                           terminal_kind, session_row_id, session_name,
+                                           workspace_kind, workspace_ref, monitor_connector)
+               VALUES (50, 1, '0xa', 'ghostty', 'ghostty', 10, 'kept', 'id', '1', 'DP-1'),
+                      (51, 2, '0xb', 'ghostty', 'ghostty', 11, 'doomed', 'id', '1', 'DP-1');",
+        )
+        .unwrap();
+    }
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    raw.execute_batch("DROP TRIGGER IF EXISTS snapshots_cascade_delete")
+        .unwrap();
+    raw.execute("DELETE FROM snapshots WHERE id = 2", [])
+        .unwrap();
+    raw.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// Opening a database that is already in the broken state clears the rows
+/// nothing owns, and says how many.
+///
+/// Anyone who installed v0.1.0 can be holding one: the two commits before
+/// this stop the state being *created* and stop it being fatal when it is,
+/// but neither reaches a file that is already like this — and on that file
+/// the id sequence resumes at the highest surviving snapshot, which is
+/// exactly the id the stale rows claim. So the file is put right, once, by
+/// the open that finds it.
+///
+/// Only the rows nothing owns. The surviving snapshot keeps every row of its
+/// own, because this is a repair and not a sweep.
+#[test]
+fn an_open_clears_rows_whose_snapshot_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    let violations = strand_a_snapshots_rows(&path);
+    assert!(
+        violations > 0,
+        "the fixture must leave the database inconsistent to be worth repairing"
+    );
+
+    let conn = osm::db::open(&path).expect("a database in this state must still open");
+
+    let left: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(left, 0, "the open must leave nothing dangling");
+
+    for (table, column, id) in [
+        ("session_rows", "row_id", 11),
+        ("window_rows", "row_id", 21),
+        ("pane_rows", "row_id", 41),
+        ("terminal_windows", "row_id", 51),
+    ] {
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "{table} still holds a row nothing owns");
+    }
+    for (table, column, id) in [
+        ("session_rows", "row_id", 10),
+        ("window_rows", "row_id", 20),
+        ("pane_rows", "row_id", 40),
+        ("terminal_windows", "row_id", 50),
+    ] {
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{table} lost a row belonging to a live snapshot");
+    }
+
+    let repair = osm::db::last_repair(&conn).expect("a repair that happened must be on record");
+    assert_eq!(
+        repair.rows, 4,
+        "the count must be the rows actually removed"
+    );
+    assert!(repair.at > 0, "and when it happened");
+    assert_eq!(
+        osm::db::orphan_rows(&conn).unwrap(),
+        0,
+        "nothing is owed after the repair"
+    );
+}
+
+/// A healthy database is not touched by the repair — no rows removed, and no
+/// record of a repair that did not happen.
+///
+/// It runs on every `open`, which is every `osm` process: every tmux hook and
+/// an `osm status` the panel polls every five seconds. A repair that wrote
+/// something each time would take the write lock away from captures for no
+/// reason and would tell a widget the database had had to be put right.
+#[test]
+fn an_open_of_a_healthy_database_removes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = osm::db::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (10, 1, '$0', 'kept');
+             INSERT INTO window_rows (row_id, snapshot_id, tmux_window_id, name, layout)
+               VALUES (20, 1, '@0', 'w', 'l');
+             INSERT INTO pane_rows (row_id, window_row_id, tmux_pane_id, idx, cwd,
+                                    restore_policy)
+               VALUES (40, 20, '%0', 0, '/tmp', 'shell');
+             INSERT INTO terminal_windows (row_id, snapshot_id, hypr_address, window_class,
+                                           terminal_kind, session_row_id, session_name,
+                                           workspace_kind, workspace_ref, monitor_connector)
+               VALUES (50, 1, '0xa', 'ghostty', 'ghostty', 10, 'kept', 'id', '1', 'DP-1');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).unwrap();
+    for table in [
+        "snapshots",
+        "session_rows",
+        "window_rows",
+        "pane_rows",
+        "terminal_windows",
+    ] {
+        let n: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "{table} lost a row to a repair with nothing to do");
+    }
+    // A placement's link to its session row is `ON DELETE SET NULL`, so a
+    // repair that mistook a live link for a dangling one would blank it
+    // rather than delete anything, and nothing above would have noticed.
+    let linked: Option<i64> = conn
+        .query_row(
+            "SELECT session_row_id FROM terminal_windows WHERE row_id = 50",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked, Some(10), "a live placement kept its session link");
+    assert!(
+        osm::db::last_repair(&conn).is_none(),
+        "a database that needed no repair must not report one"
+    );
+    assert_eq!(osm::db::orphan_rows(&conn).unwrap(), 0);
+}
+
+/// A database that is *already* holding rows nothing owns must still open,
+/// migrate, and be repaired — not be refused.
+///
+/// The migration ends by running `PRAGMA foreign_key_check`, which exists to
+/// catch a rebuild step that copied rows wrongly with foreign keys switched
+/// off. It counted every violation in the file, not the ones the migration
+/// caused, so a database that arrived damaged was blamed on the upgrade and
+/// `open` failed outright.
+///
+/// That is not a theoretical ordering. Run against a copy of the maintainer's
+/// real database, this build reported
+///
+/// ```text
+/// database: the schema migration left 198 dangling foreign-key row(s);
+/// refusing to hand back a database that is no longer self-consistent
+/// ```
+///
+/// — his exact 198 rows — with `reachable: false` and every other field null.
+/// Upgrading to the build that fixes his outage would have taken `osm` away
+/// from him completely: no capture, no restore, and a `status` that could no
+/// longer say anything about anything else. The repair that clears those rows
+/// runs a few lines later and never got the chance.
+#[test]
+fn a_database_that_arrives_damaged_is_migrated_and_repaired_not_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Off, because that is how the rows got there: a connection that
+        // enforced nothing wrote them, and one that enforces them cannot.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+               state TEXT NOT NULL
+                     CHECK (state IN ('building','complete','restore_in_progress',
+                                      'restored','failed')),
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+               server TEXT);
+             CREATE TABLE session_rows (
+               row_id INTEGER PRIMARY KEY,
+               snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+               tmux_session_id TEXT NOT NULL, name TEXT NOT NULL,
+               active_window_id TEXT,
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)));
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (3716, 100, 'boot-a', 'timer', 'complete');
+             -- The shape his file was in: rows claiming a snapshot above the
+             -- highest one that is left.
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (1, 3716, '$0', 'kept'),
+                      (2, 3717, '$0', 'stranded'),
+                      (3, 3717, '$1', 'stranded');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '11');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a damaged database must still open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "and must be migrated in place, not moved aside"
+    );
+    assert_eq!(
+        osm::db::orphan_rows(&conn).unwrap(),
+        0,
+        "the open must have cleared what nothing owns"
+    );
+    assert_eq!(
+        osm::db::last_repair(&conn).map(|r| r.rows),
+        Some(2),
+        "and must say what it cleared"
+    );
+
+    let kept: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session_rows", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kept, 1, "the live snapshot keeps its own row");
+
+    // And the point of all of it: the next snapshot cannot land on the id the
+    // stranded rows had.
+    conn.execute(
+        "INSERT INTO snapshots (taken_at, boot_id, reason, state)
+         VALUES (200, 'boot-a', 'timer', 'complete')",
+        [],
+    )
+    .unwrap();
+    let next: i64 = conn
+        .query_row("SELECT MAX(id) FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(next, 3717);
+}
+
+/// Opening a healthy database must not want the write lock.
+///
+/// `open` runs in every `osm` process: every one of the fifteen tmux hooks,
+/// and the `osm status` the panel polls every five seconds. The healthy path
+/// has nothing to write — the schema is current, the triggers are there, and
+/// `repair` asks its question read-only and finds nothing — but `create_schema`
+/// ran unconditionally, and it begins with `BEGIN IMMEDIATE`. So every hook
+/// and every poll queued for the writer, and one that met a capture mid-write
+/// sat out the five-second busy timeout and then reported the database
+/// unreachable. A panel saying "the engine cannot reach its database" while a
+/// capture is running is this project's own failure mode: it has wedged
+/// captures once already by holding the write lock across other work.
+///
+/// `an_open_of_a_healthy_database_removes_nothing` above is the other half —
+/// that nothing is *changed*. Nothing changing is not the same claim as
+/// nothing being locked, and it is the lock that costs.
+#[test]
+fn an_open_of_a_healthy_database_takes_no_write_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = osm::db::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');",
+        )
+        .unwrap();
+    }
+
+    // A capture, mid-write. `BEGIN IMMEDIATE` is what `write_topology` takes,
+    // and it is held for the whole of the open below.
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (2, 200, 'boot-a', 'timer', 'building');",
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let opened = osm::db::open(&path);
+    let elapsed = started.elapsed();
+
+    writer.execute_batch("COMMIT").unwrap();
+
+    let conn = opened.unwrap_or_else(|e| {
+        panic!(
+            "a healthy open waited {elapsed:?} for a writer's lock and then \
+             gave up: {e:#}"
+        )
+    });
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "a healthy open queued {elapsed:?} behind another writer; it has \
+         nothing to write and must not ask for the lock"
+    );
+
+    // And it really did open the database it was pointed at.
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "the connection handed back does not see the rows");
+}
+
+/// Skipping `create_schema` is a shortcut on the healthy path only: an object
+/// that is missing is still put back.
+///
+/// `open` now asks whether the schema is already what it would create before
+/// it opens a write transaction, and that question is answered from a list of
+/// names. A name missing from the list would make the answer `true` for a
+/// database that is missing that table or trigger, and `open` would hand back
+/// a connection to it — no error, no repair, and the first capture failing on
+/// a table that is not there.
+///
+/// So every object a fresh database has is dropped in turn and `open` is
+/// required to put it back. `meta` is excluded and only because dropping it
+/// is a different question entirely: with no `schema_version` the database is
+/// unversioned, which `open` answers by preserving it aside — a path
+/// `an_unversioned_database_is_preserved_not_dropped` already covers.
+#[test]
+fn every_missing_schema_object_is_put_back_by_the_next_open() {
+    let objects: Vec<(String, String)> = {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = osm::db::open(&tmp.path().join("state.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name FROM sqlite_master
+                  WHERE type IN ('table','trigger') AND name <> 'meta'
+                    AND name NOT LIKE 'sqlite_%'
+                  ORDER BY name",
+            )
+            .unwrap();
+        let v = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<(String, String)>, _>>()
+            .unwrap();
+        v
+    };
+    assert!(
+        objects.len() > 10,
+        "the fresh schema should have more than this: {objects:?}"
+    );
+
+    for (kind, name) in &objects {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        {
+            let conn = osm::db::open(&path).unwrap();
+            // `legacy_alter_table` is not needed for a DROP, but foreign keys
+            // are off so dropping a parent does not cascade the rest away.
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            conn.execute_batch(&format!("DROP {kind} {name}")).unwrap();
+        }
+
+        let conn = osm::db::open(&path)
+            .unwrap_or_else(|e| panic!("open failed on a database missing {kind} {name}: {e:#}"));
+        let back: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                rusqlite::params![kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            back, 1,
+            "open decided the schema was current on a database with no \
+             {kind} {name} in it"
+        );
+    }
+}
