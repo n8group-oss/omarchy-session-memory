@@ -895,3 +895,26 @@ fn a_healthy_database_reports_no_repair() {
         "a database that has never needed a repair must not report one: {v}"
     );
 }
+
+/// An engine that calls itself not ready always says why.
+///
+/// The maintainer's panel once read "The engine reported ready:false and gave
+/// no message." — an unhealthy verdict with no reason, which is worse than the
+/// notice it replaced: there is nothing to act on and nothing to look up. The
+/// two fields are produced from one list, so this cannot happen today; the
+/// test exists so a later change that pushes an empty problem, or sets `ready`
+/// from something other than that list, is caught here rather than on his bar.
+#[test]
+fn an_engine_that_is_not_ready_always_says_why() {
+    let env = Env::new("readywhy");
+    // A database path that cannot be opened: a directory where the file goes.
+    std::fs::create_dir_all(env.state_dir().join("state.db")).unwrap();
+
+    let v = env.status();
+    assert_eq!(v["ready"], false, "an unopenable database is not ready: {v}");
+    let msg = v["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.trim().is_empty(),
+        "ready:false must carry a reason the user can act on: {v}"
+    );
+}
