@@ -1788,9 +1788,10 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
 /// list is a thing that goes out of date silently: a name missing from it
 /// makes [`schema_is_current`] answer `true` for a database that is missing
 /// that object, and `open` would then hand back a connection to a database
-/// with no `agent_resume_debt` in it. `the_open_that_skips_create_schema_...`
-/// in `tests/db.rs` drops each object in turn and requires `open` to put it
-/// back, which is what keeps this honest.
+/// with no `agent_resume_debt` in it.
+/// `every_missing_schema_object_is_put_back_by_the_next_open` in `tests/db.rs`
+/// drops each object of a fresh database in turn and requires the next `open`
+/// to recreate it, which is what keeps this honest.
 fn schema_object_names() -> Vec<&'static str> {
     [SCHEMA_SQL, CASCADE_TRIGGERS_SQL]
         .into_iter()
