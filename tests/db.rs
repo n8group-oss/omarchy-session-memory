@@ -1400,3 +1400,98 @@ fn an_open_of_a_healthy_database_removes_nothing() {
     );
     assert_eq!(osm::db::orphan_rows(&conn).unwrap(), 0);
 }
+
+/// A database that is *already* holding rows nothing owns must still open,
+/// migrate, and be repaired — not be refused.
+///
+/// The migration ends by running `PRAGMA foreign_key_check`, which exists to
+/// catch a rebuild step that copied rows wrongly with foreign keys switched
+/// off. It counted every violation in the file, not the ones the migration
+/// caused, so a database that arrived damaged was blamed on the upgrade and
+/// `open` failed outright.
+///
+/// That is not a theoretical ordering. Run against a copy of the maintainer's
+/// real database, this build reported
+///
+/// ```text
+/// database: the schema migration left 198 dangling foreign-key row(s);
+/// refusing to hand back a database that is no longer self-consistent
+/// ```
+///
+/// — his exact 198 rows — with `reachable: false` and every other field null.
+/// Upgrading to the build that fixes his outage would have taken `osm` away
+/// from him completely: no capture, no restore, and a `status` that could no
+/// longer say anything about anything else. The repair that clears those rows
+/// runs a few lines later and never got the chance.
+#[test]
+fn a_database_that_arrives_damaged_is_migrated_and_repaired_not_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Off, because that is how the rows got there: a connection that
+        // enforced nothing wrote them, and one that enforces them cannot.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+               id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL,
+               boot_id TEXT NOT NULL, reason TEXT NOT NULL,
+               state TEXT NOT NULL
+                     CHECK (state IN ('building','complete','restore_in_progress',
+                                      'restored','failed')),
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)),
+               server TEXT);
+             CREATE TABLE session_rows (
+               row_id INTEGER PRIMARY KEY,
+               snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+               tmux_session_id TEXT NOT NULL, name TEXT NOT NULL,
+               active_window_id TEXT,
+               unresolved INTEGER NOT NULL DEFAULT 0 CHECK (unresolved IN (0,1)));
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (3716, 100, 'boot-a', 'timer', 'complete');
+             -- The shape his file was in: rows claiming a snapshot above the
+             -- highest one that is left.
+             INSERT INTO session_rows (row_id, snapshot_id, tmux_session_id, name)
+               VALUES (1, 3716, '$0', 'kept'),
+                      (2, 3717, '$0', 'stranded'),
+                      (3, 3717, '$1', 'stranded');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '11');",
+        )
+        .unwrap();
+    }
+
+    let conn = osm::db::open(&path).expect("a damaged database must still open");
+    assert!(
+        osm::db::preserved(&conn).is_none(),
+        "and must be migrated in place, not moved aside"
+    );
+    assert_eq!(
+        osm::db::orphan_rows(&conn).unwrap(),
+        0,
+        "the open must have cleared what nothing owns"
+    );
+    assert_eq!(
+        osm::db::last_repair(&conn).map(|r| r.rows),
+        Some(2),
+        "and must say what it cleared"
+    );
+
+    let kept: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session_rows", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kept, 1, "the live snapshot keeps its own row");
+
+    // And the point of all of it: the next snapshot cannot land on the id the
+    // stranded rows had.
+    conn.execute(
+        "INSERT INTO snapshots (taken_at, boot_id, reason, state)
+         VALUES (200, 'boot-a', 'timer', 'complete')",
+        [],
+    )
+    .unwrap();
+    let next: i64 = conn
+        .query_row("SELECT MAX(id) FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(next, 3717);
+}

@@ -1385,6 +1385,20 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rows whose foreign key names a parent that is not there, as SQLite counts
+/// them.
+///
+/// Independent of `PRAGMA foreign_keys`: `foreign_key_check` reports what is
+/// in the file, which is the point — the pragma is what decides whether such
+/// rows can be *created*, never whether they are there.
+fn dangling_rows(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
 /// Bring a database written under an earlier schema up to this one, in place.
 ///
 /// Returns `false` when there is no path from `from` to [`SCHEMA_VERSION`],
@@ -1407,6 +1421,17 @@ fn migrate(conn: &mut Connection, from: u32) -> Result<bool> {
     // rewrite every *other* table's references while `restore_attempts` does
     // not momentarily exist, and fails. With it on, `restore_objects` keeps
     // naming `restore_attempts` throughout, which is exactly right.
+    // Counted *before*, and this is the whole of the difference between a
+    // check and an accusation. A database can arrive already holding rows
+    // whose parent is gone — that is the state that took the maintainer's
+    // capture down, and `repair` a few lines further into `open` is what
+    // clears it. Comparing against zero blamed the migration for damage it
+    // found rather than caused: run against a copy of his real file, this
+    // refused with "the schema migration left 198 dangling foreign-key
+    // row(s)" and `open` failed outright, so the upgrade that fixes his
+    // outage would instead have taken every osm subcommand away from him —
+    // `status` included — and the repair would never have run.
+    let before = dangling_rows(conn)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     conn.pragma_update(None, "legacy_alter_table", "ON")?;
     let migrated = migrate_steps(conn, from);
@@ -1416,14 +1441,13 @@ fn migrate(conn: &mut Connection, from: u32) -> Result<bool> {
     if migrated {
         // The rebuild copied rows between tables with the enforcement off, so
         // this is the only thing that can say it copied them correctly.
-        let violations: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
-                r.get(0)
-            })?;
-        if violations > 0 {
+        let after = dangling_rows(conn)?;
+        if after > before {
             anyhow::bail!(
-                "the schema migration left {violations} dangling foreign-key row(s); \
-                 refusing to hand back a database that is no longer self-consistent"
+                "the schema migration left {} dangling foreign-key row(s) that were \
+                 not there before it ran; refusing to hand back a database it has \
+                 made less self-consistent than it found it",
+                after - before
             );
         }
     }
