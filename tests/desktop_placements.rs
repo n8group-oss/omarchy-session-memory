@@ -273,3 +273,165 @@ fn placement_read_from_a_replacement_server_is_not_attached_to_the_first_ones_to
         topo.placements
     );
 }
+
+// ---------------------------------------------------------------------------
+// The bounded retry: a compositor that stutters is asked again.
+// ---------------------------------------------------------------------------
+
+/// A compositor whose first `fail_first` client reads fail and whose later
+/// ones answer, so a test can tell a *transient* failure from a dead one.
+struct Flaky {
+    remaining_failures: std::cell::Cell<u32>,
+    calls: std::cell::Cell<u32>,
+    clients: String,
+}
+
+impl Flaky {
+    fn new(fail_first: u32, clients: &str) -> Self {
+        Flaky {
+            remaining_failures: std::cell::Cell::new(fail_first),
+            calls: std::cell::Cell::new(0),
+            clients: clients.to_string(),
+        }
+    }
+}
+
+impl HyprCtl for Flaky {
+    fn clients_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
+        self.calls.set(self.calls.get() + 1);
+        let left = self.remaining_failures.get();
+        if left > 0 {
+            self.remaining_failures.set(left - 1);
+            anyhow::bail!("could not connect to the Hyprland socket");
+        }
+        Ok(self.clients.clone())
+    }
+    fn monitors_json(&self, _budget: std::time::Duration) -> anyhow::Result<String> {
+        Ok(MONITORS.to_string())
+    }
+    fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
+        panic!("no test here may dispatch: it would move a real window")
+    }
+}
+
+/// The instant that made the maintainer lose 37% of an hour's captures.
+///
+/// `hyprctl` answered in 5ms throughout and a standalone reproduction of the
+/// read succeeded 6 times out of 6, so what fails is not a dead compositor —
+/// it is one of the transient branches, hit in the instant it has no answer.
+/// Giving up on the first refusal turns that instant into a snapshot with no
+/// placement in it. Asking again, within a bound, turns it into nothing at
+/// all.
+#[test]
+fn a_compositor_that_stutters_once_is_asked_again_rather_than_written_off() {
+    let t = server("stutter");
+    let f = Flaky::new(1, A_BROWSER);
+    let deadline = std::time::Instant::now() + desktop::PLACEMENT_READ_BUDGET;
+
+    match desktop::placements_within(&f, &t, deadline).unwrap() {
+        desktop::PlacementRead::Mapped(_, ps) => assert!(ps.is_empty(), "{ps:?}"),
+        other => panic!("one failed call was treated as an unreadable desktop: {other:?}"),
+    }
+    assert_eq!(
+        f.calls.get(),
+        2,
+        "the read was not retried, or was retried more than it needed to be"
+    );
+}
+
+/// And the retry is a bound, not a loop.
+///
+/// A compositor that has really gone away must not hold a capture open. The
+/// budget is what separates "wait out an instant" from "wait for a machine
+/// that is not coming back", and a retry with no ceiling would park the
+/// daemon's two-minute tick inside a dead `hyprctl`.
+#[test]
+fn a_compositor_that_never_answers_gives_up_inside_the_budget() {
+    let t = server("givesup");
+    let f = Flaky::new(u32::MAX, A_BROWSER);
+
+    let started = std::time::Instant::now();
+    let read =
+        desktop::placements_within(&f, &t, started + desktop::PLACEMENT_READ_BUDGET).unwrap();
+    let elapsed = started.elapsed();
+
+    match read {
+        desktop::PlacementRead::Unreadable(why) => assert!(
+            why.contains("Hyprland"),
+            "the reason must name what actually went wrong: {why}"
+        ),
+        other => panic!("a compositor that never answered produced {other:?}"),
+    }
+    assert!(
+        elapsed < desktop::PLACEMENT_READ_BUDGET * 2,
+        "the retry ran for {elapsed:?}, past its {:?} budget",
+        desktop::PLACEMENT_READ_BUDGET
+    );
+    assert!(
+        f.calls.get() > 1,
+        "nothing was retried at all: {} call(s)",
+        f.calls.get()
+    );
+}
+
+/// The retry never papers over the incarnation check.
+///
+/// Topology and placement must still come from one tmux incarnation. A read
+/// that is retried until it succeeds is still a read of whatever server is
+/// there *now*, and if that is not the server the topology came from, the two
+/// describe different machines and must not be stored together.
+#[test]
+fn the_retry_does_not_relax_the_incarnation_check() {
+    let t = server("retryidentity");
+    let mut topo = osm::capture::collect(&t).unwrap();
+    // A topology attributed to a server that is not the one running here.
+    topo.server = Some("deadbeefdeadbeef".to_string());
+
+    let f = Flaky::new(1, A_BROWSER);
+    osm::capture::attach_placements(&mut topo, &t, &f).unwrap();
+
+    assert!(
+        topo.placements.is_unknown(),
+        "a retried read was attached to a topology from another server: {:?}",
+        topo.placements
+    );
+}
+
+/// And a topology that belongs to no tmux server is not made to wait out the
+/// budget.
+///
+/// There is no session for a window to hold, so there is nothing the retry
+/// could discover; spending the whole budget on it would put three seconds
+/// into a capture that has nothing to place. Built by hand rather than by
+/// `collect`, which cannot produce this shape — it fails outright when the
+/// server it was pointed at is not there — while `Topology` can hold it and
+/// `write_topology_in` has a branch for it.
+#[test]
+fn a_topology_with_no_server_is_answered_at_once_rather_than_waited_out() {
+    let t = Tmux::with_socket(&socket("noserver-fast"));
+    assert!(!t.server_running(), "this socket must have no server on it");
+    let mut topo = osm::capture::Topology {
+        placements: osm::desktop::Placements::Off,
+        sessions: Vec::new(),
+        windows: Vec::new(),
+        panes: Vec::new(),
+        server: None,
+        server_at_end: None,
+    };
+
+    let f = Flaky::new(0, A_BROWSER);
+    let started = std::time::Instant::now();
+    osm::capture::attach_placements(&mut topo, &t, &f).unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(topo.placements.is_unknown(), "{:?}", topo.placements);
+    assert_eq!(
+        f.calls.get(),
+        0,
+        "the compositor was asked about a machine with no tmux server on it"
+    );
+    assert!(
+        elapsed < desktop::PLACEMENT_READ_BUDGET,
+        "waited {elapsed:?} for a server that is not there"
+    );
+}

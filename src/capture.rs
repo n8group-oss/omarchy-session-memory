@@ -2115,30 +2115,44 @@ pub fn collect_with_desktop(tmux: &Tmux, h: &dyn crate::hypr::HyprCtl) -> Result
 /// inside `collect_once`; the tmux/compositor boundary is the one place it
 /// had never been applied.
 ///
-/// A mismatch leaves `topo.placements` at `None`, which is the same
-/// "unreadable" the compositor half already produces — never an empty layout,
-/// which is the value that destroyed the maintainer's original mapping.
+/// A mismatch leaves `topo.placements` [`Unknown`], which is the same
+/// "unreadable" the compositor half produces — never an empty layout, which
+/// is the value that destroyed the maintainer's original mapping. The
+/// comparison stays here, outside the retry: a read that is re-attempted is
+/// still a read of whatever server is there *now*, so retrying a mismatch
+/// could only ever produce the same mismatch more slowly.
 ///
 /// Taking the topology as an argument is also the only seam a test has for
 /// the failure this exists to catch: nothing can interpose between `collect`
 /// and the placement read from outside [`collect_with_desktop`].
+///
+/// [`Unknown`]: crate::desktop::Placements::Unknown
 pub fn attach_placements(
     topo: &mut Topology,
     tmux: &Tmux,
     h: &dyn crate::hypr::HyprCtl,
 ) -> Result<()> {
-    topo.placements = match crate::desktop::placements_with_incarnation(h, tmux)? {
-        Some((incarnation, ps)) if topo.server.as_deref() == Some(incarnation.as_str()) => {
-            crate::desktop::Placements::Known(ps)
-        }
-        Some(_) => crate::desktop::Placements::Unknown(
-            "the compositor's placement was read from a different tmux server \
-             incarnation than the topology beside it"
+    use crate::desktop::{PlacementRead, Placements};
+
+    // No server at all: there is no session for a window to hold, so there is
+    // nothing the retry below could discover, and spending its whole budget
+    // here would put three seconds into every capture on a machine whose tmux
+    // is simply not running.
+    let Some(server) = topo.server.clone() else {
+        topo.placements = Placements::Unknown(
+            "no tmux server was running when the topology was read, so no window              could be matched to a session"
                 .to_string(),
-        ),
-        None => crate::desktop::Placements::Unknown(
-            "the compositor or the tmux server could not be read".to_string(),
-        ),
+        );
+        return Ok(());
+    };
+
+    let deadline = std::time::Instant::now() + crate::desktop::PLACEMENT_READ_BUDGET;
+    topo.placements = match crate::desktop::placements_within(h, tmux, deadline)? {
+        PlacementRead::Mapped(incarnation, ps) if incarnation == server => Placements::Known(ps),
+        PlacementRead::Mapped(incarnation, _) => Placements::Unknown(format!(
+            "the placement was read from tmux server incarnation {incarnation}, but              the topology beside it came from {server}"
+        )),
+        PlacementRead::Unreadable(why) => Placements::Unknown(why),
     };
     Ok(())
 }

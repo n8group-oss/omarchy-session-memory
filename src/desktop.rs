@@ -401,10 +401,104 @@ pub fn placements(
     h: &dyn crate::hypr::HyprCtl,
     tmux: &crate::tmux::Tmux,
 ) -> Result<Option<Vec<Placement>>> {
-    Ok(placements_with_incarnation(h, tmux)?.map(|(_, ps)| ps))
+    Ok(match placements_with_incarnation(h, tmux)? {
+        PlacementRead::Mapped(_, ps) => Some(ps),
+        PlacementRead::Unreadable(_) => None,
+    })
 }
 
-/// [`placements`], and the tmux incarnation the mapping was read from.
+/// The outcome of one attempt to read the placement.
+///
+/// `Unreadable` and `Mapped(_, vec![])` are the two answers that used to be
+/// one `Ok(None)`/`Ok(Some(vec![]))` pair, and keeping them apart is the whole
+/// subject of this module: "the compositor answered and no terminal has a
+/// session in it" is a fact; "one of the two could not be read" is the absence
+/// of one, and writing the second down as the first is what destroyed the
+/// maintainer's original mapping.
+///
+/// `Unreadable` carries *why*, which the `Ok(None)` it replaced could not. Six
+/// different failures produced that value — a tmux that would not identify
+/// itself, a compositor that did not answer, a reply that did not parse, a
+/// `list-clients` that errored, output that did not parse, an identity that
+/// moved mid-read — and an operator looking at a machine where captures keep
+/// coming back placement-blind has no way to act on "one of six things".
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementRead {
+    /// The mapping, and the tmux incarnation both halves were read from.
+    Mapped(String, Vec<Placement>),
+    /// It could not be read, and what went wrong.
+    Unreadable(String),
+}
+
+/// How long the placement read may spend being retried before it is called
+/// unreadable.
+///
+/// A bound on a *retry*, not a wait for slow work — the same distinction
+/// [`MONITOR_READ_BUDGET`] draws, and the same three seconds. On the
+/// maintainer's machine `hyprctl` answered in 5ms throughout while 11 captures
+/// in 19 came back with no placement, and a standalone reproduction of the
+/// read succeeded 6 times out of 6: what fails is one of the transient
+/// branches below, hit in the instant it has no answer, not a compositor that
+/// has gone away. Three seconds is long enough to cross that instant and short
+/// enough that a machine whose compositor really has died does not hold up the
+/// daemon's tick.
+pub const PLACEMENT_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often the placement read is re-attempted while
+/// [`PLACEMENT_READ_BUDGET`] lasts.
+const PLACEMENT_READ_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`placements_with_incarnation`], re-attempted until it succeeds or
+/// `deadline` passes.
+///
+/// # Why the calls themselves are not shortened
+///
+/// [`monitors_within`] hands each attempt whatever is left of its budget,
+/// because what it is waiting out is a compositor with nothing to report. This
+/// is waiting out a *failure*, and the two want opposite things from a slow
+/// call: cutting `hyprctl -j clients` down to the remaining budget would fail
+/// a compositor that is merely busy — one such call really did take longer
+/// than 15 seconds on the maintainer's machine under load — where today it
+/// succeeds. So every attempt gets the full [`crate::hypr::CALL_TIMEOUT`], and
+/// only the *number* of attempts is bounded. One consequence is deliberate: a
+/// call that burns the whole timeout leaves no budget, so a wedged compositor
+/// is asked exactly once rather than twice.
+///
+/// One attempt always happens, whatever `deadline` says. A budget is a bound
+/// on waiting, never a reason to skip the question.
+///
+/// The incarnation equality inside each attempt is untouched, and so is the
+/// one [`crate::capture::attach_placements`] makes against the topology: a
+/// retried read is still a read of whatever server is there *now*, and if that
+/// is not the server the topology came from, the two describe different
+/// machines.
+pub fn placements_within(
+    h: &dyn crate::hypr::HyprCtl,
+    tmux: &crate::tmux::Tmux,
+    deadline: std::time::Instant,
+) -> Result<PlacementRead> {
+    loop {
+        let why = match placements_with_incarnation(h, tmux)? {
+            mapped @ PlacementRead::Mapped(_, _) => return Ok(mapped),
+            PlacementRead::Unreadable(why) => why,
+        };
+        if expired(deadline) {
+            return Ok(PlacementRead::Unreadable(why));
+        }
+        // Checked on both sides of the wait, for the reason `monitors_within`
+        // gives: sleeping a flat poll interval and then asking again unchecked
+        // turns the bound into the bound plus one whole attempt.
+        std::thread::sleep(
+            PLACEMENT_READ_POLL.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+        if expired(deadline) {
+            return Ok(PlacementRead::Unreadable(why));
+        }
+    }
+}
+
+/// One attempt at [`placements`], with the tmux incarnation the mapping was
+/// read from.
 ///
 /// The identity has to leave this function. Checking it only *inside* the
 /// collection proves the client list and the window list describe one server,
@@ -415,40 +509,70 @@ pub fn placements(
 /// they were one machine state. Plan 1 applies exactly this rule to its three
 /// `list-*` reads; it simply had never been carried across the
 /// tmux/compositor boundary. See [`crate::capture::attach_placements`].
+///
+/// Every failure below is transient as far as this function can tell, so none
+/// of them is final: [`placements_within`] is what production calls, and it
+/// asks again within a bounded budget before the answer is written down.
 pub fn placements_with_incarnation(
     h: &dyn crate::hypr::HyprCtl,
     tmux: &crate::tmux::Tmux,
-) -> Result<Option<(String, Vec<Placement>)>> {
+) -> Result<PlacementRead> {
     // The tmux server's identity is read *before* the compositor and again
     // after the client list, so the whole mapping is known to describe one
     // server. A server replaced in between hands out `$0`, `%0`, … from zero
     // again, and the sessions its clients name are not the sessions this
     // snapshot's topology holds.
     //
-    // `Ok(None)` — no server at all — is `None` here too, deliberately.
+    // `Ok(None)` — no server at all — is unreadable here too, deliberately.
     // Terminals do not vanish when tmux dies; a window whose session cannot
     // be read is a window whose placement is unknown, and "unknown" must
     // never be written down as "there were none".
     let before = match tmux.running_server_incarnation() {
         Ok(Some(id)) => id,
-        _ => return Ok(None),
+        Ok(None) => {
+            return Ok(PlacementRead::Unreadable(
+                "no tmux server was running, so no window could be matched to a session".into(),
+            ))
+        }
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server would not identify itself: {e:#}"
+            )))
+        }
     };
 
     let clients_json = match h.clients_json(crate::hypr::CALL_TIMEOUT) {
         Ok(j) => j,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor would not list its windows: {e:#}"
+            )))
+        }
     };
     let monitors_json = match h.monitors_json(crate::hypr::CALL_TIMEOUT) {
         Ok(j) => j,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor would not list its monitors: {e:#}"
+            )))
+        }
     };
     // A malformed reply is an unreachable compositor, not an empty desktop.
-    let (windows, monitors) = match (
-        crate::hypr::parse_clients(&clients_json),
-        crate::hypr::parse_monitors(&monitors_json),
-    ) {
-        (Ok(w), Ok(m)) => (w, m),
-        _ => return Ok(None),
+    let windows = match crate::hypr::parse_clients(&clients_json) {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor's window list could not be read: {e:#}"
+            )))
+        }
+    };
+    let monitors = match crate::hypr::parse_monitors(&monitors_json) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the compositor's monitor list could not be read: {e:#}"
+            )))
+        }
     };
 
     // The tmux half gets the same treatment as the compositor half, which is
@@ -460,15 +584,39 @@ pub fn placements_with_incarnation(
     // retention.
     let raw = match tmux.run(&["list-clients", "-F", "#{client_pid} #{client_session}"]) {
         Ok(raw) => raw,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server would not list its clients: {e:#}"
+            )))
+        }
     };
     let tmux_clients = match parse_clients_output(&raw) {
         Ok(cs) => cs,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux client list could not be read: {e:#}"
+            )))
+        }
     };
     match tmux.running_server_incarnation() {
         Ok(Some(after)) if after == before => {}
-        _ => return Ok(None),
+        Ok(Some(after)) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server changed identity while the placement was being \
+                 read: {before} became {after}"
+            )))
+        }
+        Ok(None) => {
+            return Ok(PlacementRead::Unreadable(
+                "the tmux server went away while the placement was being read".into(),
+            ))
+        }
+        Err(e) => {
+            return Ok(PlacementRead::Unreadable(format!(
+                "the tmux server would not confirm its identity after the placement \
+                 was read: {e:#}"
+            )))
+        }
     }
 
     let mapped = map_windows(&windows, &tmux_clients);
@@ -497,7 +645,7 @@ pub fn placements_with_incarnation(
             rel: relative_geometry(w, &monitors),
         });
     }
-    Ok(Some((before, out)))
+    Ok(PlacementRead::Mapped(before, out))
 }
 
 /// The terminal a window class belongs to, for spawning its like again.
