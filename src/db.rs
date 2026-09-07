@@ -1337,13 +1337,17 @@ fn repair(conn: &mut Connection) -> Result<Option<Repair>> {
     if orphan_rows(conn)? == 0 {
         return Ok(None);
     }
-    let before = child_rows(conn)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Another process may have repaired it while this one queued for the
-    // migration lock — or, without the lock, between the question and here.
+    // Asked again, and both counts taken inside the transaction: the question
+    // above was asked in autocommit, so on its own it is a guess about a
+    // database somebody else may have put right in the meantime, and a
+    // `before` read outside would not be the same database as the `after`.
+    // `open` holds the migration lock throughout, which makes that impossible
+    // today; the measurement should not depend on it.
     if orphan_rows(&tx)? == 0 {
         return Ok(None);
     }
+    let before = child_rows(&tx)?;
     for (child, column, parent, key) in CHILD_RELATIONS {
         tx.execute(
             &format!(
