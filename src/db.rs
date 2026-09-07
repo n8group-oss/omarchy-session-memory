@@ -1368,7 +1368,9 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
             // module docs for why the default is `known`.
             11 => {
                 tx.execute_batch(
-                    "ALTER TABLE snapshots ADD COLUMN placement_state TEXT NOT NULL                      DEFAULT 'known'                      CHECK (placement_state IN ('known','unknown','disabled'))",
+                    "ALTER TABLE snapshots ADD COLUMN placement_state TEXT NOT NULL
+                     DEFAULT 'known'
+                     CHECK (placement_state IN ('known','unknown','disabled'))",
                 )?;
                 version = 12;
             }

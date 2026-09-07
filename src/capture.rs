@@ -2140,7 +2140,8 @@ pub fn attach_placements(
     // is simply not running.
     let Some(server) = topo.server.clone() else {
         topo.placements = Placements::Unknown(
-            "no tmux server was running when the topology was read, so no window              could be matched to a session"
+            "no tmux server was running when the topology was read, so no \
+             window could be matched to a session"
                 .to_string(),
         );
         return Ok(());
@@ -2150,7 +2151,8 @@ pub fn attach_placements(
     topo.placements = match crate::desktop::placements_within(h, tmux, deadline)? {
         PlacementRead::Mapped(incarnation, ps) if incarnation == server => Placements::Known(ps),
         PlacementRead::Mapped(incarnation, _) => Placements::Unknown(format!(
-            "the placement was read from tmux server incarnation {incarnation}, but              the topology beside it came from {server}"
+            "the placement was read from tmux server incarnation {incarnation}, \
+             but the topology beside it came from {server}"
         )),
         PlacementRead::Unreadable(why) => Placements::Unknown(why),
     };
