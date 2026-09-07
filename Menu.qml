@@ -791,9 +791,25 @@ Panel {
         + "snapshot #" + from + " was used."
   }
 
+  // The released installer, not a build from git.
+  //
+  // Each `v*` tag publishes the binary, its SHA-256, and an `install.sh` with
+  // *that build's* digest written into it by the workflow that built it. The
+  // script checks the download against the digest it was built with rather
+  // than against a checksum fetched from the same server as the file, which
+  // would check for corruption and for nothing else.
+  //
+  // What this replaced was a one-liner that fetched the repository at whatever
+  // state its branch happened to be in, built it with a full Rust toolchain,
+  // and ran the result. The Omarchy marketplace's automated review reads a
+  // line like that as `package-manager` plus `remote-build`, and it is right
+  // to: it is slower, it needs far more installed, and it verifies nothing.
+  // Building from source belongs in the README, where a developer will look
+  // for it — and it stays the documented route on a machine this release has
+  // no binary for.
   function copyInstallCommand() {
-    Quickshell.clipboardText = "cargo install --git https://github.com/n8group-oss/omarchy-session-memory osm && osm install"
-    actionStatus = "Install command copied."
+    Quickshell.clipboardText = "curl -fsSLO https://github.com/n8group-oss/omarchy-session-memory/releases/latest/download/install.sh && sh install.sh"
+    actionStatus = "Install command copied — run `sh install.sh --dry-run` first to see every step."
     actionStatusTimer.restart()
   }
 
@@ -1124,9 +1140,14 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             color: root.dim
-            text: "Install it once, then this widget fills in:\n"
-              + "  cargo install --git https://github.com/n8group-oss/omarchy-session-memory osm\n"
-              + "  osm install          # inspect it first with --dry-run"
+            text: "Install the engine once, then this widget fills in. The installer "
+              + "verifies the binary against the SHA-256 the release workflow built it "
+              + "with, which is written into the script itself:\n"
+              + "  curl -fsSLO https://github.com/n8group-oss/omarchy-session-memory/releases/latest/download/install.sh\n"
+              + "  sh install.sh --dry-run   # prints every step, touches nothing\n"
+              + "  sh install.sh\n"
+              + "Building from source is in the README, and is the only route on a "
+              + "machine that is not x86_64."
           }
 
           Flow {

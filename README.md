@@ -16,6 +16,13 @@ both in the tree; neither has been released or submitted yet.
 
 ## Building
 
+Most people do not need this. [Installing from a
+release](#installing-from-a-release) downloads a prebuilt `osm` and verifies
+it against the SHA-256 that the workflow which built it wrote into the
+installer — no toolchain, no build, and a check that a source install cannot
+make. Build from source to work on osm itself, or on a machine this release
+ships no binary for.
+
 ```bash
 cargo build --release
 install -Dm755 target/release/osm ~/.local/share/osm/bin/osm

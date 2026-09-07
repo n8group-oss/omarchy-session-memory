@@ -1175,3 +1175,108 @@ fn balanced_object(src: &str, from: usize) -> String {
     }
     panic!("unbalanced object from {from}");
 }
+
+/// The assets a `v*` tag actually publishes, read out of the release
+/// workflow's `gh release create` call.
+fn published_assets() -> Vec<String> {
+    let wf = std::fs::read_to_string(".github/workflows/release.yml")
+        .expect(".github/workflows/release.yml exists");
+    wf.lines()
+        .map(|l| l.trim().trim_end_matches('\\').trim())
+        .filter_map(|l| l.strip_prefix("dist/"))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The panel points at the released installer, not at a build from git.
+///
+/// The Omarchy marketplace's automated review flagged this submission
+/// `security-review-required`, and two of the capabilities it named were
+/// this: a `package-manager` invocation and a `remote-build`, both of them
+/// the same line —
+///
+/// > `cargo install --git https://github.com/…/omarchy-session-memory osm`
+///
+/// which asks the user to fetch whatever is on a branch right now, build it
+/// with a full toolchain, and run it. The project already publishes something
+/// strictly better and faster: a release binary whose SHA-256 is written into
+/// the matching `install.sh` by the workflow that built it, so the script
+/// verifies the download against the digest of the exact build rather than
+/// against a checksum fetched from the same place as the file.
+///
+/// A widget that recommends the worse route to every user who installs the
+/// plugin is the widget's own recommendation, not a packaging detail. Whether
+/// a *developer* builds from source is the README's business.
+#[test]
+fn the_panel_recommends_the_released_installer_and_not_a_build_from_git() {
+    let menu = qml("Menu.qml");
+
+    for pattern in ["cargo install", "cargo build", "--git http"] {
+        assert!(
+            !menu.contains(pattern),
+            "Menu.qml still tells the user to {pattern:?}; the marketplace \
+             reads that as package-manager + remote-build, and the release \
+             installer is both safer and faster"
+        );
+    }
+    assert!(
+        menu.contains("install.sh"),
+        "Menu.qml names no install route at all"
+    );
+    assert!(
+        menu.contains("releases/latest/download/install.sh"),
+        "the installer the panel names is not the one the releases page serves"
+    );
+
+    // The button that copies a command copies *that* command.
+    let copy = qml_function(&menu, "copyInstallCommand");
+    assert!(
+        copy.contains("releases/latest/download/install.sh"),
+        "the install button copies something other than the released \
+         installer:\n{copy}"
+    );
+    assert!(
+        !copy.contains("cargo"),
+        "the install button still copies a source build:\n{copy}"
+    );
+}
+
+/// And what it names is what a release actually contains.
+///
+/// A panel recommending `install.sh` from the releases page is only better
+/// than a source build if that file is there. Both halves are read from the
+/// repository rather than assumed: the file names out of the panel, the
+/// published assets out of the workflow that uploads them.
+#[test]
+fn every_release_file_the_docs_name_is_one_the_release_publishes() {
+    let assets = published_assets();
+    for expected in [
+        "install.sh",
+        "osm-x86_64-unknown-linux-gnu",
+        "osm-x86_64-unknown-linux-gnu.sha256",
+    ] {
+        assert!(
+            assets.iter().any(|a| a == expected),
+            "the release workflow does not publish {expected}: {assets:?}"
+        );
+    }
+
+    let needle = "releases/latest/download/";
+    for file in ["Menu.qml", "README.md"] {
+        let src = qml(file);
+        let mut at = 0usize;
+        while let Some(found) = src[at..].find(needle) {
+            let start = at + found + needle.len();
+            let named: String = src[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+                .collect();
+            assert!(
+                assets.contains(&named),
+                "{file} points at a release asset called {named:?}, which no \
+                 release publishes: {assets:?}"
+            );
+            at = start;
+        }
+    }
+}
