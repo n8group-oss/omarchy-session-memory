@@ -670,9 +670,17 @@ pub struct AgentResumeFailure {
 ///
 /// `outcome` is a stable token from [`crate::desktop::PlaceOutcome::as_str`]:
 /// `placed`, `misplaced`, `never_mapped`, `never_attached`, `spawn_failed`,
-/// `no_compositor`, `lost_compositor`, `skipped`, `placement_disabled`.
-/// Everything except `placed` and `placement_disabled` means the restore is
+/// `no_compositor`, `lost_compositor`, `skipped`, `placement_disabled`,
+/// `placement_carried`, `placement_unknown`. Everything except `placed`,
+/// `placement_disabled` and `placement_carried` means the restore is
 /// `partial` and the snapshot stays restorable.
+///
+/// Two of them are reported against the pseudo-session `*`, because they are
+/// statements about the pass rather than about one window:
+/// `placement_carried` (the source snapshot's placement was unknown, so the
+/// layout came from an earlier snapshot of the same boot — which one is in
+/// `detail`) and `placement_unknown` (it was unknown and nothing earlier knew
+/// either, so no window was put back).
 ///
 /// `placed` means the compositor was asked where the window is and said it is
 /// on the workspace and monitor the capture recorded. It never means "the

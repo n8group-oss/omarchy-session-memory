@@ -696,6 +696,111 @@ pub fn placements_of(conn: &rusqlite::Connection, snapshot_id: i64) -> Result<Ve
         .map_err(Into::into)
 }
 
+/// The layout a restore of one snapshot should put back, and where it came
+/// from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementForRestore {
+    /// The snapshot's own placement — it was `known` (possibly empty) or
+    /// `disabled`, and either way it is the answer.
+    Own(Vec<Placement>),
+    /// The snapshot's placement was `unknown`, and this is the newest earlier
+    /// snapshot of the **same boot** that knew, with its id and the time it
+    /// was taken.
+    Carried {
+        from: i64,
+        taken_at: i64,
+        placements: Vec<Placement>,
+    },
+    /// The snapshot's placement was `unknown` and nothing earlier in the same
+    /// boot knew either. There is no layout to put back and none may be
+    /// invented.
+    Unavailable,
+}
+
+/// What a restore of `snapshot_id` has to work with.
+///
+/// # Why an older layout beats no layout
+///
+/// The tmux topology and the window placement are facts of very different
+/// speeds. What sessions and panes exist, and what is running in them, changes
+/// by the minute — so the topology must come from the newest snapshot, always.
+/// Which workspace and monitor a session's terminal lives on is something the
+/// user decided once and rarely revisits; a copy of it from a few minutes
+/// earlier in the same boot is very likely still true, and is certainly closer
+/// to the truth than opening no terminal at all.
+///
+/// The alternative — report the shortfall and place nothing — hands the user
+/// back their sessions with an empty screen, which is the outcome this whole
+/// feature exists to prevent. So the layout is carried forward, and the carry
+/// is *reported* ([`PlaceOutcome::PlacementCarried`]) rather than performed
+/// silently: a restore that used a layout it did not itself record has to say
+/// so.
+///
+/// # The two directions it will not look
+///
+/// **Across a boot.** A snapshot's placement describes where windows were
+/// during that boot. Reaching further back would resurrect an arrangement the
+/// user may have abandoned two reboots ago and present it as this one's.
+///
+/// **Forward.** The snapshot a restore publishes when it finishes carries
+/// placement of its own and is newer than the source; reading forward would
+/// let a restore place windows from the layout its own earlier attempt
+/// produced — a claim about the machine after the restore rather than before
+/// the reboot.
+///
+/// A snapshot that is `known` is never backfilled, empty or not:
+/// `Known(vec![])` is the compositor answering that there are no terminal
+/// windows, and putting terminals onto a desktop the user deliberately
+/// cleared is not a restore.
+pub fn placement_for_restore(
+    conn: &rusqlite::Connection,
+    snapshot_id: i64,
+) -> Result<PlacementForRestore> {
+    let (state, boot_id, taken_at) = conn.query_row(
+        "SELECT placement_state, boot_id, taken_at FROM snapshots WHERE id = ?1",
+        [snapshot_id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    if state != PLACEMENT_UNKNOWN {
+        return Ok(PlacementForRestore::Own(placements_of(conn, snapshot_id)?));
+    }
+
+    // Same boot, not later than the source, and it has to actually hold
+    // windows: a `known` snapshot with no rows is an answered empty desktop,
+    // which carries nothing and must not stop the search either — the user's
+    // windows were somewhere before it, and that record is still the best one
+    // there is.
+    let fallback: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT s.id, s.taken_at FROM snapshots s
+             WHERE s.boot_id = ?1
+               AND s.state <> 'building'
+               AND s.placement_state = 'known'
+               AND (s.taken_at < ?2 OR (s.taken_at = ?2 AND s.id < ?3))
+               AND EXISTS (SELECT 1 FROM terminal_windows w WHERE w.snapshot_id = s.id)
+             ORDER BY s.taken_at DESC, s.id DESC
+             LIMIT 1",
+            rusqlite::params![boot_id, taken_at, snapshot_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    Ok(match fallback {
+        Some((from, at)) => PlacementForRestore::Carried {
+            from,
+            taken_at: at,
+            placements: placements_of(conn, from)?,
+        },
+        None => PlacementForRestore::Unavailable,
+    })
+}
+
 /// The window a placement pass delivered, and where it put it.
 ///
 /// Carried by [`PlaceOutcome::Placed`] because the claim is about *this*
@@ -796,6 +901,25 @@ pub enum PlaceOutcome {
     /// outcome that says "no window, and that is finished work": a headless
     /// machine, or a user who wants their tmux back without terminals.
     PlacementDisabled,
+    /// The source snapshot's placement is [`Placements::Unknown`], and the
+    /// layout being applied came from an earlier snapshot of the same boot
+    /// that knew. Carries which one, and when it was taken.
+    ///
+    /// Reported against the pseudo-session `*` beside the real per-session
+    /// outcomes, because it is a statement about the pass rather than about
+    /// one window. **Not** a shortfall: the pass did its job, with the best
+    /// record of the desktop that exists. See [`placement_for_restore`] for
+    /// why an older layout is preferred to no layout.
+    PlacementCarried(String),
+    /// The source snapshot's placement is [`Placements::Unknown`] and no
+    /// earlier snapshot of the same boot knew either, so this restore has no
+    /// layout to put back and did not invent one.
+    ///
+    /// A shortfall, and deliberately so: the run stays `partial` and the
+    /// source snapshot stays selectable. Reporting nothing would have read as
+    /// "this snapshot had no terminal windows", retired the source, and left
+    /// no record anywhere of where the user's windows belonged.
+    PlacementUnknown(String),
 }
 
 impl PlaceOutcome {
@@ -810,6 +934,8 @@ impl PlaceOutcome {
             PlaceOutcome::LostCompositor(_) => "lost_compositor",
             PlaceOutcome::Skipped(_) => "skipped",
             PlaceOutcome::PlacementDisabled => "placement_disabled",
+            PlaceOutcome::PlacementCarried(_) => "placement_carried",
+            PlaceOutcome::PlacementUnknown(_) => "placement_unknown",
         }
     }
 
@@ -819,7 +945,9 @@ impl PlaceOutcome {
             PlaceOutcome::SpawnFailed(d)
             | PlaceOutcome::LostCompositor(d)
             | PlaceOutcome::Misplaced(d)
-            | PlaceOutcome::Skipped(d) => Some(d),
+            | PlaceOutcome::Skipped(d)
+            | PlaceOutcome::PlacementCarried(d)
+            | PlaceOutcome::PlacementUnknown(d) => Some(d),
             _ => None,
         }
     }
