@@ -401,7 +401,8 @@ pub fn placements(
     h: &dyn crate::hypr::HyprCtl,
     tmux: &crate::tmux::Tmux,
 ) -> Result<Option<Vec<Placement>>> {
-    Ok(match placements_with_incarnation(h, tmux)? {
+    let deadline = std::time::Instant::now() + PLACEMENT_READ_BUDGET;
+    Ok(match placements_with_incarnation(h, tmux, deadline)? {
         PlacementRead::Mapped(_, ps) => Some(ps),
         PlacementRead::Unreadable(_) => None,
     })
@@ -451,18 +452,26 @@ const PLACEMENT_READ_POLL: std::time::Duration = std::time::Duration::from_milli
 /// [`placements_with_incarnation`], re-attempted until it succeeds or
 /// `deadline` passes.
 ///
-/// # Why the calls themselves are not shortened
+/// # The budget bounds the calls, not only the number of them
 ///
-/// [`monitors_within`] hands each attempt whatever is left of its budget,
-/// because what it is waiting out is a compositor with nothing to report. This
-/// is waiting out a *failure*, and the two want opposite things from a slow
-/// call: cutting `hyprctl -j clients` down to the remaining budget would fail
-/// a compositor that is merely busy — one such call really did take longer
-/// than 15 seconds on the maintainer's machine under load — where today it
-/// succeeds. So every attempt gets the full [`crate::hypr::CALL_TIMEOUT`], and
-/// only the *number* of attempts is bounded. One consequence is deliberate: a
-/// call that burns the whole timeout leaves no budget, so a wedged compositor
-/// is asked exactly once rather than twice.
+/// Each `hyprctl` call is started with whatever is left before `deadline`,
+/// recomputed between the two halves of an attempt — the same rule
+/// [`monitors_within`] and [`spawn_and_place`] follow, through
+/// [`call_budget`].
+///
+/// It used to hand every call the full, independent
+/// [`crate::hypr::CALL_TIMEOUT`] and bound only the *number* of attempts,
+/// which made this budget a statement about nothing: an attempt starting a
+/// millisecond before the deadline still ran a client list and a monitor list
+/// of up to fifteen seconds each, so a compositor that had wedged rather than
+/// died held the capture open for thirty seconds against a bound of three.
+/// And it is a capture that is held: [`crate::capture::attach_placements`]
+/// runs inside one, which is the entire reason this bound is three seconds.
+///
+/// [`call_budget`]'s floor is what keeps that from going too far the other
+/// way — the last call before a deadline still gets a whole second, because a
+/// deadline may bound how long osm waits and may not cut a call off after a
+/// millisecond and report the placement failed for nothing but arithmetic.
 ///
 /// One attempt always happens, whatever `deadline` says. A budget is a bound
 /// on waiting, never a reason to skip the question.
@@ -478,7 +487,7 @@ pub fn placements_within(
     deadline: std::time::Instant,
 ) -> Result<PlacementRead> {
     loop {
-        let why = match placements_with_incarnation(h, tmux)? {
+        let why = match placements_with_incarnation(h, tmux, deadline)? {
             mapped @ PlacementRead::Mapped(_, _) => return Ok(mapped),
             PlacementRead::Unreadable(why) => why,
         };
@@ -516,6 +525,7 @@ pub fn placements_within(
 pub fn placements_with_incarnation(
     h: &dyn crate::hypr::HyprCtl,
     tmux: &crate::tmux::Tmux,
+    deadline: std::time::Instant,
 ) -> Result<PlacementRead> {
     // The tmux server's identity is read *before* the compositor and again
     // after the client list, so the whole mapping is known to describe one
@@ -541,7 +551,11 @@ pub fn placements_with_incarnation(
         }
     };
 
-    let clients_json = match h.clients_json(crate::hypr::CALL_TIMEOUT) {
+    // `call_budget` is re-evaluated for each of the two calls rather than
+    // computed once: the client list is the slow half, and a monitor list
+    // started with the budget the client list has already spent is a call
+    // outside the bound this whole function is under.
+    let clients_json = match h.clients_json(call_budget(deadline)) {
         Ok(j) => j,
         Err(e) => {
             return Ok(PlacementRead::Unreadable(format!(
@@ -549,7 +563,7 @@ pub fn placements_with_incarnation(
             )))
         }
     };
-    let monitors_json = match h.monitors_json(crate::hypr::CALL_TIMEOUT) {
+    let monitors_json = match h.monitors_json(call_budget(deadline)) {
         Ok(j) => j,
         Err(e) => {
             return Ok(PlacementRead::Unreadable(format!(

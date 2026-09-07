@@ -435,3 +435,98 @@ fn a_topology_with_no_server_is_answered_at_once_rather_than_waited_out() {
         "waited {elapsed:?} for a server that is not there"
     );
 }
+
+/// A compositor that takes the time it is given, and remembers how much that
+/// was.
+///
+/// `Flaky` above answers instantly and ignores its `budget`, which is why the
+/// six-second assertion in
+/// [`a_compositor_that_never_answers_gives_up_inside_the_budget`] cannot see
+/// this defect: a stub that never waits makes any budget look the same. This
+/// one behaves the way `hypr::run_hyprctl` does — it runs until it is either
+/// finished or out of budget — so what the read hands it decides how long the
+/// capture is held open.
+struct Timed {
+    /// Every budget handed to the compositor, in call order.
+    budgets: std::cell::RefCell<Vec<std::time::Duration>>,
+    /// How long the client list takes to come back.
+    clients_take: std::time::Duration,
+    /// How long the monitor list runs before giving up — capped so that a
+    /// failing run of this test finishes in seconds rather than in the
+    /// fifteen it is complaining about.
+    monitors_cap: std::time::Duration,
+}
+
+impl HyprCtl for Timed {
+    fn clients_json(&self, budget: std::time::Duration) -> anyhow::Result<String> {
+        self.budgets.borrow_mut().push(budget);
+        std::thread::sleep(self.clients_take.min(budget));
+        Ok(A_BROWSER.to_string())
+    }
+    fn monitors_json(&self, budget: std::time::Duration) -> anyhow::Result<String> {
+        self.budgets.borrow_mut().push(budget);
+        std::thread::sleep(budget.min(self.monitors_cap));
+        anyhow::bail!("could not connect to the Hyprland socket")
+    }
+    fn dispatch(&self, _lua: &str, _budget: std::time::Duration) -> anyhow::Result<String> {
+        panic!("no test here may dispatch: it would move a real window")
+    }
+}
+
+/// The retry budget bounds the calls it makes, not just how many of them
+/// there are.
+///
+/// `PLACEMENT_READ_BUDGET` is three seconds, and the reason it is three is
+/// that a capture is held open for the whole of it — `attach_placements` runs
+/// inside one. Handing each `hyprctl` call the independent fifteen-second
+/// `CALL_TIMEOUT` made that bound a statement about nothing: an attempt
+/// starting a millisecond before the deadline still ran two calls of up to
+/// fifteen seconds each, so a compositor that had wedged rather than died
+/// held the capture for thirty seconds against a budget of three.
+///
+/// So each call is started with what is left of the budget, recomputed
+/// between them — the same rule `spawn_and_place` already follows through
+/// `call_budget`, which is also where the floor comes from: a deadline may
+/// bound how long osm waits, but it may not cut a call off after a
+/// millisecond and call the placement failed for nothing but arithmetic.
+#[test]
+fn each_compositor_call_is_started_with_what_is_left_of_the_budget() {
+    let t = server("callbudget");
+    let h = Timed {
+        budgets: std::cell::RefCell::new(Vec::new()),
+        clients_take: std::time::Duration::from_millis(1200),
+        monitors_cap: std::time::Duration::from_secs(4),
+    };
+
+    let started = std::time::Instant::now();
+    let read =
+        desktop::placements_within(&h, &t, started + desktop::PLACEMENT_READ_BUDGET).unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(read, desktop::PlacementRead::Unreadable(_)),
+        "the monitor list never came back, so this is not a readable desktop: {read:?}"
+    );
+
+    let budgets = h.budgets.borrow().clone();
+    assert!(
+        budgets.len() >= 2,
+        "both halves of the read have to be asked before this can say anything: {budgets:?}"
+    );
+    assert!(
+        budgets.iter().all(|b| *b <= desktop::PLACEMENT_READ_BUDGET),
+        "a call was started with more time than the whole retry budget: {budgets:?}"
+    );
+    assert!(
+        budgets[1] < budgets[0],
+        "the second call was not given the budget the first one had spent \
+         ({:?} then {:?}); it is recomputed between them or it bounds nothing",
+        budgets[0],
+        budgets[1]
+    );
+    assert!(
+        elapsed < desktop::PLACEMENT_READ_BUDGET * 2,
+        "the read held the capture open for {elapsed:?} against a {:?} budget",
+        desktop::PLACEMENT_READ_BUDGET
+    );
+}
