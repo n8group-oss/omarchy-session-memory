@@ -1781,6 +1781,58 @@ fn migrate_steps(conn: &mut Connection, _from: u32) -> Result<bool> {
     Ok(true)
 }
 
+/// Every table and trigger [`create_schema`] would create, read out of the
+/// SQL it would run.
+///
+/// Derived from the statements rather than listed beside them, because a
+/// list is a thing that goes out of date silently: a name missing from it
+/// makes [`schema_is_current`] answer `true` for a database that is missing
+/// that object, and `open` would then hand back a connection to a database
+/// with no `agent_resume_debt` in it. `the_open_that_skips_create_schema_...`
+/// in `tests/db.rs` drops each object in turn and requires `open` to put it
+/// back, which is what keeps this honest.
+fn schema_object_names() -> Vec<&'static str> {
+    [SCHEMA_SQL, CASCADE_TRIGGERS_SQL]
+        .into_iter()
+        .flat_map(|sql| sql.split("CREATE "))
+        .filter_map(|stmt| {
+            let rest = stmt
+                .strip_prefix("TABLE IF NOT EXISTS ")
+                .or_else(|| stmt.strip_prefix("TRIGGER IF NOT EXISTS "))?;
+            rest.split(|c: char| c.is_whitespace() || c == '(')
+                .find(|w| !w.is_empty())
+        })
+        .collect()
+}
+
+/// Whether this database already is what [`create_schema`] would make it.
+///
+/// Read-only, and asked *before* any write transaction is opened. `open` runs
+/// in every `osm` process — fifteen tmux hooks and a status poll every five
+/// seconds — and `create_schema` begins with `BEGIN IMMEDIATE`, so running it
+/// unconditionally put every one of them in the queue for the writer. A poll
+/// that met a capture mid-write sat out the whole busy timeout and then told
+/// the panel the database could not be reached. Nothing was ever written on
+/// that path; the cost was entirely the lock.
+///
+/// Both halves are checked. The version alone is not enough: the 12 → 13
+/// migration rebuilds `snapshots`, and dropping a table drops its triggers
+/// with it, so a just-migrated database is at the current version and still
+/// needs [`CASCADE_TRIGGERS_SQL`] run over it.
+fn schema_is_current(conn: &Connection) -> Result<bool> {
+    if !matches!(on_disk_schema(conn), OnDisk::Version(SCHEMA_VERSION)) {
+        return Ok(false);
+    }
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger')")?;
+    let present = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<String>>>()?;
+    Ok(schema_object_names()
+        .into_iter()
+        .all(|n| present.contains(n)))
+}
+
 /// Create this build's schema and stamp its version, atomically.
 ///
 /// One `IMMEDIATE` transaction around both halves, and that is load-bearing:
@@ -1897,7 +1949,17 @@ pub fn open(path: &Path) -> Result<Connection> {
     // A preservation this process finished on someone else's behalf still has
     // to be recorded: the database it moved aside is nowhere the engine looks
     // any more, and `osm status --json` is the only thing that says so.
-    create_schema(&mut conn, preserved.or(recovered))?;
+    //
+    // Asked before it is run, and this is the difference between an `osm
+    // status` that answers while a capture is writing and one that waits out
+    // the busy timeout and reports the database unreachable: `create_schema`
+    // opens an `IMMEDIATE` transaction, so on the healthy path — which is
+    // every tmux hook and every five-second poll — running it unconditionally
+    // meant queueing for the writer in order to write nothing.
+    let record = preserved.or(recovered);
+    if record.is_some() || !schema_is_current(&conn)? {
+        create_schema(&mut conn, record)?;
+    }
 
     // After the schema, so the tables and the delete triggers are there, and
     // still under the migration lock, so two openers cannot both decide to

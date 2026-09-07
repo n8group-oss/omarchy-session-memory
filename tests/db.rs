@@ -1588,3 +1588,136 @@ fn a_database_that_arrives_damaged_is_migrated_and_repaired_not_refused() {
         .unwrap();
     assert_eq!(next, 3717);
 }
+
+/// Opening a healthy database must not want the write lock.
+///
+/// `open` runs in every `osm` process: every one of the fifteen tmux hooks,
+/// and the `osm status` the panel polls every five seconds. The healthy path
+/// has nothing to write — the schema is current, the triggers are there, and
+/// `repair` asks its question read-only and finds nothing — but `create_schema`
+/// ran unconditionally, and it begins with `BEGIN IMMEDIATE`. So every hook
+/// and every poll queued for the writer, and one that met a capture mid-write
+/// sat out the five-second busy timeout and then reported the database
+/// unreachable. A panel saying "the engine cannot reach its database" while a
+/// capture is running is this project's own failure mode: it has wedged
+/// captures once already by holding the write lock across other work.
+///
+/// `an_open_of_a_healthy_database_removes_nothing` above is the other half —
+/// that nothing is *changed*. Nothing changing is not the same claim as
+/// nothing being locked, and it is the lock that costs.
+#[test]
+fn an_open_of_a_healthy_database_takes_no_write_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    {
+        let conn = osm::db::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (1, 100, 'boot-a', 'manual', 'complete');",
+        )
+        .unwrap();
+    }
+
+    // A capture, mid-write. `BEGIN IMMEDIATE` is what `write_topology` takes,
+    // and it is held for the whole of the open below.
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO snapshots (id, taken_at, boot_id, reason, state)
+               VALUES (2, 200, 'boot-a', 'timer', 'building');",
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let opened = osm::db::open(&path);
+    let elapsed = started.elapsed();
+
+    writer.execute_batch("COMMIT").unwrap();
+
+    let conn = opened.unwrap_or_else(|e| {
+        panic!(
+            "a healthy open waited {elapsed:?} for a writer's lock and then \
+             gave up: {e:#}"
+        )
+    });
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "a healthy open queued {elapsed:?} behind another writer; it has \
+         nothing to write and must not ask for the lock"
+    );
+
+    // And it really did open the database it was pointed at.
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "the connection handed back does not see the rows");
+}
+
+/// Skipping `create_schema` is a shortcut on the healthy path only: an object
+/// that is missing is still put back.
+///
+/// `open` now asks whether the schema is already what it would create before
+/// it opens a write transaction, and that question is answered from a list of
+/// names. A name missing from the list would make the answer `true` for a
+/// database that is missing that table or trigger, and `open` would hand back
+/// a connection to it — no error, no repair, and the first capture failing on
+/// a table that is not there.
+///
+/// So every object a fresh database has is dropped in turn and `open` is
+/// required to put it back. `meta` is excluded and only because dropping it
+/// is a different question entirely: with no `schema_version` the database is
+/// unversioned, which `open` answers by preserving it aside — a path
+/// `an_unversioned_database_is_preserved_not_dropped` already covers.
+#[test]
+fn every_missing_schema_object_is_put_back_by_the_next_open() {
+    let objects: Vec<(String, String)> = {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = osm::db::open(&tmp.path().join("state.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name FROM sqlite_master
+                  WHERE type IN ('table','trigger') AND name <> 'meta'
+                    AND name NOT LIKE 'sqlite_%'
+                  ORDER BY name",
+            )
+            .unwrap();
+        let v = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<(String, String)>, _>>()
+            .unwrap();
+        v
+    };
+    assert!(
+        objects.len() > 10,
+        "the fresh schema should have more than this: {objects:?}"
+    );
+
+    for (kind, name) in &objects {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        {
+            let conn = osm::db::open(&path).unwrap();
+            // `legacy_alter_table` is not needed for a DROP, but foreign keys
+            // are off so dropping a parent does not cascade the rest away.
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            conn.execute_batch(&format!("DROP {kind} {name}")).unwrap();
+        }
+
+        let conn = osm::db::open(&path)
+            .unwrap_or_else(|e| panic!("open failed on a database missing {kind} {name}: {e:#}"));
+        let back: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                rusqlite::params![kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            back, 1,
+            "open decided the schema was current on a database with no \
+             {kind} {name} in it"
+        );
+    }
+}
