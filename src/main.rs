@@ -994,14 +994,27 @@ fn main() -> Result<()> {
                         // Read, not assumed. What is in the preserved file is
                         // a different file's business, so it is answered by
                         // opening that file — see `preserved_notice`.
-                        let preserved = summary.preserved.map(|p| {
+                        let preserved = summary.preserved.and_then(|p| {
                             let held = osm::db::preserved_contents(std::path::Path::new(&p.path));
+                            // A file that is no longer there has nothing left
+                            // to say. The record's whole job was to tell the
+                            // user where their snapshots went; once they have
+                            // acted on it — deleting an empty backup is what
+                            // the zero-snapshot notice invites — repeating it
+                            // on every five-second poll is an alarm about a
+                            // situation that is over. Forget it and say
+                            // nothing. A file osm merely could not *read* is a
+                            // different answer and is kept.
+                            if matches!(held, osm::db::PreservedContents::Gone) {
+                                let _ = osm::db::forget_preserved(&conn);
+                                return None;
+                            }
                             notices.push(preserved_notice(&p.path, &held));
-                            osm::ipc::PreservedDatabase {
+                            Some(osm::ipc::PreservedDatabase {
                                 path: p.path,
                                 schema_version: p.schema_version,
                                 preserved_at: p.preserved_at,
-                                present: !matches!(held, osm::db::PreservedContents::Gone),
+                                present: true,
                                 snapshots: match held {
                                     osm::db::PreservedContents::Snapshots(n) => Some(n),
                                     _ => None,
@@ -1010,7 +1023,7 @@ fn main() -> Result<()> {
                                     osm::db::PreservedContents::Unreadable(why) => Some(why),
                                     _ => None,
                                 },
-                            }
+                            })
                         });
                         if let Some(r) = &summary.repaired {
                             notices.push(format!(

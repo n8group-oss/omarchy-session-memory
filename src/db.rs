@@ -541,6 +541,25 @@ pub fn preserved(conn: &Connection) -> Option<Preserved> {
     })
 }
 
+/// Forget a preservation whose file is no longer there.
+///
+/// The record exists to tell the user where their snapshots went. Once the
+/// file is gone — because they deleted it, which the zero-snapshot notice
+/// explicitly invites — there is nothing left to tell and nothing they can
+/// act on, so continuing to report it turns a resolved situation into a
+/// standing alarm on a panel that polls every five seconds.
+///
+/// Only ever called for a path that is absent; a file osm merely could not
+/// *read* is a different answer and is kept.
+pub fn forget_preserved(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key IN \
+         ('preserved_db_path', 'preserved_db_version', 'preserved_db_at')",
+        [],
+    )?;
+    Ok(())
+}
+
 /// What a preserved database turned out to hold.
 ///
 /// Three answers rather than a claim. `osm status` used to tell its reader

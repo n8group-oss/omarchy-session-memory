@@ -643,7 +643,7 @@ fn a_preserved_database_that_cannot_be_read_is_counted_neither_way() {
 /// And once the user takes the offer, the notice must not turn into an alarm
 /// about a file that is gone because they removed it.
 #[test]
-fn a_preserved_database_the_user_removed_is_not_called_unreadable() {
+fn a_preserved_database_the_user_removed_is_forgotten_entirely() {
     let env = Env::new("preservedgone");
     write_legacy_db(&env.state_dir().join("state.db"), 0);
 
@@ -652,25 +652,37 @@ fn a_preserved_database_the_user_removed_is_not_called_unreadable() {
         .as_str()
         .expect("a path")
         .to_string();
+    assert!(
+        first["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("was preserved at"),
+        "while the file is there, the notice names it: {first}"
+    );
+
+    // The user does what the zero-snapshot notice invites and deletes it.
     std::fs::remove_file(&path).unwrap();
 
     let v = env.status();
-    let preserved = &v["database"]["preserved"];
-    assert_eq!(
-        preserved["present"], false,
-        "nothing is at the recorded path any more: {v}"
-    );
-    assert!(preserved["snapshots"].is_null(), "{v}");
-    assert!(preserved["error"].is_null(), "{v}");
-    let msg = v["message"].as_str().unwrap_or_default().to_string();
     assert!(
-        msg.contains("nothing is there now"),
-        "the notice must say the file is gone: {msg}"
+        v["database"]["preserved"].is_null(),
+        "a preservation whose file the user removed is forgotten, not reported \
+         with present:false forever: {v}"
     );
     assert!(
-        !msg.contains("could not read"),
-        "a file the user deleted is not one osm failed to read: {msg}"
+        v["message"].is_null()
+            || !v["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("was preserved at"),
+        "there is nothing left to say about a file that is not there, and the \
+         panel polls this every five seconds: {v}"
     );
+
+    // And it stays forgotten — the record is gone from the database, not
+    // merely filtered out of one response.
+    let again = env.status();
+    assert!(again["database"]["preserved"].is_null(), "{again}");
 }
 
 /// A row in `snapshots` is not a snapshot, and counting rows is not an
